@@ -254,6 +254,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 - [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
 - [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
 - [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
+- [Network setup](docs/NETWORK_SETUP.md): the Mac Studio gateway, the direct Spark link, and how to rebuild both.
 - [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.
 - [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.
 - [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
