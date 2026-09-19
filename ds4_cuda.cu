@@ -31455,10 +31455,12 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_total_expert,
         uint32_t                n_expert,
+        float                   swiglu_clamp,
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
         uint32_t                mid_token_stride) {
+    (void)swiglu_clamp;
     fprintf(stderr, "ds4: CUDA stub called: ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor\n");
     return 0;
 }
@@ -31589,22 +31591,15 @@ __device__ __forceinline__ static void glm_moe_dot8(
         const cuda_block_q8_K *y4, const cuda_block_q8_K *y5,
         const cuda_block_q8_K *y6, const cuda_block_q8_K *y7,
         uint32_t n, float acc[8]) {
-    /* Deliberately the same call the warp kernels make, one token at a time.
-     * dev_dot_q4_K_q8_K_block8 is arithmetically identical to this loop (a
-     * unit test over random blocks is bit-identical for every n), yet on the
-     * pair the tile8 path built on it produced logits that deviate from the
-     * Metal reference while this arithmetic matches it (mean |delta| 0.085
-     * over the vocabulary, against 1.10 for the block8 path). Until that
-     * discrepancy is explained, the tile8 kernels use the expression that is
-     * known to match the reference. */
-    if (n > 0u) acc[0] += dev_dot_q4_K_q8_K_block(w, y0);
-    if (n > 1u) acc[1] += dev_dot_q4_K_q8_K_block(w, y1);
-    if (n > 2u) acc[2] += dev_dot_q4_K_q8_K_block(w, y2);
-    if (n > 3u) acc[3] += dev_dot_q4_K_q8_K_block(w, y3);
-    if (n > 4u) acc[4] += dev_dot_q4_K_q8_K_block(w, y4);
-    if (n > 5u) acc[5] += dev_dot_q4_K_q8_K_block(w, y5);
-    if (n > 6u) acc[6] += dev_dot_q4_K_q8_K_block(w, y6);
-    if (n > 7u) acc[7] += dev_dot_q4_K_q8_K_block(w, y7);
+    /* The 8-wide form, which reuses one weight block across the whole tile.
+     * It was briefly replaced with n single-block calls while the tile8
+     * deviation was being chased, on the theory that the two might differ; a
+     * unit test over random blocks shows they are bit-identical, and
+     * substituting one for the other left the logits dump byte-identical, so
+     * that theory was simply wrong - the deviation was the expert map's 256
+     * bound, nowhere near this. The wide form is back because it is the faster
+     * of two expressions that are known to agree. */
+    dev_dot_q4_K_q8_K_block8(w, y0, y1, y2, y3, y4, y5, y6, y7, n, acc);
 }
 
 /* Warp-per-row routed MoE (q2_K or q4_K x q8_K). Each block stages the token's
@@ -32333,6 +32328,12 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         n_tokens >= 128u && !getenv("DS4_GLM_MOE_NO_EXPERT_TILE8");
     const bool use_expert_major =
         n_tokens >= 16u && getenv("DS4_GLM_MOE_EXPERT_MAJOR");
+    if (getenv("DS4_GLM_MOE_TRACE")) {
+        fprintf(stderr, "ds4: glm moe: type=%u tokens=%u experts=%u used=%u path=%s\n",
+                gate_type, n_tokens, n_total_expert, n_expert,
+                use_expert_tile8 ? "tile8"
+                                 : (use_expert_major ? "expert-major" : "warp"));
+    }
     if (use_expert_tile8 || use_expert_major) {
         const uint32_t cap = n_tokens;
         const uint32_t n_pairs = n_tokens * n_expert;

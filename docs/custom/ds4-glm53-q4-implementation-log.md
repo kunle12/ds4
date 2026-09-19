@@ -214,7 +214,7 @@ First working Q4_K pair path, with a measured prefill and one open defect.
 | M3 | Kept the unported paths refusing by name | expert-major, scalar and MTP tok2 return `glm_moe_unsupported_path(...)` for a Q4_K trio instead of reaching Q2_K arithmetic |
 | M4 | Ran a Q4_K pair end to end | first working Q4_K pair run: coherent output, `prefill 103.45 t/s, generation 11.36 t/s` |
 | M5 | Compared logits against the Metal reference, with a Q2_K calibration | `--dump-logits` on `{pair, Mac-alone} × {Q2_K, Q4_K}` after the same 1091-token prefill: Q2_K pair vs Metal mean \|Δ\| 0.196 / max 1.48 / top-16 15-of-16; Q4_K pair vs Metal 1.100 / 9.09 / 9-of-16. Argmax and top-3 order agreed in both, so the divergence was in degree |
-| M6 | Localised it to the tile8 path | the same CUDA path through the warp kernels instead matched Metal at mean \|Δ\| **0.085** / max 0.50 / top-16 15-of-16. For Q2_K the two paths are **bit-identical** (max 0.0000), so the tile8 machinery is sound there and the defect is specific to its Q4_K instantiation. Bisecting with `DS4_GLM_MOE_NO_DOWN_TILE8_EXACT` attributed it to the tile8 **gate/up** kernel (tile8-gate/up + warp-down still deviated at 1.148) |
+| M6 | Localised it to the tile8 path | the same CUDA path through the warp kernels instead matched Metal at mean \|Δ\| **0.085** / max 0.50 / top-16 15-of-16. For Q2_K the two paths came out **bit-identical** (max 0.0000), which I read at the time as the tile8 machinery being sound for Q2_K and the defect being specific to its Q4_K instantiation. **That inference was unsound** and it sent the next several hours into the type-dependent code: a bit-identity establishes nothing unless the two runs are known to have taken *different* paths, and I never checked which path either took. It is also the step that was wrong — the fault was shared code (Phase N). Bisecting with `DS4_GLM_MOE_NO_DOWN_TILE8_EXACT` attributed it to the tile8 **gate/up** kernel (tile8-gate/up + warp-down still deviated at 1.148) |
 | M7 | Ruled out the arithmetic, nondeterminism and staging | a unit test on the Spark over random blocks, built from the real helpers extracted verbatim (`/tmp/q4dots_test.cu`; sizes confirmed 144 / 84 / 292), shows `dev_dot_q4_K_q8_K_block8` is **bit-identical** to n single-block calls for n=1..8 — and substituting the single-block expression inside the tile8 kernel left the logits dump **byte-identical**. A repeat run is byte-identical, and disabling the local batch IO staging changes nothing |
 | M8 | Temporarily routed Q4_K around tile8 | a guard making `use_expert_tile8` require Q2_K, verified byte-identical to the warp run — **reverted in Phase N**, where the real cause turned out to be the expert count rather than the kernel |
 
@@ -249,7 +249,7 @@ once the real cause was fixed.
 | N2 | The model has 288 experts, not 256 | read straight from both GGUFs: `glm5-next.expert_count = 288`, `expert_used_count = 8`, `expert_feed_forward_length = 2048`. `glm_moe_expert_map_kernel` skips `e >= n_total_expert`, so every pair routed to experts 256–287 was dropped: no `mid` row was written for it, and the down projection then read uninitialised data — a wrong answer that looked plausible, never a crash |
 | N3 | Fixed all nine sites to use the model's count | counts and lists sizing, both expert-map launches, both tile-builder launches and the three weight lookaheads; the parameter is validated (`n_total_expert == 0 \|\| > 65536` rejected) instead of discarded. The lookahead matters on its own: with 256 it under-covered the last 32 experts for the streaming resolver |
 | N4 | Verified with tile8 enabled on both models | Q4_K pair: **byte-identical to the warp-path run**, top-16 15-of-16 against the Metal reference, mean \|Δ\| 0.109 over the reference's top-16, argmax agreeing. Phase M's guard was reverted as unnecessary — the tile8 path was never wrong, it was being fed the wrong set of pairs |
-| N5 | Bounded the exposure | this is **pre-existing**: the literal 256 predates WS 1 and WS 2, and it stays latent until the prefill chunk reaching the worker is ≥ 128 tokens, because that is when the tile8 branch runs. The Q2_K control runs at this prompt never routed to an expert ≥ 256 — Q2_K tile8 fixed, Q2_K tile8 pre-fix and Q2_K warp are byte-identical — so those results stand, while **any earlier Q2_K prefill that did take the tile8 path with ≥ 128-token chunks was silently dropping 32 of 288 experts** |
+| N5 | Bounded the exposure — **and withdrew my first attempt at this row** | `n_total_expert` is type-independent, so any run that reached the expert map was subject to the 256 bound, for either model. What I cannot support is what I first wrote here: that the Q2_K control runs "never routed to an expert ≥ 256". That is statistically impossible — about 22 layers × 1091 tokens × 8 slots ≈ 192k selections over 288 experts — and I never verified it. The evidence I offered for it, that the Q2_K tile8 and warp dumps were byte-identical, proves nothing either way unless the runs took *different* paths, which I had not checked. The path trace added in Phase Q shows this pipeline hands the worker's MoE all 1091 tokens at once and takes tile8 for Q4_K, so the Q2_K run should have taken it too and the byte-identity is left **unexplained**. The likeliest cause is my own harness: the same command form failed to propagate `DS4_GLM_MOE_TRACE` to one worker, so the `DS4_GLM_MOE_NO_EXPERT_TILE8` flag that defined the warp comparison may never have reached it, which would make the comparison vacuous |
 
 **Consequence.** WS 2's gate is met on the corrected path (100.57 t/s against
 the 40.80 t/s streaming baseline), and the WS 3–4 shapes inherit the fix. The
@@ -293,6 +293,57 @@ runs. The coverage checks are the type-independent part and the Q4_K case proves
 them. The clamp is verified on real weights (P4) rather than synthetically -
 making it bind on purpose needs weights whose dot deterministically exceeds it,
 and that construction is worth doing separately.
+
+### Phase Q — Self-audit: what I got wrong, and the tool that would have prevented it
+
+Prompted by a direct question about fallacies in my own reasoning. The *fixes*
+hold up — each was verified, and the expert-major grid one is now validated to
+fail pre-fix and pass post-fix. The *reasoning* around them did not, in three
+places, and the tooling failed often enough to matter.
+
+**The load-bearing fallacy.** I reasoned "the tile8 and warp kernels are
+templated over the weight type, therefore the difference must be in a
+type-dependent piece — the block dot or the block stride". That silently assumes
+both paths compute *the same work*, i.e. that shared code means shared inputs.
+They do not: tile8 goes through the expert map, warp reads `selected` directly. A
+defect in *shared* code — the 256 expert bound — could therefore hit one path and
+not the other, and I had ruled that out by construction. Every check I then ran
+(a bit-exact dot unit test, substituting one dot form for the other, bisection,
+staging, determinism) was sound and aimed at the wrong layer. What would have
+shortcut it is comparing the inputs the two paths *see*, or simply asking which
+experts each visited — and I had built the logits harness before ever pointing it
+at path coverage.
+
+| # | Finding |
+| --- | --- |
+| Q1 | **Unsound inference from a bit-identity** (Phase M, row M6). "Q2_K tile8 ≡ Q2_K warp, byte-identical" was treated as proof that the tile8 machinery is sound for Q2_K. A bit-identity is evidence of nothing unless the two runs are known to have taken *different* paths, and I never established that. It was the pivotal wrong step. |
+| Q2 | **An impossible explanation written as fact** (Phase N, row N5). "The Q2_K controls never routed to an expert ≥ 256" — over ≈192k selections, so P ≈ e^−22600. I should have noticed the number instead of writing the sentence. Withdrawn. |
+| Q3 | **A cause asserted but never measured.** The 64-token greedy divergence is described as a near-tie. Plausible, but unverified — and the Q2_K calibration (identical text with *noisier* logits, 0.196 against 0.085) argues against the simple noise story rather than settling it, which is how I described it. The gap at the divergence point was never measured. |
+| Q4 | **Mixed measurement bases.** The clamp fix is reported as "mean \|Δ\| 0.085 → 0.0727", comparing the pre-fix *vocabulary* mean with the post-fix *top-16* mean. Like-for-like (top-16): 0.1085 → 0.0727, max 0.3416 → 0.1972. The conclusion holds; the arithmetic as stated did not. |
+| Q5 | **A performance regression I introduced and then rationalised.** After my own substitution experiment showed the two dot forms are bit-identical, I left the Q4_K `glm_moe_dot8` as n single-block calls with a comment framing it as the safer choice. It is the slower of two proven-equivalent expressions. Reverted. |
+| Q6 | **Two more instances of the same ABI fault, one of them called.** Extending the signature check found the `direct_scalar_q4` stub missing `swiglu_clamp` — and unlike the batch entry, `ds4.c` calls it. Harmless in effect (the stub returns 0 either way), but it is a public API. The CUDA GLM MoE surface had **three** signature mismatches, all masked by AAPCS64 passing floats in the FP register file. |
+| Q7 | **An over-claim already corrected** (Phase O): a tile-capacity slack called a latent overflow when it was sufficient — \`ceil(n_pairs/8) + 252\` against a capacity of \`+ 256\`. |
+| Q8 | **Tooling carelessness, repeatedly**: `rsync -e "$SSH"` with the host included (twice), a `sed` that corrupted a script, and a Python heredoc with an unterminated string — so that a "measurement" ran against the *unfixed* binary and printed a meaningless IDENTICAL — plus reading a post-run log tail as if it were the run. Individually trivial; together they cost a substantial part of a session and produced one result I briefly took seriously. |
+
+**Added: a path trace.** `DS4_GLM_MOE_TRACE=1` makes the GLM MoE dispatch print
+one line per call — `type`, `tokens`, `experts`, `used`, `path`. It is what
+finally answered the question above: this pipeline hands the worker 1,091 tokens
+unchunked, so prefill runs **tile8** (21 calls) and decode runs warp (63 calls).
+Q1, Q2 and the unexplained byte-identity would all have fallen out of that one
+line at the start, which is the lesson worth keeping: when two paths disagree,
+first establish that they took different paths.
+
+**Also checked while here**, so that the negative results are recorded too: the
+router is *not* bounded to 256 (it accepts up to 384 experts), and Metal's clamp
+form matches my `glm_moe_swiglu` mirror exactly (`gate = min(gate, limit)`, `up =
+clamp(up, ±limit)`) — so the clamp fix's arithmetic is right, not merely closer.
+
+**Still open**: why the pre-fix Q2_K tile8 and warp dumps were byte-identical.
+With the trace showing tile8 is taken, and the bound being type-independent, they
+should have differed. The likeliest cause is my harness — the same command form
+demonstrably failed to propagate a MoE env var to one worker — which would make
+that comparison vacuous. One run with the flag confirmed present in the worker's
+environment settles it.
 
 ---
 
