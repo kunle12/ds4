@@ -1,0 +1,312 @@
+# GLM 5.3 Flash Q4 across Mac + Spark — implementation log
+
+**Purpose.** Running record of what has been done, with the evidence that backs
+each claim, so work can be resumed or audited without re-deriving it.
+**How to use.** Append new entries at the end of §3 and update §1/§2 in place.
+One entry per change or measurement; never rewrite history — correct it in a new
+entry.
+**Related documents.** `ds4-glm53-q4-split-design.md` (the plan and its
+workstreams), `ds4-technical-analysis.md` (engine), `ds4-v41-split-design.md`
+(the analogous V4.1 port study).
+
+Timestamps are local (AEST). Entries marked `≈` are reconstructed from ordering
+rather than read from a log; all quoted numbers and command outputs are
+verbatim from the session.
+
+---
+
+## 1. Status summary (as of 2026-09-19 16:19)
+
+**Objective.** Run `GLM-5.3-Flash-Q4_K.gguf` (177.77 GiB, `glm5-next`, 45
+executable layers) as a two-machine pipeline — Mac Studio coordinator + DGX
+Spark worker — for 250K–500K-token coding sessions, with the Spark inside its
+thermal envelope.
+
+| Area | State |
+| --- | --- |
+| GLM 5.3 layer-slice correctness (wire width) | **done, validated bit-exact** |
+| Cross-machine Q2 pipeline | **working and measured** |
+| Q4_K on the pair | **blocked** — CUDA GLM routed MoE is Q2_K-only; port specified in the plan |
+| Q4_K on the Mac alone | **working and measured** (SSD streaming) |
+| Spark thermal protection | **installed, enabled, verified live** |
+| Access path (macOS ALF workaround) | **installed as a boot-persistent launchd daemon, verified** |
+| Binaries deployed to `~/bin` on both hosts | **done, checksums verified** |
+| Plan for closing the Q4 gap | **written** (`ds4-glm53-q4-split-design.md`) |
+
+**Next action:** workstream 1 of the plan — type traits + dispatch predicate for
+the GLM routed MoE (`{Q2_K, Q4_K}`), then WS 2 (Q4_K prefill), which is the first
+milestone that makes a 262K Q4 ingest measurable behind the guard.
+
+**Nothing is running** except the tunnel daemon (Mac) and the thermal guard
+(Spark), both of which are permanent by design.
+
+---
+
+## 2. Source changes
+
+| # | File / anchor | Change | Why | Verified |
+| --- | --- | --- | --- | --- |
+| 1 | `ds4.c:71777` (`ds4_engine_hidden_f32_values`) | return `N_HC * N_EMBD` when `ds4_model_is_glm53()`, `N_EMBD` otherwise | GLM 5.3's mHC block is the slice payload; the function described GLM 5.2's single stream, so every wire/buffer size was 4× too small | built both backends |
+| 2 | `ds4.c:74441` (GLM branch, `ds4_session_eval_layer_slice`) | `hidden_dim = glm53 ? N_HC*N_EMBD : N_EMBD` | per-token chunk stride across a slice boundary | built both |
+| 3 | `ds4.c:73521` (`ds4_session_eval_output_head_from_hc`) | write into `gg->hc_cur` for glm53 | the head collapses the HC block; writing `gg->cur` left it stale | built both |
+| 4 | `ds4_metal.m:4754` + `:4821` | new `ds4_metal_executable_dir()`; search `<exe_dir>/metal/…` in addition to `metal/…` and `./metal/…` | kernel sources were CWD-relative only, so an installed binary (`~/bin/ds4-server` + `~/bin/metal`) only worked if started from a directory containing `metal/` | built, verified from `/tmp` |
+
+Changes 1–3 are the fix that makes GLM 5.3 pipeline mode work at all; change 4
+is required for the `~/bin` deployment convention.
+
+**Not in the repository** (host-level, staged outside the tree): the Spark
+thermal-protection scripts/units (§7) and the launchd tunnel job (§7).
+
+Working tree also contains an untracked `docs/custom/` (this log and the plan) and
+the user's pre-existing `README.md` modification.
+
+---
+
+## 3. Chronological log
+
+### Phase A — Analysis (before any change)
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| A1 | Read the technical-analysis doc, `docs/DISTRIBUTED.md`, `DGX_SPARK.md`, `MODELS.md`, `NETWORK_SETUP.md`, QA gates, and the distributed/GLM code paths | `ds4_distributed.c` is model-agnostic; GLM has a slice branch; whole pipeline mode exists |
+| A2 | Parsed the GGUF directly (metadata + tensor table, 1412 tensors) | `general.architecture = glm5-next`, 46 blocks, `nextn=1` ⇒ 45 executable; `q4_k` = 163.27 GiB in **129 tensors = 43 MoE layers × gate/up/down**; everything else BF16/Q8_0/F32; per-layer bytes exact |
+| A3 | `./ds4 --inspect` on the checkpoint | engine binds it as `GLM-5.3-Flash`, 320.76 B params, 177.77 GiB |
+| A4 | Memory-admission probes per slice (`DS4_GLM_MEMORY_GUARD_REPORT=1`) | 3-layer slice: graph 2.80/2.88/2.97 GiB at 8K/32K/64K ctx ⇒ graph cost is ~layer-count independent; measured budget 115.19 GiB |
+| A5 | Verified the Mac↔Spark 10GbE direct link | `en0` 10Gbase-T active, `192.168.2.1`; Spark `enP7s7` 10000Mb/s; RTT 0.94–1.21 ms; single-stream TCP **0.46 GiB/s**; payload need ≈26 MB/s |
+
+### Phase B — Defect discovery, fix, validation
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| B1 | Traced the slice payload width | the GLM 5.3 tape reads/writes `n_tokens × N_EMBD × N_HC` (64 KiB/token) in all three forward paths (`ds4.c:52361`, `:53646`, `:55619` and readbacks), while `ds4_engine_hidden_f32_values` returned `N_EMBD` (16 KiB) |
+| B2 | Confirmed by history | `git log -L` on that function: the `GLM_DSA → N_EMBD` special case arrived with **GLM 5.2** (n_hc = 0); the `glm53 ? N_HC : 1` multiplier arrived later with **GLM 5.3** — the wire contract was never updated |
+| B3 | Patched the three sites (§2 #1–3) | — |
+| B4 | Built Mac (Metal) and Spark (CUDA `sm_121`) | Spark `ds4` 47.6 MB; Mac binaries rebuilt |
+| B5 | **Loopback parity test** — two processes on the Mac, Q2, `--layers 0:23` + `--layers 24:output`, 48 greedy tokens vs a single-host Q2 run | **byte-identical output** (`diff` clean). Any HC-carry error diverges immediately, so this validates the fix end to end |
+| B6 | Probed long-context slice memory | coordinator (0:23) ctx 524288: 94.88 / 115.19 GiB; worker (24:output): 92.07 / 103.63 GiB — the pair holds all 173.74 GiB of executable weights resident |
+
+### Phase C — Cross-machine work, and the Q4 blocker
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| C1 | First cross-machine attempt: Mac coordinator `--listen 192.168.2.1`, Spark worker | route never established; worker's HELLO sat unaccepted (`CLOSE_WAIT`, no owner, `accept()` never returned) |
+| C2 | Isolated the cause | loopback `--listen 127.0.0.1` accepts normally; a **20-line `cc`-built listener fails identically** from the same shell while Apple-signed `/usr/bin/nc` works on the same address/port ⇒ macOS Application Firewall (confirmed enabled: `Firewall is enabled. (State = 1)`), not a ds4 bug |
+| C3 | Workaround: `ssh -R 9911:127.0.0.1:9911` tunnel; Mac coordinator on loopback, Spark worker dialing its own loopback | route established |
+| C4 | **Q2 pipeline measured** at 32 768 ctx | 383.48 t/s prefill, 12.82 t/s decode, first token 136 ms |
+| C5 | Spark-as-coordinator Q4 attempt | `ds4: glm routed moe: unsupported types 12/12/12` |
+| C6 | Read the CUDA dispatch | `ds4_cuda.cu:32103`: `if (gate_type != 10u || up_type != 10u || down_type != 10u) … return 0;` — type 10 = Q2_K; the decode path delegates to the same batch function |
+| C7 | CUDA coordinator-side slice prefill | `CUDA tensor read failed: unspecified launch failure` for chunks ≥ 512 rows (512/2048/4096/8192 all fail; a 26-token slice works). **Reproduced on pristine `8db1d1d`** ⇒ pre-existing, not caused by §2 #1–3 |
+| C8 | Stale-worker incident | an unpatched worker left running caused `input hidden-state size does not match token span`; diagnosed with temporary instrumentation that printed got/want/tokens/hc/bits. Instrumentation **reverted**; only the three functional hunks remain |
+
+### Phase D — Q4 measured where it can run
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| D1 | Mac alone, Q4 + `--ssd-streaming`, 32 768 ctx | 84.23 t/s prefill, 8.84 t/s decode; plan 97.09 GiB; **5 435 / 12 384 experts** cached (71.65 GiB) |
+| D2 | Same at 262 144 ctx | **82.47 t/s prefill (53 min cold ingest), 8.00 t/s decode**; plan 99.84 GiB; expert cache unchanged; no thermal warning logged by macOS |
+| D3 | Derived streaming baseline | per-token routed-expert traffic 4.43 GiB; ~40 % misses ⇒ ~1.78 GiB/token from SSD |
+
+### Phase E — Spark thermal protection
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| E1 | Spark went offline mid-run | Mac `en0` lost media (`status: inactive`), `spike.local` mDNS failed, `192.168.2.2` unreachable. User restarted it |
+| E2 | User attributed it to thermal protection; confirmed on the web | NVIDIA field diagnostic fails such units on **PowerStress, `020000600139`**; death state logged as `[HW_THERMAL_SLOWDOWN] · GPU 88→90 °C · CPU zones 97→98 °C`, ACPI trip 104 °C; silent hard-lock with no panic/OOM is the documented symptom. **This corrects my earlier "memory exhaustion" hypothesis** |
+| E3 | Measured the Spark uncapped under pipeline prefill | board peak **90 °C** (10/60 samples ≥ 85 °C), `HW Thermal Slowdown` accumulating, `SW Power Capping` 69 s; GPU die ~10 °C cooler than the board zone |
+| E4 | Built the protection kit (guard + CPU cap + units + installers + README) | staged `/tmp/gb10-thermal-protect`, pushed to Spark `~/thermal-protect`; **backed up to Mac `~/thermal-protect`** |
+| E5 | Install hang diagnosed | not the script: `is-system-running = starting`, `plymouth-quit-wait.service` `activating` 17 min (headless box booting to `graphical.target`), so every start job ordered after `multi-user.target` queued behind it. Unit reordered to `After=local-fs.target`; `set-default multi-user.target` applied by the user |
+| E6 | Guard bug found and fixed | `board: parameter not set` → `set -u` exit 2 on the *first* `set_cap` (board not yet sampled); slow-down field parse was off by one; initial cap logged `board=0C`. All three fixed and **verified with a stub `nvidia-smi` that succeeds at `-lgc`** (the unprivileged dry-run never entered that branch, which is why the bug escaped) |
+| E7 | Installed and verified | `gb10-cpu-cap.service` active (`scaling_max_freq = 2400000` on all policies, hw max 2.81 GHz); `gb10-thermal-guard.service` active; GPU clock range locked ≤2100 MHz; board 47–50 °C idle |
+| E8 | **Capped sweep** (bounded 32K → 64K → 128K, guard armed) | see §4; peak board **81 °C**, **0** throttle-active samples over 269 guard samples, 0 guard interventions |
+
+### Phase F — Deployment
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| F1 | `ds4_metal.m` executable-relative lookup (§2 #4) | `cd /tmp && ~/bin/ds4 …` compiled its Metal library and answered `O(log n)`; `/tmp` has no `metal/` so this can only come from the new path |
+| F2 | Installed 5 binaries to `~/bin` on both hosts (+ `metal/` on the Mac) | checksums MATCH on all; replaced stale builds (Mac `ds4-server` Sep 17, Spark Sep 13) |
+| F3 | Found the pre-existing CWD workaround in `llm_config.json` | V4.1 entry uses `/Users/xun/dev/ds4/ds4-server --chdir /Users/xun/dev/ds4`; V4 Flash uses the stable `~/bin/ds4-server`. With F1 the V4.1 entry can drop `--chdir` and the repo path |
+| F4 | Built `~/ds4-tunnel` (daemon + agent plists, installers, README) | address pinned to the literal IPv4 (an mDNS failure is what killed the first tunnel); `KeepAlive`, `TCPKeepAlive`, `ServerAliveInterval`, `BatchMode`, explicit `-i`/known_hosts, `ExitOnForwardFailure`, logs to `~/Library/Logs` |
+| F5 | Verified the exact plist command line before install | Spark loopback listener up; worker connected; coordinator (`~/bin/ds4`, run from `/tmp`) generated correct output |
+| F6 | Could not install the launchd job myself | my shell is an SSH/Background session: `gui/501` unreachable (125), `user/501` rejects (EIO), legacy `launchctl load -w` silently ineffective. Installers now fail loudly with that explanation |
+| F7 | User installed the daemon | `state = running`, never exited; runs as `xun` |
+| F8 | **Acceptance tests on the installed daemon** | listener on Spark loopback ✓; **KeepAlive**: killed pid 45807 → launchd started 45914 within ~2 s, listener back ✓ |
+| F9 | End-to-end through the daemon, installed binaries | **Q2: works** (route ready, correct output, 21.3 t/s prefill / 17.4 t/s decode on a 16-token prompt). **Q4: fails as designed** — coordinator `prompt processing failed: cuda GLM layer-slice evaluation failed at pos 0`, worker `glm routed moe: unsupported types 12/12/12` ⇒ the gate bites from the **worker side** too, confirming no contiguous cut avoids it |
+
+### Phase G — Plan
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| G1 | Wrote `ds4-glm53-q4-split-design.md` | goal + acceptance criteria; measured state; the three gaps; design (template the ten GLM MoE kernels, dispatch mirroring Metal, escape hatch); 11 workstreams with effort; layered validation; risks; rollout; fallbacks; open questions |
+| G2 | Updated it with the tunnel/snapshot constraint (§4.2) | acceptance criterion 6 (snapshot round-trip) needs a direct connection or a HELLO addition carrying the worker's reachable host |
+
+### Phase H — Repository organisation
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| H1 | Renamed `docs/src/` → `docs/custom/` at the owner's request, so everything in that directory is known to be owner/agent-authored rather than upstream | directory is untracked in git (`?? docs/custom/`), so a plain `mv` was correct; updated the three references that named the old path (this log's artifact table and working-tree note, and `ds4-v41-split-design.md` §related-analysis); verified no `docs/src` or `src/ds4-` reference remains in the tree, and none in the out-of-tree kits |
+
+---
+
+## 4. Measurements
+
+### 4.1 Q2 pipeline, Mac coordinator (0:23) + Spark worker (24:output), over the tunnel
+
+| ctx | tokens prefilled in that step | prefill | decode | first token | conditions |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 32 768 | 32 768 | 383.48 t/s | 12.82 t/s | 136 ms | uncapped clocks |
+| 32 768 | 32 768 | 380.55 t/s | 12.48 t/s | 135 ms | **capped** (GPU ≤2100 MHz, CPU 2.4 GHz) |
+| 65 536 | +32 768 | 364.41 t/s | 12.02 t/s | 134 ms | capped |
+| 131 072 | +65 536 | 360.75 t/s | 11.42 t/s | 123 ms | capped |
+
+Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board margin.
+
+### 4.2 Q4_K on the Mac alone (`--ssd-streaming`)
+
+| ctx | prefill | decode | plan | expert cache |
+| ---: | ---: | ---: | ---: | --- |
+| 32 768 | 84.23 t/s | 8.84 t/s | 97.09 GiB | 5 435 / 12 384 (71.65 GiB) |
+| 262 144 | 82.47 t/s (53 min ingest) | 8.00 t/s | 99.84 GiB | unchanged |
+
+### 4.3 Spark thermals
+
+| Condition | Board peak | Throttle evidence |
+| --- | ---: | --- |
+| uncapped, pipeline prefill | **90 °C** (10/60 samples ≥ 85 °C) | `HW Thermal Slowdown` accumulating; `SW Power Capping` 69 s |
+| capped + guard, 32K→128K sweep | **81 °C** over 269 samples | **0** slowdown-active samples, 0 guard interventions |
+| idle after install | 47–50 °C | GPU clock 1495 MHz (within the [1500, 2100] lock) |
+
+### 4.4 Memory admission (measured with the engine's own guard)
+
+| Slice | ctx | required | budget |
+| --- | ---: | ---: | ---: |
+| Mac coordinator `0:23` | 262 144 | 93.29 GiB | 115.19 |
+| Mac coordinator `0:23` | 524 288 | 94.88 GiB | 115.19 |
+| Spark worker `24:output` | 262 144 | 90.74 GiB | 103.63 |
+| Spark worker `24:output` | 524 288 | 92.07 GiB | 103.63 |
+
+### 4.5 Link
+
+`en0` 10Gbase-T active; `enP7s7` 10000Mb/s full duplex; RTT 0.94–1.21 ms; single-stream TCP 4 GiB in 8.94 s ⇒ **0.46 GiB/s**; wire need ≈26 MB/s at 400 t/s. **Not the constraint.**
+
+---
+
+## 5. Defects found, and their disposition
+
+| Defect | Evidence | Disposition |
+| --- | --- | --- |
+| GLM 5.3 slice wire width (`N_EMBD` vs `N_HC×N_EMBD`) | three tape sites + git history | **fixed** (§2 #1–3), bit-exact parity |
+| CUDA GLM routed MoE is Q2_K-only | `ds4_cuda.cu:32103`; `unsupported types 12/12/12` from both roles | **open** — the port in the plan |
+| CUDA coordinator-side slice prefill crashes ≥512-row chunks | reproduced on pristine `8db1d1d` | **open, out of scope** while the Mac leads; workstream 10 |
+| macOS ALF blocks inbound for adhoc-signed binaries | `cc` listener vs Apple `nc`; loopback exempt | **worked around** (launchd tunnel); ALF allow is the alternative |
+| Metal kernel sources resolved only from CWD | `metal/…`, `./metal/…` candidates | **fixed** (§2 #4) |
+| Spark hard-locks under sustained load | board 90 °C, `HW_THERMAL_SLOWDOWN`, unreachable; NVIDIA field-diagnostic PowerStress failure | **mitigated** (caps + governor); user has declined RMA |
+| Guard: `set -u` exit on first `set_cap`; slow-down parse; initial `board=0C` | journal `board: parameter not set`, status `2` | **fixed** and stub-verified |
+| Install hang: plymouth boot stall | `is-system-running = starting` for 17 min | **fixed** (unit ordering) + `set-default multi-user.target` |
+| Snapshot over the tunnel | coordinator derives worker address from the socket = `127.0.0.1` | **open** — recorded in the plan §4.2 |
+
+---
+
+## 6. Corrections to earlier conclusions
+
+1. **Spark offline was thermal, not memory exhaustion.** My first hypothesis was
+   unified-memory exhaustion from a second worker; the log and the public record
+   say thermal trip. Corrected in Phase E2.
+2. **"`ds4-server` lacks `--chdir`" was wrong.** It is parsed (undocumented in
+   `--help`): `--chdir` alone → `missing value for --chdir`; with a value it is
+   accepted. The user's V4.1 entry works as intended.
+3. **"Spark needs ufw rules" was wrong for this direction.** Verified Mac→Spark
+   inbound on a fresh port (9777) with `ufw` active — it passes. Only relevant if
+   the Spark leads.
+4. **"`gb10-thermal-status.sh` has a defect" was wrong** — the missing section
+   was my `sed` range truncating the output, not the script.
+
+---
+
+## 7. Artifacts and host configuration
+
+### On the Mac
+
+| Path | What |
+| --- | --- |
+| `~/dev/ds4/` | source tree at `8db1d1d` + §2 changes |
+| `~/dev/ds4/docs/custom/ds4-glm53-q4-split-design.md` | the plan |
+| `~/dev/ds4/docs/custom/ds4-glm53-q4-implementation-log.md` | this log |
+| `~/bin/` | `ds4`, `ds4-server`, `ds4-agent`, `ds4-bench`, `ds4-eval` (from today's build) + `metal/` (27 files) |
+| `~/ds4-tunnel/` | tunnel kit: daemon + agent plists, `install.sh`, `install-agent.sh`, `uninstall.sh`, `README.md` |
+| `~/thermal-protect/` | backup copy of the Spark protection kit |
+| `/Library/LaunchDaemons/com.local.ds4-tunnel.plist` | installed by the user; job `com.local.ds4-tunnel`, runs as `xun` |
+| `~/Library/Logs/ds4-tunnel.log` | tunnel log (empty = clean) |
+
+### On the Spark (`192.168.2.2`)
+
+| Path | What |
+| --- | --- |
+| `~/dev/ds4/` | source tree at `8db1d1d` + §2 #1–3 |
+| `~/bin/` | the same five binaries (CUDA `sm_121`) |
+| `~/thermal-protect/` | kit source |
+| `/usr/local/bin/gb10-thermal-guard.sh`, `gb10-cpu-cap.sh`, `gb10-thermal-status.sh` | installed |
+| `/etc/systemd/system/gb10-thermal-guard.service`, `gb10-cpu-cap.service`, `gb10-cpu-cap.timer` | installed, enabled |
+| `~/mlmodels/glm/` | Q2 + Q4 GGUF + vision encoder |
+
+Services: `gb10-thermal-guard.service` (active, `Restart=always`),
+`gb10-cpu-cap.service` + `.timer` (re-applies the CPU cap every 5 min).
+Default target changed to `multi-user.target` (headless).
+
+---
+
+## 8. Open decisions
+
+1. **IQ2_XXS in the same port pass, or Q4_K only?** Q4_K is the stated goal;
+   IQ2_XXS is one more template instantiation (~1–2 days code) but widens the QA
+   matrix, and it is what would let the Spark run IQ2 GLM artifacts.
+2. **Snapshots:** accept the tunnel limitation, or take the ALF-allow route with
+   explicit binds, or add the worker's reachable host to HELLO (protocol change).
+3. **`make install`** target so rebuild → `~/bin` is one command (currently manual
+   `cp`).
+4. Confirm 500K must hold **without** MTP (excluded in distributed mode by
+   `ds4_engine_has_mtp`), i.e. decode stays at ~11–14 t/s.
+
+---
+
+## 9. Next steps (from the plan)
+
+| WS | Work | Effort |
+| --- | --- | --- |
+| 1 | type traits + dispatch predicate for GLM MoE (`{Q2_K, Q4_K}`), loud failure otherwise, `DS4_CUDA_GLM_MOE_TYPES=q2k` escape hatch | 0.5–1 d |
+| 2 | Q4_K prefill instantiations (tile8 gate/up, down terms + reduce) — **first measurable milestone** | 2–3 d |
+| 3 | Q4_K expert-major gate/up + down | 1–2 d |
+| 4 | Q4_K decode instantiations (warp-per-pair, tok2-reuse, down warp, small-batch) | 2–3 d |
+| 5 | CPU/GPU parity harness for the GLM MoE Q4_K path | 1–2 d |
+| 6 | cross-machine oracle (pipeline vs single-host, logits + `--dist-replay-check`) | 1–2 d |
+| 7 | boundary gates (2 048→2 056, 4 096→4 100), snapshot round-trip | 1–2 d |
+| 8 | long-context endurance (262K ingest, 524K alloc) with peak board logged per frontier | 1–2 d |
+| 9 | docs + release gates | 0.5–1 d |
+| 10 | *(optional)* CUDA coordinator-side slice prefill fix | 1–3 d |
+| 11 | *(optional)* IQ2_XXS instantiations | 1–2 d |
+
+Critical path WS 1 → 2 → 5 → 6 ≈ 1–1.5 weeks; full set with QA and docs ≈ 2–3 weeks.
+
+---
+
+## 10. Quick acceptance commands
+
+```sh
+# tunnel (Mac)
+launchctl print system/com.local.ds4-tunnel | grep -E "state|pid|last exit"
+ssh 192.168.2.2 'ss -tln | grep 9911'
+
+# thermal protection (Spark)
+ssh 192.168.2.2 'systemctl is-active gb10-thermal-guard.service gb10-cpu-cap.service'
+ssh 192.168.2.2 '/usr/local/bin/gb10-thermal-status.sh | head -20'
+ssh 192.168.2.2 'journalctl -u gb10-thermal-guard -n 5 --no-pager'
+
+# binaries work from any directory
+cd /tmp && ~/bin/ds4 --inspect -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf | head -3
+
+# working cross-machine configuration (Q2)
+ssh 192.168.2.2 'pkill -x ds4; (setsid nohup ~/bin/ds4 --cuda -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf \
+  --role worker --layers 24:output --coordinator 127.0.0.1 9911 --ctx 524288 >/tmp/w.log 2>&1 </dev/null &)'
+cd /tmp && ~/bin/ds4 -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf --role coordinator --layers 0:23 \
+  --listen 127.0.0.1 9911 --ctx 32768 --temp 0 -n 32 -p "your prompt"
+```
