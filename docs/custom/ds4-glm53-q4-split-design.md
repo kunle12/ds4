@@ -331,14 +331,17 @@ Two `ds4` processes on this box is not a supported configuration, not even
 transiently: the guard's `TARGET_KILL=ds4` at `ZONE_ABORT=95 °C` is a backstop
 for the hardware, not a licence to over-subscribe memory.
 
-**Check the admission numbers before launching, not after.** The guard prints
-`required=… GiB budget=… GiB` on startup: a *whole-model* 512K run plans ~98.88 GiB
-against 121 GiB on this box. The Mac handles that (measured, 186.89 / 19.71 t/s);
-the Spark does not — a whole-model Q2 run at 512K froze it and it **rebooted itself**
-~20 minutes later, with a cool board and zero guard ABORTs in the record
-(log §4.1b). The **split slices are the supported shape**: `0:23` and `24:output`
-measured 94.88 and 92.07 GiB, and the pair ran a 403K ingest at 67 °C with the box
-responsive.
+**Check the admission numbers before launching — and treat them as necessary, not
+sufficient.** The guard prints `required=… GiB budget=… GiB` on startup, and a
+*whole-model* 512K run plans ~98.88 GiB against 121 GiB on this box: the Mac admits
+and completes it (186.89 / 19.71 t/s, measured); the Spark does **not** — the GPU
+driver refused the allocations outright (`NVRM: … Out of memory [NV_ERR_NO_MEMORY]
+… _memdescAllocInternal`), logging stopped inside 7 seconds, and the box reset
+abruptly 19 minutes later with the watchdog never armed and zero guard ABORTs
+(log §4.1b). The guard's budget derives from system RAM and does not include NVRM's
+own reservation, so it cannot authorise a whole-model run on that box. The **split
+slices are the supported shape**: `0:23` and `24:output` measured 94.88 and
+92.07 GiB, and the pair ran a 403K ingest at 67 °C with the machine responsive.
 
 ---
 

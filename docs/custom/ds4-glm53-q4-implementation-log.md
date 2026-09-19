@@ -237,24 +237,54 @@ argued. Two consequences the earlier estimates missed:
   outright (19.71 vs 9.26 decode); the pair is only compelling where no single
   machine can hold the model and the alternative is streaming.
 
-**Whole-model Q2 at 512K freezes the Spark, and it reboots itself.** Launching it
-(98.88 GiB planned against 121 GiB, by the same guard arithmetic the Mac printed)
-produced, in order: the guard's *last* journal sample at 22:03:58 — `board=55C
-gpu=50,2093MHz,9.54W slowdown=Not Active`, i.e. cool and idle as the load began; no
-further sample for 19 minutes; `ping` 0.4 ms and TCP accepted on `:22` while no
-`sshd` banner arrived at 60-second budgets (22:14 onward); and a **self-reboot at
-22:23**, back up at 22:24 with 118 GiB free and the guard re-armed. Zero guard
-ABORTs, and the last evidence before the freeze is a cool board.
+**Whole-model Q2 at 512K freezes the Spark, and it reboots itself.** The previous
+boot's own records give the proximate cause, which is the **GPU driver, not heat**:
 
-The mechanism is **not established**: memory exhaustion, a firmware/driver stall on
-the single ~90 GiB unified allocation, and a fast thermal transient the guard could
-not sample are all consistent with what is recorded. The Mac ran the identical
-workload to completion (186.89 / 19.71), so this is specific to the Spark's
-whole-model shape, not to the workload. Consequences for the plan: §9's "Q2 on one
-Spark resident" fallback is **not valid at 512K**; any whole-model run on the Spark
-needs its admission numbers checked before launch; and the **split slices are the
-supported shape** on that box (94.88 / 92.07 GiB, which ran a 403K ingest at 67 °C
-with the machine responsive).
+```
+Sep 19 22:03:51-22:03:58 spike kernel: NVRM: GPU0 nvCheckOkFailedNoLog:
+  Check failed: Out of memory [NV_ERR_NO_MEMORY] (0x00000051)
+  returned from _memdescAllocInternal(...)          ← repeated, ~20+ lines
+Sep 19 22:03:58 spike kernel: NVRM: ... [last line in that boot's journal]
+```
+
+The engine's own guard had admitted the run — `required=98.88 GiB budget=115.19
+GiB` on the Mac — so **the guard's budget is not sufficient for a whole-model CUDA
+run on this box**: it is derived from system RAM, while NVRM reserves its own
+overhead and refused the allocations outright. Sequence: cool idle board
+(`board=55C gpu=50,9.54W slowdown=Not Active` at 22:03:58) → the driver failed to
+allocate → **the journal stops dead at 22:03:58** → kernel still answering `ping`
+0.4 ms and accepting TCP on `:22`, but no `sshd` banner at 60-second budgets from
+22:14 → **abrupt reset at 22:23** (boot record; no shutdown entry at all).
+
+What is *excluded*: the **watchdog** (SBSA `state: inactive`, `timeout: 10`,
+raw `bootstatus = 0`, and `CARDRESET = 0` — it was never armed), a logged panic or
+oops (none), any NVIDIA Xid (none — only the allocation failures), and the guard's
+own abort (0 ABORTs).
+
+What is *not* established: which unlogged mechanism performed the reset at 22:23 —
+19 minutes after the freeze. The `acpitz` zones all carry a **104 °C critical trip**
+that powers off by design with no log and no shutdown record, which fits both the
+silence and the delay (`CARDRESET = 0` rules the SBSA card-reset path out); a
+platform/firmware reset after the wedged allocation loop, and a power-delivery
+protection event, are equally consistent. The box behaves exactly as its documented
+failure mode describes — *"no panic, no OOM, no shutdown record"* — now with the
+trigger visible for the first time.
+
+**Both of the evening's freezes carry this signature.** The earlier one (boot -2,
+journal ends 17:21:10, previously put down to "memory pressure from two resident
+workers") has **six** `NV_ERR_NO_MEMORY` lines in its final seconds, exactly like
+this one's twenty-four. So both outages are the **GPU driver refusing allocations
+under over-subscription** — two resident workers then (≈86 GiB Q4 + ≈45 GiB Q2
+against 121 GiB), one whole model at 512K now (~99 GiB planned, still refused) — and
+neither is thermal. That is the failure to design around, and it is why the fix is
+the split-slice shape rather than a tighter thermal band: the box has survived 92.07
+GiB slices at depth and has not survived either whole-model arrangement.
+
+Consequences for the plan: §9's "Q2 on one Spark resident" fallback is **not valid
+at 512K**; the guard's admission number is **necessary but not sufficient** for
+whole-model runs on this box; and the **split slices are the supported shape**
+(94.88 / 92.07 GiB, which ran a 403K ingest at 67 °C with the machine responsive).
+The Mac ran the identical workload to completion (186.89 / 19.71).
 
 Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board margin.
 
@@ -487,6 +517,16 @@ corrected measurement.
     ABORTs** and the evening's peak board was **74 °C**. That is userland
     starvation with a live kernel, and not heat — evidence that was on the box
     the whole time and should have been read during the incident, not after it.
+
+    **The mechanism is now identified at the driver level.** That boot's own
+    journal ends with **six** `NVRM: GPU0 … Out of memory [NV_ERR_NO_MEMORY]
+    (0x00000051) … _memdescAllocInternal` lines at 17:21:07–17:21:10, immediately
+    before logging stops — the same signature as the 22:03 freeze (24 such lines,
+    log §4.1b). Both outages are therefore the **GPU driver refusing allocations
+    under over-subscription**, not thermal events and not generic host-memory
+    pressure: two resident workers the first time (≈86 GiB Q4 + ≈45 GiB Q2 against
+    121 GiB), one whole model at 512K the second (~99 GiB planned, still refused,
+    despite the engine's own guard admitting it).
 
 11. **Two comparisons used numbers that are not comparable.** The plan's §10
     answer on MTP set "the capped pair decodes 12.48 t/s at 32K" against "8.00 t/s
