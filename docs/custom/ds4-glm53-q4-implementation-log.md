@@ -202,6 +202,14 @@ backed up on the Mac and documented in §7.
 | 32 768 | 32 768 | 380.55 t/s | 12.48 t/s | 135 ms | **capped** (GPU ≤2100 MHz, CPU 2.4 GHz) |
 | 65 536 | +32 768 | 364.41 t/s | 12.02 t/s | 134 ms | capped |
 | 131 072 | +65 536 | 360.75 t/s | 11.42 t/s | 123 ms | capped |
+| 403 351 | cold 403K ingest | **346.41 t/s** | **9.26 t/s** | — | capped, `--prompt-file`, ~19.5 min ingest |
+
+Prefill is **depth-robust** (346 t/s at 403K against 380 at 32K), while decode falls
+with depth (12.48 → 9.26 t/s) — the `max(stage)` / `sum(stage)` structure the plan
+predicted. Worth noting for anyone reading intermediate progress lines: two ad-hoc
+rate estimates taken during that ingest (≈90 t/s and ≈171 t/s) were artefacts of
+imprecisely bounded sampling intervals; only the program's own reported figure
+counts.
 
 Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board margin.
 
@@ -573,6 +581,12 @@ ssh 192.168.2.2 'pkill -x ds4; (setsid nohup ~/bin/ds4 --cuda -m ~/mlmodels/glm/
   --role worker --layers 24:output --coordinator 127.0.0.1 9911 --listen 127.0.0.1 55911 --ctx 524288 >/tmp/w.log 2>&1 </dev/null &)'
 cd /tmp && ~/bin/ds4 -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf --role coordinator --layers 0:23 \
   --listen 127.0.0.1 9911 --ctx 32768 --temp 0 -n 32 -p "your prompt"
+
+# long one-shot runs: detach from the terminal
+#   a `nohup ... &` started from an agent/SSH PTY can leave ds4 blocked on
+#   /dev/ttys000 at 0% CPU with the model unloaded (seen 2026-09-19 with
+#   --prompt-file). Run it under `ssh localhost` or as a launchd job, and check
+#   `ps -o pcpu` before waiting on it.
 
 # snapshot acceptance (distributed checkpoint save + load, §11)
 ~/bin/ds4-server -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf --role coordinator --layers 0:23 \
