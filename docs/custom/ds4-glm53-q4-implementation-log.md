@@ -244,7 +244,7 @@ Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board marg
 | CUDA coordinator-side slice prefill crashes ≥512-row chunks | reproduced on pristine `8db1d1d` | **open, out of scope** while the Mac leads; workstream 10 |
 | macOS ALF blocks inbound for adhoc-signed binaries | `cc` listener vs Apple `nc`; loopback exempt | **worked around** (launchd tunnel); ALF allow is the alternative |
 | Metal kernel sources resolved only from CWD | `metal/…`, `./metal/…` candidates | **fixed** (§2 #4) |
-| Spark hard-locks under sustained load | board 90 °C, `HW_THERMAL_SLOWDOWN`, unreachable; NVIDIA field-diagnostic PowerStress failure | **mitigated** (caps + governor); user has declined RMA |
+| Spark hard-locks under sustained load | board 90 °C, `HW_THERMAL_SLOWDOWN`, unreachable; NVIDIA field-diagnostic PowerStress failure | **mitigated** (caps + governor); RMA declined 2026-09-19 — revisit only if a caps-armed run trips, which the plan's endurance gate is designed to surface |
 | Guard: `set -u` exit on first `set_cap`; slow-down parse; initial `board=0C` | journal `board: parameter not set`, status `2` | **fixed** and stub-verified |
 | Install hang: plymouth boot stall | `is-system-running = starting` for 17 min | **fixed** (unit ordering) + `set-default multi-user.target` |
 | Snapshot over the tunnel | coordinator derives worker address from the socket = `127.0.0.1` | **fixed** — second forward `-L 55911:127.0.0.1:55911` plus a worker pinned with `--listen 127.0.0.1 55911`; save and load verified, data sockets observed on 55911 |
@@ -292,9 +292,10 @@ Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board marg
 | `~/dev/ds4/docs/custom/ds4-glm53-q4-implementation-log.md` | this log |
 | `~/bin/` | `ds4`, `ds4-server`, `ds4-agent`, `ds4-bench`, `ds4-eval` (rebuilt 2026-09-19 17:46) + `metal/` (26 kernels) |
 | `~/ds4-tunnel/` | tunnel kit: daemon + agent plists, `install.sh`, `install-agent.sh`, `uninstall.sh`, `README.md` |
+| `~/ds4-deploy.sh` | rebuild + install to `~/bin` on this host or the peer; `check` verifies source parity (`ds4.c` md5) and prints both hosts' binaries and process state |
 | `~/thermal-protect/` | backup copy of the Spark protection kit |
 | `/Library/LaunchDaemons/com.local.ds4-tunnel.plist` | installed by the user; job `com.local.ds4-tunnel`, runs as `xun` |
-| `~/Library/Logs/ds4-tunnel.log` | tunnel log (empty = clean) |
+| `~/Library/Logs/ds4-tunnel.log` | tunnel log; the `banner exchange` retries from the 2026-09-19 wedge are expected, and it is silent while the peer answers |
 
 ### On the Spark (`192.168.2.2`)
 
@@ -302,7 +303,8 @@ Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board marg
 | --- | --- |
 | `~/dev/ds4/` | source tree content-matched to the Mac's (`ds4.c` md5 `98c92891…` on both), on branch `main` at `8db1d1d` |
 | `~/bin/` | the same five binaries, rebuilt 2026-09-19 from that tree with `make -j20 cuda-spark` (CUDA `sm_121`) |
-| `~/thermal-protect/` | kit source |
+| `~/thermal-protect/` | kit source, README synced with the Mac backup |
+| `~/ds4-deploy.sh` | same script (md5 identical to the Mac's); `local` here rebuilds `cuda-spark` |
 | `/usr/local/bin/gb10-thermal-guard.sh`, `gb10-cpu-cap.sh`, `gb10-thermal-status.sh` | installed |
 | `/etc/systemd/system/gb10-thermal-guard.service`, `gb10-cpu-cap.service`, `gb10-cpu-cap.timer` | installed, enabled |
 | `~/mlmodels/glm/` | Q2 + Q4 GGUF + vision encoder |
@@ -315,19 +317,27 @@ Default target changed to `multi-user.target` (headless).
 
 ## 8. Open decisions
 
-1. **IQ2_XXS in the same port pass, or Q4_K only?** Q4_K is the stated goal;
-   IQ2_XXS is one more template instantiation (~1–2 days code) but widens the QA
-   matrix, and it is what would let the Spark run IQ2 GLM artifacts.
+1. ~~**IQ2_XXS in the same port pass, or Q4_K only?**~~ Answered 2026-09-19:
+   **Q4_K only.** IQ2_XXS remains WS 11, after the Q4_K milestone clears QA; its
+   mixed trio (IQ2_XXS gate/up with a Q2_K down) is why it is not a free
+   addition to the same pass.
 2. ~~**Snapshots:** accept the tunnel limitation, or take the ALF-allow route with
    explicit binds, or add the worker's reachable host to HELLO (protocol change)?~~
    Answered 2026-09-19: none of those. The tunnel carries the data connection too
    (`-L 55911:127.0.0.1:55911`) with the worker pinned (`--listen 127.0.0.1 55911`),
    and save plus load are verified (§11). The ALF route is closed (plan §3.3) and
    no protocol change is needed.
-3. **`make install`** target so rebuild → `~/bin` is one command (currently manual
-   `cp`).
-4. Confirm 500K must hold **without** MTP (excluded in distributed mode by
-   `ds4_engine_has_mtp`), i.e. decode stays at ~11–14 t/s.
+3. ~~**`make install`** target so rebuild → `~/bin` is one command?~~ Answered
+   2026-09-19: solved **outside** the Makefile, as `~/ds4-deploy.sh` (host-level,
+   like the tunnel and thermal kits). It syncs the source to the peer, picks the
+   right backend per host (Metal here, `cuda-spark` there), and refuses to replace
+   a running binary without `STOP=1`. Upstream's Makefile stays untouched, so a
+   rebase against `antirez/ds4` cannot conflict on it.
+4. ~~Confirm 500K must hold **without** MTP (excluded in distributed mode by
+   `ds4_engine_has_mtp`), i.e. decode stays at ~11–14 t/s.~~ Answered 2026-09-19:
+   **yes** — decode stays ~11–14 t/s and MTP remains excluded under the split;
+   enabling it there is design work (taking the head and its routing across a
+   slice boundary), not a flag.
 5. **The `DS4_GLM_GENERIC_MOE_Q4K` experiment (§2 #6):** drop it now that the
    result is measured, or keep it until WS 2 lands as a comparison point? It is
    inert unless the variable is set, so keeping it costs nothing at runtime, but

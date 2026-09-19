@@ -400,14 +400,26 @@ Layered, cheapest first; each layer must pass before the next is trusted.
 
 ## 10. Open questions for the owner
 
-1. Is Q4_K the target, or should the same work also cover **IQ2_XXS** (the
-   released GLM 5.3 IQ2 artifacts) in the same pass? It is one more
-   instantiation of the same template (WS 11) but widens the QA matrix.
+1. ~~Is Q4_K the target, or should the same work also cover **IQ2_XXS** (the
+   released GLM 5.3 IQ2 artifacts) in the same pass?~~ Answered 2026-09-19:
+   **Q4_K only.** IQ2_XXS stays as WS 11 — one more instantiation of the same
+   template, ~1–2 d — once the Q4_K milestone is through QA. The shipped IQ2
+   recipe is a *mixed* trio (IQ2_XXS gate/up with a Q2_K down), so folding it in
+   would add a second axis to the dispatch predicate and the test matrix rather
+   than a second instantiation.
 2. ~~Grant `ds4` Local Network permission on the Mac, or standardise on the
    supervised tunnel?~~ Answered 2026-09-19: the grant is unavailable to a
    process launched from an SSH session, and the firewall's allow is not honoured
    for adhoc-signed binaries, so the tunnel is standard (§4.2).
-3. Is the Spark's hard-lock RMA-worthy on this unit (field diagnostic
-   PowerStress)? The caps are a workaround; a defective unit will still trip.
-4. Does the 500K target need to hold with `--mtp` off? MTP is excluded under the
-   split, so planning should not assume speculative speedup.
+3. ~~Is the Spark's hard-lock RMA-worthy on this unit (field diagnostic
+   PowerStress)?~~ Answered 2026-09-19: **accept the cap + guard workaround**,
+   and revisit only if a caps-armed run trips. The §6.6 endurance gate — 262K
+   ingest twice with the peak board logged per frontier — is the real test of
+   this workload; the synthetic field diagnostic is reserved for a unit that
+   fails it.
+4. ~~Does the 500K target need to hold with `--mtp` off?~~ Answered 2026-09-19:
+   **yes, and MTP stays a non-goal.** Planning assumes no speculative speedup, and
+   the target is met without it: the capped pair decodes 12.48 t/s at 32K and
+   11.42 t/s at 131K, against 8.00 t/s for single-Mac Q4 with SSD streaming at
+   262K. Enabling MTP under a layer split would be design work — the head and its
+   routing would have to cross a slice boundary — not a flag.
