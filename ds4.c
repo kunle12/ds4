@@ -46075,11 +46075,30 @@ static bool glm_graph_dense_tensor_layout(
 
 static bool glm_graph_layer_uses_generic_routed_moe(
         const ds4_layer_weights *l) {
-    return l &&
-           l->ffn_gate_exps &&
-           l->ffn_up_exps &&
-           l->ffn_down_exps &&
-           l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS;
+    if (!l || !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) {
+        return false;
+    }
+    /* IQ2_XXS gate/up with a Q2_K down is the shipped sparse recipe and has
+     * always been served by the generic routed-MoE dispatch. */
+    if (l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS) return true;
+
+    /* SPIKE: a homogeneous Q4_K expert trio is rejected by the GLM-specific
+     * CUDA implementation ("glm routed moe: unsupported types 12/12/12"),
+     * while the generic dispatch carries Q4_K kernels and already serves this
+     * model's expert shapes. Gate it behind an env var so the experiment can be
+     * confined to one host and the validated Metal path is untouched. Remove,
+     * or make unconditional, once the result is measured. */
+    static int q4k_spike = -1;
+    if (q4k_spike < 0) {
+        q4k_spike = getenv("DS4_GLM_GENERIC_MOE_Q4K") != NULL ? 1 : 0;
+    }
+    if (q4k_spike &&
+        l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+        l->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+        l->ffn_down_exps->type == DS4_TENSOR_Q4_K) {
+        return true;
+    }
+    return false;
 }
 
 static bool glm_tp_validate_ownership_kernels(
