@@ -32202,9 +32202,16 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
         uint32_t                mid_token_stride) {
-    (void)layer_index; (void)n_total_expert;
+    (void)layer_index;
+    /* n_total_expert is the model's expert count (288 for GLM 5.3 Flash) and
+     * every expert-indexed buffer below is sized and bounded by it. It used to
+     * be discarded in favour of a literal 256, which silently dropped the
+     * pairs routed to experts 256 and above: the tile8 expert map skips
+     * e >= n_total_expert, so those pairs never had a mid row written and the
+     * down projection read uninitialised data for them. */
     if (!out || !mid || !x || !selected || !weights || !model_map ||
         n_tokens == 0 || n_expert == 0 ||
+        n_total_expert == 0 || n_total_expert > 65536u ||
         (expert_in_dim & 255u) != 0u || (expert_mid_dim & 255u) != 0u) {
         return 0;
     }
@@ -32228,13 +32235,13 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
     }
     const int logical_tier = cuda_current_tier();
     const char *gw = (const char *)cuda_resolve_weight_ptr(model_map,
-            gate_offset, (uint64_t)256 * gate_expert_bytes, logical_tier,
+            gate_offset, (uint64_t)n_total_expert * gate_expert_bytes, logical_tier,
             "glm_gate_exps");
     const char *uw = (const char *)cuda_resolve_weight_ptr(model_map,
-            up_offset, (uint64_t)256 * up_expert_bytes, logical_tier,
+            up_offset, (uint64_t)n_total_expert * up_expert_bytes, logical_tier,
             "glm_up_exps");
     const char *dw = (const char *)cuda_resolve_weight_ptr(model_map,
-            down_offset, (uint64_t)256 * down_expert_bytes, logical_tier,
+            down_offset, (uint64_t)n_total_expert * down_expert_bytes, logical_tier,
             "glm_down_exps");
     if (!gw || !uw || !dw) return 0;
 
@@ -32296,26 +32303,17 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
 
     static ds4_gpu_tensor *map_scratch[DS4_MAX_GPUS] = {0};
     static ds4_gpu_tensor *down_terms_scratch[DS4_MAX_GPUS] = {0};
-    /* Q4_K prefill runs on the warp kernels. The GLM tile8 kernels are
-     * bit-identical to the warp kernels for Q2_K but deviate for Q4_K: on the
-     * pair, tile8 Q4_K next-token logits differ from the Metal reference by
-     * mean |delta| 1.10 over the vocabulary (max 9.09) against 0.085 (max
-     * 0.50) for the warp path, and the deviation reproduces byte-for-byte.
-     * The dots are ruled out: a unit test over random blocks shows the block8
-     * and single-block forms are bit-identical, and substituting one for the
-     * other leaves the dump unchanged. See the log's Phase M. */
     const bool use_expert_tile8 =
-        n_tokens >= 128u && weight_is_q2_K &&
-        !getenv("DS4_GLM_MOE_NO_EXPERT_TILE8");
+        n_tokens >= 128u && !getenv("DS4_GLM_MOE_NO_EXPERT_TILE8");
     const bool use_expert_major =
         n_tokens >= 16u && getenv("DS4_GLM_MOE_EXPERT_MAJOR");
     if (use_expert_tile8 || use_expert_major) {
         const uint32_t cap = n_tokens;
         const uint32_t n_pairs = n_tokens * n_expert;
-        const uint64_t counts_bytes = 256u * sizeof(int32_t);
+        const uint64_t counts_bytes = (uint64_t)n_total_expert * sizeof(int32_t);
         const uint64_t lists_off = (counts_bytes + 255u) & ~255ull;
         const uint64_t lists_bytes =
-            (uint64_t)256u * cap * sizeof(int32_t);
+            (uint64_t)n_total_expert * cap * sizeof(int32_t);
         const uint32_t tile_capacity =
             (n_pairs + 7u) / 8u + 256u;
         const uint64_t tile_total_off =
@@ -32337,7 +32335,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
             cudaMemsetAsync(counts, 0, counts_bytes);
             glm_moe_expert_map_kernel<<<(n_pairs + 255u) / 256u, 256>>>(
                     counts, lists, (const int32_t *)selected->ptr,
-                    n_pairs, 256u, cap, 0u);
+                    n_pairs, n_total_expert, cap, 0u);
             if (use_expert_tile8) {
                 uint32_t *tile_total = (uint32_t *)(
                         (char *)map_scratch[dev]->ptr + tile_total_off);
@@ -32347,7 +32345,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                         (char *)map_scratch[dev]->ptr + tile_starts_off);
                 glm_moe_build_expert_tiles8_kernel<<<1, 1>>>(
                         tile_total, tile_experts, tile_starts,
-                        counts, 256u);
+                        counts, n_total_expert);
                 dim3 ge1((expert_mid_dim + 7u) / 8u,
                           tile_capacity, 1);
                 GLM_MOE_LAUNCH_TYPED(
@@ -32400,10 +32398,10 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                                         (chunk_pairs + 255u) / 256u, 256>>>(
                                         counts, lists,
                                         (const int32_t *)selected->ptr,
-                                        chunk_pairs, 256u, cap, pair_base);
+                                        chunk_pairs, n_total_expert, cap, pair_base);
                                 glm_moe_build_expert_tiles8_kernel<<<1, 1>>>(
                                         tile_total, tile_experts, tile_starts,
-                                        counts, 256u);
+                                        counts, n_total_expert);
                             }
                             dim3 gd1((out_dim + 31u) / 32u,
                                      chunk_tile_capacity, 1);

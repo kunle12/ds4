@@ -27,7 +27,7 @@ thermal envelope.
 | GLM 5.3 layer-slice correctness (wire width) | **done, validated bit-exact** |
 | Cross-machine Q2 pipeline | **working and measured** |
 | Distributed snapshot round-trip across the split | **save verified 2026-09-19** (165 MiB checkpoint, worker's shard fetched over the data forward); load path exercised and reported a hit — equivalence still needs the fresh-pair restore (§6.1 #8) |
-| Q4_K on the pair | **working** — WS 2 landed (log Phase M): correct output (mean \|Δ\| 0.085 vs the Metal reference on the same prompt), 56.5 t/s prefill / 11.4 t/s generation against 40.8 / 5.7 for Mac-only streaming. The tile8 prefill kernels are held back for Q4_K pending the defect in Phase M, which costs 1.8× prefill |
+| Q4_K on the pair | **working and measured** — WS 2 landed (log Phases M and N): correct output (logits byte-identical to the warp path, top-16 15-of-16 against the Metal reference), **100.6 t/s prefill / 11.4 t/s generation** against 40.8 / 5.7 for Mac-only streaming — 2.47× and 1.99×, so the ≥2× gate passes. Phase N also fixed a pre-existing 256-vs-288 expert-count bug that silently dropped 32 experts whenever the tile8 prefill path ran |
 | Q4_K on the Mac alone | **working and measured** (SSD streaming) |
 | Spark thermal protection | **installed, enabled, verified live**; re-armed by itself after the 2026-09-19 power cycle |
 | Access path (macOS ALF workaround) | **installed as a boot-persistent launchd daemon, verified**; carries both forwards (`-R` control, `-L` data for snapshots) |
@@ -216,32 +216,47 @@ First working Q4_K pair path, with a measured prefill and one open defect.
 | M5 | Compared logits against the Metal reference, with a Q2_K calibration | `--dump-logits` on `{pair, Mac-alone} × {Q2_K, Q4_K}` after the same 1091-token prefill: Q2_K pair vs Metal mean \|Δ\| 0.196 / max 1.48 / top-16 15-of-16; Q4_K pair vs Metal 1.100 / 9.09 / 9-of-16. Argmax and top-3 order agreed in both, so the divergence was in degree |
 | M6 | Localised it to the tile8 path | the same CUDA path through the warp kernels instead matched Metal at mean \|Δ\| **0.085** / max 0.50 / top-16 15-of-16. For Q2_K the two paths are **bit-identical** (max 0.0000), so the tile8 machinery is sound there and the defect is specific to its Q4_K instantiation. Bisecting with `DS4_GLM_MOE_NO_DOWN_TILE8_EXACT` attributed it to the tile8 **gate/up** kernel (tile8-gate/up + warp-down still deviated at 1.148) |
 | M7 | Ruled out the arithmetic, nondeterminism and staging | a unit test on the Spark over random blocks, built from the real helpers extracted verbatim (`/tmp/q4dots_test.cu`; sizes confirmed 144 / 84 / 292), shows `dev_dot_q4_K_q8_K_block8` is **bit-identical** to n single-block calls for n=1..8 — and substituting the single-block expression inside the tile8 kernel left the logits dump **byte-identical**. A repeat run is byte-identical, and disabling the local batch IO staging changes nothing |
-| M8 | Landed the correction | Q4_K prefill takes the warp path (`use_expert_tile8` now requires Q2_K). Verified: byte-identical to the warp run, mean \|Δ\| 0.108 vs Metal, top-16 15-of-16, argmax agreeing |
+| M8 | Temporarily routed Q4_K around tile8 | a guard making `use_expert_tile8` require Q2_K, verified byte-identical to the warp run — **reverted in Phase N**, where the real cause turned out to be the expert count rather than the kernel |
 
 **Measured, same 1091-token prompt, greedy, ctx 8192:**
 
 | Configuration | prefill | generation | vs Metal (mean \|Δ\| over vocab) |
 | --- | --- | --- | --- |
 | Mac alone, Q4_K + SSD streaming (**the baseline to beat**) | 40.80 t/s | 5.73 t/s | reference |
-| Pair, Q4_K, tile8 kernels | 103.45 t/s | 11.36 t/s | 1.100 — **wrong, not usable** |
-| Pair, Q4_K, warp kernels (**landed**) | 56.48 t/s | 11.37 t/s | 0.085 — correct |
+| Pair, Q4_K, tile8 with the 256-expert fault | 103.45 t/s | 11.36 t/s | 1.100 — **wrong, not usable** |
+| Pair, Q4_K, warp kernels (correct, but not the intended path) | 56.48 t/s | 11.37 t/s | 0.085 — correct |
+| Pair, Q4_K, **tile8 after Phase N** | **100.57 t/s** | **11.43 t/s** | correct — logits byte-identical to the warp run's |
 
-So the corrected Q4_K pair path is **1.38× the streaming prefill and 1.98× its
-generation**, and the plan's ≥2× prefill gate is missed *only* because the
-tile8 Q4_K kernel is unusable as it stands. Restoring it is worth 1.8× more
-prefill, which is where the remaining work is.
+The corrected path is **2.47× the streaming prefill and 1.99× its generation**,
+so the plan's ≥2× prefill gate passes — and it now passes on a computation that
+matches the Metal reference, which the 103.45 t/s figure never did.
 
-**Open defect.** The tile8 Q4_K instantiation produces different `mid` values
-than the warp path for the same inputs, while the identical code is
-bit-identical for Q2_K. Excluded so far: the block dots (unit test and
-substitution), the block stride (`sizeof(block_t)`, which the warp path also
-uses while matching the reference), the tile mapping (type-independent, and
-bit-identical for Q2_K at the same prompt), aliasing, staging, and
-nondeterminism. The remaining candidates are the weight and activation row
-addresses inside the tile8 gate/up kernel, so the next probe is to dump `mid`
-from both kernels in a single dispatch and diff it per pair and row. Until
-then, Q4_K deliberately does not reach tile8, and Q2_K is untouched: the guard
-is a conjunction that evaluates exactly as before when the weights are Q2_K.
+**Resolved — see Phase N.** The tile8 Q4_K instantiation produced different
+`mid` values than the warp path because the expert map was bounded by a
+hardcoded 256 while GLM 5.3 Flash has 288 experts: the pairs routed to experts
+256–287 were never mapped, so no `mid` row was written for them and the down
+projection read uninitialised data. Every exclusion recorded above still holds
+— the dots, the block stride, the tile mapping, the staging and determinism were
+genuinely innocent, which is exactly why the fault looked like it was inside the
+kernel rather than in which pairs were fed to it. Phase M's guard was reverted
+once the real cause was fixed.
+
+### Phase N — A pre-existing expert-count bug, found by the WS 2 logit comparison
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| N1 | Traced the Phase M deviation to the expert map rather than the kernel | `ds4_gpu_glm_routed_moe_batch_tensor` accepted `n_total_expert` and discarded it (`(void)n_total_expert;`), then used a literal `256u` for the expert-map bound, the counts and lists sizing, both tile-builder launches and the three weight lookaheads |
+| N2 | The model has 288 experts, not 256 | read straight from both GGUFs: `glm5-next.expert_count = 288`, `expert_used_count = 8`, `expert_feed_forward_length = 2048`. `glm_moe_expert_map_kernel` skips `e >= n_total_expert`, so every pair routed to experts 256–287 was dropped: no `mid` row was written for it, and the down projection then read uninitialised data — a wrong answer that looked plausible, never a crash |
+| N3 | Fixed all nine sites to use the model's count | counts and lists sizing, both expert-map launches, both tile-builder launches and the three weight lookaheads; the parameter is validated (`n_total_expert == 0 \|\| > 65536` rejected) instead of discarded. The lookahead matters on its own: with 256 it under-covered the last 32 experts for the streaming resolver |
+| N4 | Verified with tile8 enabled on both models | Q4_K pair: **byte-identical to the warp-path run**, top-16 15-of-16 against the Metal reference, mean \|Δ\| 0.109 over the reference's top-16, argmax agreeing. Phase M's guard was reverted as unnecessary — the tile8 path was never wrong, it was being fed the wrong set of pairs |
+| N5 | Bounded the exposure | this is **pre-existing**: the literal 256 predates WS 1 and WS 2, and it stays latent until the prefill chunk reaching the worker is ≥ 128 tokens, because that is when the tile8 branch runs. The Q2_K control runs at this prompt never routed to an expert ≥ 256 — Q2_K tile8 fixed, Q2_K tile8 pre-fix and Q2_K warp are byte-identical — so those results stand, while **any earlier Q2_K prefill that did take the tile8 path with ≥ 128-token chunks was silently dropping 32 of 288 experts** |
+
+**Consequence.** WS 2's gate is met on the corrected path (100.57 t/s against
+the 40.80 t/s streaming baseline), and the WS 3–4 shapes inherit the fix. The
+lesson worth keeping: every kernel-level check pointed at the kernel, and the
+fault was in the routing data feeding it. What caught it was comparing logits
+against a different implementation — the thing the plan's parity harnesses
+exist for.
 
 ---
 
