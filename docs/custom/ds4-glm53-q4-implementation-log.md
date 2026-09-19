@@ -32,6 +32,7 @@ thermal envelope.
 | Access path (macOS ALF workaround) | **installed as a boot-persistent launchd daemon, verified** |
 | Binaries deployed to `~/bin` on both hosts | **done, checksums verified** |
 | Plan for closing the Q4 gap | **written** (`ds4-glm53-q4-split-design.md`) |
+| Fork and branch | **pushed** — `customisation` on `kunle12/ds4`, 5 commits ahead of upstream `8db1d1d` |
 
 **Next action:** workstream 1 of the plan — type traits + dispatch predicate for
 the GLM routed MoE (`{Q2_K, Q4_K}`), then WS 2 (Q4_K prefill), which is the first
@@ -145,6 +146,20 @@ the user's pre-existing `README.md` modification.
 | # | Action | Evidence / result |
 | --- | --- | --- |
 | H1 | Renamed `docs/src/` → `docs/custom/` at the owner's request, so everything in that directory is known to be owner/agent-authored rather than upstream | directory is untracked in git (`?? docs/custom/`), so a plain `mv` was correct; updated the three references that named the old path (this log's artifact table and working-tree note, and `ds4-v41-split-design.md` §related-analysis); verified no `docs/src` or `src/ds4-` reference remains in the tree, and none in the out-of-tree kits |
+
+### Phase I — Fork and remote workflow
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| I1 | Adopted the fork as the working remote: `origin` = `kunle12/ds4`, `upstream` = `antirez/ds4` (the existing `origin` was renamed) | `git remote -v` shows both; forks tracked this way make "pull from upstream, push to fork" the default |
+| I2 | Created branch `customisation` from upstream `8db1d1d` | fork's `main` and the local `main` were both already at that commit, so the branch starts exactly at the fork point |
+| I3 | Committed the work as five focused commits rather than one blob | `b2e9c39` wire-width fix, `cf077c1` Metal source lookup, `2bdb60c` gitignore, `3343e3c` network doc + README link, `413d331` custom docs. The two code fixes can be offered upstream independently, and the network doc (LAN addresses, MACs) is isolated so it can be dropped |
+| I4 | Added `.venv/` and `venv/` to `.gitignore` | a 41 MB local Python virtualenv was untracked and one `git add -A` away from being committed |
+| I5 | Set the commit identity from the account rather than guessing | `Xun <6646691+kunle12@users.noreply.github.com>` — the numeric-ID noreply form, derived from `api.github.com/users/kunle12`; set repo-local, then all five commits rewritten with `--reset-author` |
+| I6 | Push credential path | SSH is **not** registered on the account (`git@github.com: Permission denied (publickey)`); `gh auth login` (HTTPS, scopes `gist, read:org, repo, workflow`) is the working path. Wired **repo-locally** via `credential.https://github.com.helper = !gh auth git-credential` so the global config is untouched |
+| I7 | Pushed and verified | `origin/customisation = 413d331 =` local HEAD; fork `main` still `8db1d1d`; `main` tracks `upstream/main`; branch is 0 behind / 5 ahead of upstream. Push printed `failed to store: -25308` — that is the osxkeychain helper declining to cache the token from a non-interactive session, harmless because the gh helper supplies credentials on each push |
+
+**Remote workflow from here:** `git fetch upstream && git merge upstream/main` (or rebase) to take antirez's changes; `git push` publishes to the fork. Nothing in this phase changes the code, the installed services, or the Spark.
 
 ---
 
