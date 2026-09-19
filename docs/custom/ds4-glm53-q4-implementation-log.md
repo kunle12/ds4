@@ -237,16 +237,24 @@ argued. Two consequences the earlier estimates missed:
   outright (19.71 vs 9.26 decode); the pair is only compelling where no single
   machine can hold the model and the alternative is streaming.
 
-**Whole-model Q2 at 512K wedges the Spark.** Launching it (98.88 GiB planned against
-121 GiB, by the same guard arithmetic the Mac printed) left the box with a live
-kernel — `ping` 0.4 ms, TCP accepted on `:22`, the tunnel's established session
-intact — while no new login received an `sshd` banner at 60-second budgets, for 10+
-minutes. The Mac ran the identical workload to completion (186.89 / 19.71). The
-mechanism is inferred, not established: CUDA buffer accounting plausibly exceeds the
-Mac's Metal layout at this size, and the box needs verification after recovery.
-Consequences for the plan: §9's "Q2 on one Spark resident" fallback is **not valid at
-512K**, and any whole-model run on the Spark needs its admission numbers checked
-before launch.
+**Whole-model Q2 at 512K freezes the Spark, and it reboots itself.** Launching it
+(98.88 GiB planned against 121 GiB, by the same guard arithmetic the Mac printed)
+produced, in order: the guard's *last* journal sample at 22:03:58 — `board=55C
+gpu=50,2093MHz,9.54W slowdown=Not Active`, i.e. cool and idle as the load began; no
+further sample for 19 minutes; `ping` 0.4 ms and TCP accepted on `:22` while no
+`sshd` banner arrived at 60-second budgets (22:14 onward); and a **self-reboot at
+22:23**, back up at 22:24 with 118 GiB free and the guard re-armed. Zero guard
+ABORTs, and the last evidence before the freeze is a cool board.
+
+The mechanism is **not established**: memory exhaustion, a firmware/driver stall on
+the single ~90 GiB unified allocation, and a fast thermal transient the guard could
+not sample are all consistent with what is recorded. The Mac ran the identical
+workload to completion (186.89 / 19.71), so this is specific to the Spark's
+whole-model shape, not to the workload. Consequences for the plan: §9's "Q2 on one
+Spark resident" fallback is **not valid at 512K**; any whole-model run on the Spark
+needs its admission numbers checked before launch; and the **split slices are the
+supported shape** on that box (94.88 / 92.07 GiB, which ran a 403K ingest at 67 °C
+with the machine responsive).
 
 Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board margin.
 

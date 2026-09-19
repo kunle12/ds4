@@ -333,11 +333,12 @@ for the hardware, not a licence to over-subscribe memory.
 
 **Check the admission numbers before launching, not after.** The guard prints
 `required=… GiB budget=… GiB` on startup: a *whole-model* 512K run plans ~98.88 GiB
-against 121 GiB on this box. The Mac handles that (measured); the Spark did not — a
-whole-model Q2 run at 512K left it with a live kernel and no `sshd` banner for 10+
-minutes (log §4.1b). The **split slices are the supported shape**: `0:23` and
-`24:output` measured 94.88 and 92.07 GiB, and the pair ran a 403K ingest at 67 °C
-with the box responsive.
+against 121 GiB on this box. The Mac handles that (measured, 186.89 / 19.71 t/s);
+the Spark does not — a whole-model Q2 run at 512K froze it and it **rebooted itself**
+~20 minutes later, with a cool board and zero guard ABORTs in the record
+(log §4.1b). The **split slices are the supported shape**: `0:23` and `24:output`
+measured 94.88 and 92.07 GiB, and the pair ran a 403K ingest at 67 °C with the box
+responsive.
 
 ---
 
