@@ -1,4 +1,5 @@
-/* GLM 5.3 routed-MoE dispatch: CUDA vs a host reference, for Q2_K and Q4_K.
+/* GLM 5.3 routed-MoE dispatch: CUDA vs a host reference (Q4_K; see the scope
+ * note at the end of this comment for why Q2_K is not compared here).
  *
  * First slice of the WS-5 parity harness from the split plan. It builds a
  * synthetic 288-expert MoE through the public ds4_gpu_* API and compares the
@@ -29,6 +30,7 @@
  *
  * Run: make test-glm53-moe-q4k   (needs a CUDA device)
  */
+#define _POSIX_C_SOURCE 200809L   /* setenv/unsetenv */
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -368,7 +370,22 @@ int main(void) {
      * `make q4k-dot-test` and by the Q2_K pair runs. */
     const uint32_t type = 12u;
     run_case(type, 8u, 0.05f);      /* warp / small-batch path */
-    run_case(type, 128u, 0.05f);    /* tile8 prefill path      */
+
+    /* tile8 wins whenever it is eligible, so the expert-major path has to be
+     * forced. Its grid's y extent is the expert index, and a literal 256 there
+     * left experts 256..287 unlaunched entirely (Phase O); this case sees that
+     * as unwritten mid rows. The dispatch reads the flags per call, so setting
+     * them around the call is enough. The middle case covers the third
+     * combination - tile8 off, expert-major off - where the warp kernels serve
+     * a prefill-sized batch. */
+    setenv("DS4_GLM_MOE_NO_EXPERT_TILE8", "1", 1);
+    setenv("DS4_GLM_MOE_EXPERT_MAJOR", "1", 1);
+    run_case(type, 128u, 0.05f);    /* expert-major gate/up + down */
+    unsetenv("DS4_GLM_MOE_EXPERT_MAJOR");
+    run_case(type, 128u, 0.05f);    /* warp serves prefill when tile8 is off */
+    unsetenv("DS4_GLM_MOE_NO_EXPERT_TILE8");
+
+    run_case(type, 128u, 0.05f);    /* tile8 prefill path */
 
     if (failures) {
         printf("%d check(s) FAILED\n", failures);
