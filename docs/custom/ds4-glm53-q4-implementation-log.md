@@ -920,3 +920,60 @@ One log line to read correctly when it appears: `kv cache skipped tokens=818
 reason=evict … session has no valid checkpoint to stage` is a benign eviction
 no-op after a hit, not the defect — the defect's message is
 `distributed KV shard tensor size overflow`.
+
+---
+
+## Q2 standalone regression check (baseline comparison)
+
+The question this answers: did any of the GLM Q4_K work break the **existing** Q2
+paths on a single machine? Q2 is the shipped sparse recipe and shares a binary
+with the Q4_K work, so it had to be checked, not assumed.
+
+**Where the changed code actually lives.** All 67 hunks in `ds4_cuda.cu` are
+inside GLM-named functions — `ds4_gpu_glm_routed_moe_batch_tensor`,
+`..._one_tensor`, `..._direct_scalar_q4_tensor` and their `glm_routed_moe_*` /
+`glm_moe_*` kernels — with **zero** non-GLM hunks. Those entry points have
+exactly one non-test caller each: `ds4.c:48508`, `48647`, `48678`, all inside the
+GLM branch of the layer-MoE dispatch. `ds4.c`, `ds4_distributed.c`,
+`ds4_metal.m`, `ds4_tp.c`, `ds4_gpu.h`, `ds4_agent.c` and `ds4_server.c` are
+**byte-identical to baseline**. The Makefile change only adds a test target;
+`ds4_cli.c` adds the env banner, which writes to stderr only and only when one of
+the nine switches is set.
+
+**Why Q2 never reaches the changed code.** The dispatch decides by tensor type:
+
+```c
+/* IQ2_XXS gate/up with a Q2_K down is the shipped sparse recipe and has
+ * always been served by the generic routed-MoE dispatch. */
+if (l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS) return true;
+```
+
+`glm_graph_layer_uses_generic_routed_moe` returns true for that recipe, and the
+caller then returns `ds4_gpu_routed_moe_batch_tensor` — the generic dispatcher,
+untouched by this work. Only a homogeneous **Q4_K** trio (type 12) falls through
+to the GLM-specific path that was fixed. That is also the mechanical explanation
+for the zero trace lines in the Q2_K runs discussed above.
+
+**Measured, not argued.** A baseline binary built from `8655de7` (the commit
+before this work, verified to differ from the current build) was run against the
+current binary — same model, same prompt, greedy decode, one machine with no
+`--role`, i.e. the standalone path — comparing generated text byte-for-byte:
+
+| model | baseline | current | result |
+| --- | --- | --- | --- |
+| GLM 5.3 Flash Q2 | 348 bytes, exit 0 | 348 bytes, exit 0 | identical |
+| DeepSeek V4 Flash Q2 | 347 bytes, exit 0 | 347 bytes, exit 0 | identical |
+
+`--dump-tokens` is *not* a valid check here: it tokenizes the prompt and exits
+before decoding, so it exercises none of this path. The comparison above is on
+generated text, which runs the decode path.
+
+**V4.1 is not measured, and here is exactly what covers it.** No V4.1 language
+model exists on either machine: `/Users/xun/mlmodels/deepseekv4/` holds only the
+970 MB `DeepSeek-V4.1-Flash-Vision.gguf` encoder, and the Spark holds no V4.1
+file at all. So a V4.1 Q2 run was not possible. What makes it safe is that every
+file implementing V4.1 behaviour (`ds4_engine_is_deepseek41` in `ds4.c`, the
+DSML4.1 syntax in `ds4_agent.c`, the model id in `ds4_server.c`, `ds4_tp.c`) is
+byte-identical to baseline, and a V4.1 Q2 model routes by the same type-based
+rule to the same untouched dispatcher. That is inference from identical inputs,
+not a measurement — if a V4.1 Q2 GGUF appears, repeat the check above against it.
