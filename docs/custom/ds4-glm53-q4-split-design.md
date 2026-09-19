@@ -40,6 +40,31 @@ and will land near the harmonic mean of the two machines, i.e. ~10–14 t/s vers
 8.0 t/s streaming. The main win is **ingest time and the removal of the
 SSD-streaming dependency** (no expert cache to size, no hotlist to tune).
 
+**The topology effect, now measured rather than inferred** (2026-09-19, Q2, the
+same 403,351-token prompt at ctx 524288 on both sides — so no quantisation or
+depth confound):
+
+| Topology | prefill | decode |
+| --- | ---: | ---: |
+| Mac coordinator + Spark worker | **346.41 t/s** | 9.26 t/s |
+| Mac alone (whole model resident) | 186.89 t/s | **19.71 t/s** |
+| Spark alone, 512K | *wedges the box* (log §4.1b) | — |
+
+Two conclusions this forces, both of which contradict the earlier `[INFERENCE]`:
+
+* The split **doubles prefill and halves decode** (1.85× / 0.47×). It is a
+  throughput-versus-latency trade, not a free speedup.
+* The decode case for the split does not survive the measurement. Q4
+  single-machine resident decode ≈ 19.71 / 1.76 (weight bits) ≈ 11.2 t/s, so
+  pair-Q4 ≈ **5.3 t/s** against streaming's measured 4.63–5.02 — a wash. What the
+  split actually buys for Q4 is **ingest speed** (~2.5–3× against streaming) and
+  **stability** at 500K: no expert-cache lottery, and none of the 13 GiB of
+  transient slack that streaming leaves on a machine you are also working on.
+
+It beats the **slower** single machine and loses on decode to either; splitting pays
+where a machine cannot hold the model at all — the Q4 case — and even there its
+benefit is ingest and predictability, not tokens per second.
+
 ---
 
 ## 1. Goal and acceptance criteria
@@ -306,6 +331,14 @@ Two `ds4` processes on this box is not a supported configuration, not even
 transiently: the guard's `TARGET_KILL=ds4` at `ZONE_ABORT=95 °C` is a backstop
 for the hardware, not a licence to over-subscribe memory.
 
+**Check the admission numbers before launching, not after.** The guard prints
+`required=… GiB budget=… GiB` on startup: a *whole-model* 512K run plans ~98.88 GiB
+against 121 GiB on this box. The Mac handles that (measured); the Spark did not — a
+whole-model Q2 run at 512K left it with a live kernel and no `sshd` banner for 10+
+minutes (log §4.1b). The **split slices are the supported shape**: `0:23` and
+`24:output` measured 94.88 and 92.07 GiB, and the pair ran a 403K ingest at 67 °C
+with the box responsive.
+
 ---
 
 ## 5. Work breakdown
@@ -414,7 +447,7 @@ Layered, cheapest first; each layer must pass before the next is trusted.
 | --- | --- | --- |
 | Q4 quality, long context, one machine | Mac alone + `--ssd-streaming` | 82.5 t/s prefill, 8.0 t/s decode at 262K; 53 min cold ingest; 99.84 GiB plan |
 | Best throughput available on the pair | Q2 pipeline (Mac coord + Spark worker) | 380.6 t/s prefill, 12.5 t/s decode at 32K, board 66–77 °C |
-| Q2, one machine | Spark or Mac resident | Spark GLM 5.3 Q2: 531 t/s prefill, 14.35 t/s decode (repo QA) |
+| Q2, one machine | **Mac resident** — not the Spark at 512K | Mac, whole model, ctx 524288, 403K prompt: **186.89 t/s prefill, 19.71 t/s decode** (measured 2026-09-19). The Spark's repo-QA figure (531 / 14.35 t/s) is at a smaller context; a whole-model 512K run **wedged the box** (log §4.1b) |
 
 ---
 

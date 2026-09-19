@@ -211,6 +211,43 @@ rate estimates taken during that ingest (≈90 t/s and ≈171 t/s) were artefact
 imprecisely bounded sampling intervals; only the program's own reported figure
 counts.
 
+### 4.1b Topology comparison: pair vs one machine (same model, prompt, ctx)
+
+Measured 2026-09-19 with the identical 403,350-token prompt at ctx 524288, so no
+quantisation or depth confound:
+
+| topology | prefill | decode |
+| --- | ---: | ---: |
+| Mac `0:23` + Spark `24:output` | **346.41 t/s** | **9.26 t/s** |
+| Mac alone (whole model resident) | **186.89 t/s** | **19.71 t/s** |
+| Spark alone (whole model resident) | *wedged* — see below | — |
+
+This is the cleanest result of the session: the split is **1.85× on prefill and
+0.47× on decode**, which is `max(stage)` and `sum(stage)` measured rather than
+argued. Two consequences the earlier estimates missed:
+
+* **The split's decode is halved, not merely "near the harmonic mean".** So its
+  decode benefit over the *streaming* route comes only from streaming's own cache
+  penalty. Redone with the measured factor: Q4 single-machine resident decode
+  ≈ 19.71 / 1.76 (weight bits) ≈ 11.2 t/s, so pair-Q4 ≈ **5.3 t/s** against
+  streaming's measured 4.63–5.02 t/s — **a wash**. My earlier "~1.3× decode" estimate
+  did not include the topology penalty and was wrong.
+* **The split is a throughput-versus-latency trade**, not a free speedup: better
+  prefill, worse decode. For Q2 at 500K the single Mac is the better configuration
+  outright (19.71 vs 9.26 decode); the pair is only compelling where no single
+  machine can hold the model and the alternative is streaming.
+
+**Whole-model Q2 at 512K wedges the Spark.** Launching it (98.88 GiB planned against
+121 GiB, by the same guard arithmetic the Mac printed) left the box with a live
+kernel — `ping` 0.4 ms, TCP accepted on `:22`, the tunnel's established session
+intact — while no new login received an `sshd` banner at 60-second budgets, for 10+
+minutes. The Mac ran the identical workload to completion (186.89 / 19.71). The
+mechanism is inferred, not established: CUDA buffer accounting plausibly exceeds the
+Mac's Metal layout at this size, and the box needs verification after recovery.
+Consequences for the plan: §9's "Q2 on one Spark resident" fallback is **not valid at
+512K**, and any whole-model run on the Spark needs its admission numbers checked
+before launch.
+
 Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board margin.
 
 ### 4.2 Q4_K on the Mac alone (`--ssd-streaming`)
@@ -584,9 +621,11 @@ cd /tmp && ~/bin/ds4 -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf --role coordinator 
 
 # long one-shot runs: detach from the terminal
 #   a `nohup ... &` started from an agent/SSH PTY can leave ds4 blocked on
-#   /dev/ttys000 at 0% CPU with the model unloaded (seen 2026-09-19 with
-#   --prompt-file). Run it under `ssh localhost` or as a launchd job, and check
-#   `ps -o pcpu` before waiting on it.
+#   /dev/ttys000 with the model unloaded and the log frozen (seen 2026-09-19 with
+#   --prompt-file). Feeding the prompt on stdin from a file works, as does
+#   `ssh -T localhost` or a launchd job. To tell a working run from a wedged one,
+#   check that the LOG IS GROWING - `ps -o pcpu` reads 0.0% while prefilling
+#   normally, because the work is on the GPU.
 
 # snapshot acceptance (distributed checkpoint save + load, §11)
 ~/bin/ds4-server -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf --role coordinator --layers 0:23 \
