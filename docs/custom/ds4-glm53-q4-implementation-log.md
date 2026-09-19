@@ -27,7 +27,7 @@ thermal envelope.
 | GLM 5.3 layer-slice correctness (wire width) | **done, validated bit-exact** |
 | Cross-machine Q2 pipeline | **working and measured** |
 | Distributed snapshot round-trip across the split | **save verified 2026-09-19** (165 MiB checkpoint, worker's shard fetched over the data forward); load path exercised and reported a hit — equivalence still needs the fresh-pair restore (§6.1 #8) |
-| Q4_K on the pair | **working and measured** — WS 2 landed (log Phases M and N): correct output (logits byte-identical to the warp path, top-16 15-of-16 against the Metal reference), **100.6 t/s prefill / 11.4 t/s generation** against 40.8 / 5.7 for Mac-only streaming — 2.47× and 1.99×, so the ≥2× gate passes. Phase N also fixed a pre-existing 256-vs-288 expert-count bug that silently dropped 32 experts whenever the tile8 prefill path ran |
+| Q4_K on the pair | **working and measured** — WS 2 and WS 3 landed (log Phases M, N, O): correct output (logits byte-identical to the warp path, top-16 15-of-16 against the Metal reference), **100.6 t/s prefill / 11.4 t/s generation** against 40.8 / 5.7 for Mac-only streaming — 2.47× and 1.99×, so the ≥2× gate passes. Phases N and O fixed four instances of a pre-existing 256-vs-288 expert-count hardcoding. The MTP tok2 and scalar paths still refuse Q4_K by name, unverified |
 | Q4_K on the Mac alone | **working and measured** (SSD streaming) |
 | Spark thermal protection | **installed, enabled, verified live**; re-armed by itself after the 2026-09-19 power cycle |
 | Access path (macOS ALF workaround) | **installed as a boot-persistent launchd daemon, verified**; carries both forwards (`-R` control, `-L` data for snapshots) |
