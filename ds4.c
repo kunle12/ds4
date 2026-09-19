@@ -60979,10 +60979,17 @@ static bool glm_layer_payload_tensor_bytes(uint32_t layer,
         return false;
 
     if (ds4_model_is_glm53() && ds4_glm53_layer_is_kda(layer)) {
-        if (compact_live != 0 || index_live != 0) return false;
+        /* KDA layers carry no compressed KV rows, but the payload header stores
+         * one uniform `compact_live` for *every* layer of the slice (see the
+         * writer in ds4_session_save_layer_payload and the sizing loop above).
+         * Rejecting those counts made every slice containing a KDA layer
+         * unsizeable as soon as a context existed, which is why a distributed
+         * checkpoint failed with "distributed KV shard tensor size overflow".
+         * The span for such a layer is always the conv state plus the recurrent
+         * state, independent of the counts. */
         *out = session_glm_kda_conv_state_bytes() +
                session_glm_kda_recurrent_state_bytes();
-        return true;
+        return *out != 0;
     }
 
     const bool has_indexer = glm_graph_layer_uses_full_indexer(layer);
