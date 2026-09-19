@@ -34,7 +34,7 @@ thermal envelope.
 | Binaries deployed to `~/bin` on both hosts | **rebuilt 2026-09-19 from byte-identical sources and reinstalled** (`ds4.c` md5 `98c92891…` on both) |
 | Spark wedge, 2026-09-19 | two resident workers left the box with a live kernel and dead userland; **physical power cycle**, then a mandatory clean-slate precondition (plan §4.3) |
 | Plan for closing the Q4 gap | **written** (`ds4-glm53-q4-split-design.md`) |
-| Fork and branch | **pushed** — `customisation` on `kunle12/ds4` |
+| Fork and branch | **pushed** — `customisation` on `kunle12/ds4`, HEAD `1b82376`, 9 commits ahead of upstream `8db1d1d` |
 
 **Next action:** workstream 1 of the plan — type traits + dispatch predicate for
 the GLM routed MoE (`{Q2_K, Q4_K}`), then WS 2 (Q4_K prefill), which is the first
@@ -181,6 +181,14 @@ backed up on the Mac and documented in §7.
 | J7 | First snapshot attempt failed before any data connection | `kv cache skipped tokens=819 reason=cold because KV payload staging failed: distributed KV shard tensor size overflow` — the KDA guard of §2 #5 |
 | J8 | Fixed, rebuilt, re-ran | save wrote `bf072cd0…kv` (165.08 MiB, `save=18.2 ms`), data sockets observed on 55911, load reported `cached_tokens: 819` with identical output — details in §11 |
 | J9 | Rebuilt **all five** binaries on both hosts from byte-identical sources | `ds4.c` md5 `98c92891b4a880429dd1937c58ce4b67` on both; Spark build `make -j20 cuda-spark` (`sm_121`) |
+
+### Phase K — Rebuild, verification, and publication
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| K1 | Rebuilt all five binaries on both hosts from byte-identical sources and installed them | Mac `make` 17:46 (`~/bin` + 26 Metal kernels), Spark `make -j20 cuda-spark` (`sm_121`) 17:49 → `~/bin` 17:50; both builds reported zero errors and zero warnings; Mac smoke test from `/tmp`: `--inspect` binds `glm5-next`, all five answer `--help` |
+| K2 | Stopped the stale pair, then re-verified on the rebuilt binaries | worker `data_port=55911` + `ctx=4096`, route ready; cold save `size=164.89 MiB save=18.1 ms` with six data-socket observations on `127.0.0.1:55911`, then `cache hit … load=126.8 ms` and `cached_tokens: 819` |
+| K3 | Committed as three focused commits and pushed to the fork | `6e1f447` KDA sizing fix, `5881ac0` env-gated experiment, `1b82376` docs; `origin/customisation = 1b82376`, 9 commits ahead of upstream `8db1d1d`; the working tree's `ds4.c` md5 equals the compiled one, so the binaries match the commits |
 
 ---
 
