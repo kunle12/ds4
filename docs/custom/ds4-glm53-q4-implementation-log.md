@@ -26,7 +26,7 @@ thermal envelope.
 | --- | --- |
 | GLM 5.3 layer-slice correctness (wire width) | **done, validated bit-exact** |
 | Cross-machine Q2 pipeline | **working and measured** |
-| Distributed snapshot round-trip across the split | **verified 2026-09-19** — save and load, with the data connection observed crossing the tunnel |
+| Distributed snapshot round-trip across the split | **save verified 2026-09-19** (165 MiB checkpoint, worker's shard fetched over the data forward); load path exercised and reported a hit — equivalence still needs the fresh-pair restore (§6.1 #8) |
 | Q4_K on the pair | **blocked** — CUDA GLM routed MoE is Q2_K-only; port specified in the plan |
 | Q4_K on the Mac alone | **working and measured** (SSD streaming) |
 | Spark thermal protection | **installed, enabled, verified live**; re-armed by itself after the 2026-09-19 power cycle |
@@ -179,7 +179,7 @@ backed up on the Mac and documented in §7.
 | J5 | Tunnel self-healed | `KeepAlive` re-established the session and the Mac held `127.0.0.1:55911` again; the plan gained a mandatory clean-slate precondition (§4.3) |
 | J6 | Worker pinned with `--listen 127.0.0.1 55911` | `data_listen=127.0.0.1:55911`; the coordinator logged `data_port=55911` (not the ephemeral 39215) and `ctx=4096` |
 | J7 | First snapshot attempt failed before any data connection | `kv cache skipped tokens=819 reason=cold because KV payload staging failed: distributed KV shard tensor size overflow` — the KDA guard of §2 #5 |
-| J8 | Fixed, rebuilt, re-ran | save wrote `bf072cd0…kv` (165.08 MiB, `save=18.2 ms`), data sockets observed on 55911, load reported `cached_tokens: 819` with identical output — details in §11 |
+| J8 | Fixed, rebuilt, re-ran | save wrote `bf072cd0…kv` (165.08 MiB, `save=18.2 ms`), data sockets observed on 55911, and the load reported `cached_tokens: 819` with `cache_write_tokens: 0` — details in §11. (The completion text was *not* compared; see §6.1 #7.) |
 | J9 | Rebuilt **all five** binaries on both hosts from byte-identical sources | `ds4.c` md5 `98c92891b4a880429dd1937c58ce4b67` on both; Spark build `make -j20 cuda-spark` (`sm_121`) |
 
 ### Phase K — Rebuild, verification, and publication
@@ -247,7 +247,7 @@ Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board marg
 | Spark hard-locks under sustained load | board 90 °C, `HW_THERMAL_SLOWDOWN`, unreachable; NVIDIA field-diagnostic PowerStress failure | **mitigated** (caps + governor); RMA declined 2026-09-19 — revisit only if a caps-armed run trips, which the plan's endurance gate is designed to surface |
 | Guard: `set -u` exit on first `set_cap`; slow-down parse; initial `board=0C` | journal `board: parameter not set`, status `2` | **fixed** and stub-verified |
 | Install hang: plymouth boot stall | `is-system-running = starting` for 17 min | **fixed** (unit ordering) + `set-default multi-user.target` |
-| Snapshot over the tunnel | coordinator derives worker address from the socket = `127.0.0.1` | **fixed** — second forward `-L 55911:127.0.0.1:55911` plus a worker pinned with `--listen 127.0.0.1 55911`; save and load verified, data sockets observed on 55911 |
+| Snapshot over the tunnel | coordinator derives worker address from the socket = `127.0.0.1` | **fixed** — second forward `-L 55911:127.0.0.1:55911` plus a worker pinned with `--listen 127.0.0.1 55911`; save verified and the load path exercised, data sockets observed on 55911 (§11) |
 | GLM 5.3 KDA layers made any containing slice unsizeable | `staging failed: distributed KV shard tensor size overflow`; `glm_layer_payload_tensor_bytes` rejected the uniform `compact_live` the header carries for every layer | **fixed** in `ds4.c` (guard removed, span is conv+recurrent state); snapshot round-trip then verified — see §11 |
 
 ---
@@ -278,6 +278,69 @@ Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board marg
    frequency cut. Two resident workers (a leftover plus a new one, ~45 GiB each
    over a 95 GiB mmap) remain the plausible trigger, which is why the plan now
    carries a clean-slate precondition.
+
+### 6.1 Corrections from the self-audit (2026-09-19, after the fact)
+
+7. **"Byte-identical output" was inferred, not measured.** The load was reported
+   as reproducing the cold run's completion text. It was not: both requests were
+   sent with `temperature 0`, so equal text was *expected*, and the observation
+   recorded was only the usage block (`cached_tokens: 819`,
+   `cache_write_tokens: 0`, `load=126.8 ms`). The claim appeared in three places
+   and is now removed from all of them. Comparing the two completions belongs in
+   the fresh-pair restore test, which is where it now sits.
+
+8. **Criterion 6 was overstated as "verified".** The load ran on a *live* pair
+   whose worker still held the same KV, so an identical result cannot distinguish
+   "restore applied" from "restore was a no-op". What the run establishes is:
+   the **save** is solid (165 MiB written, the worker's shard fetched over the
+   data forward, no error), and the **load path was exercised** and reported a
+   hit. Equivalence needs the restore on a fresh pair — already required by the
+   plan's §6 item 5, and now the only thing standing between this and a verified
+   round-trip.
+
+9. **"KDA layers fall inside the coordinator's 0:23 slice" was wrong.**
+   `ds4_glm53_layer_is_kda` is `il % 4u != 3u && il + N_NEXTN_PREDICT < N_LAYER`,
+   so three of every four layers are KDA and they appear in **both** slices. The
+   fix was still necessary and sufficient, but for a different reason: the
+   **coordinator** sizes and parses *every* shard (its own and each worker's),
+   while the worker only *writes* spans and never calls the sizing helper. So the
+   worker's older binary was unaffected because of which code it runs, not
+   because of which layers it holds. The conclusion survived; the stated reason
+   did not.
+
+10. **The wedge's memory arithmetic was wrong, and the thermal question is now
+    settled by evidence rather than by elimination.** The leftover worker's HELLO
+    said `quant=Q4` — and a Q2 model reports `quant=Q2` in the same field — so
+    the leftover was a **Q4_K** worker holding ≈86 GiB, not a Q2 worker holding
+    ≈45 GiB. With the new Q2 worker at ≈45 GiB against 121 GiB total, exhaustion
+    is the mechanism, not a plausible candidate. The guard's own journal settles
+    the rest: at 17:19–17:21 the board was **54 °C, GPU 52 °C, 8 W, 0 % util,
+    `slowdown=Not Active`**; its 3-second loop then **stopped for 12 minutes**
+    (17:22–17:33) while the kernel still answered ping and TCP; there were **zero
+    ABORTs** and the evening's peak board was **74 °C**. That is userland
+    starvation with a live kernel, and not heat — evidence that was on the box
+    the whole time and should have been read during the incident, not after it.
+
+11. **Two comparisons used numbers that are not comparable.** The plan's §10
+    answer on MTP set "the capped pair decodes 12.48 t/s at 32K" against "8.00 t/s
+    for single-Mac Q4 with SSD streaming at 262K". That is Q2 versus Q4 *and* 32K
+    versus 262K, so it cannot support a statement about the Q4 split's decode at
+    depth. The decision (no MTP) is unaffected — it rests on MTP being excluded
+    under a layer split — but the evidence cited for it was confounded. The
+    honest state: **the Q4 pair's decode and prefill at 262K/524K do not exist
+    yet**, blocked behind WS 1–2, and the plan's §6.5/§6.6 runs are what will
+    produce them. The same confusion is latent in §9's fallback table, which pits
+    Q2-pair numbers against Q4-single numbers.
+
+12. **The ALF conclusion was slightly overclaimed.** What is established: the
+    per-app allow did not take effect for an adhoc/linker-signed binary, and the
+    blocking layer sits above `socketfilterfw` (the app was listed as *Allow
+    incoming connections* while SYNs still dropped, and Apple-signed `nc` passed
+    on the same address). What was *not* established: that no GUI route exists —
+    Local Network privacy was inferred, not tested, because the tunnel already
+    worked and is the better answer anyway (an Apple-signed `sshd` owns the
+    socket). The docs now say "not pursued to a conclusion" rather than
+    "unavailable".
 
 ---
 
@@ -403,9 +466,11 @@ ls -la /tmp/ds4kv/          # one .kv entry per cold checkpoint
 
 ---
 
-## 11. Distributed snapshot round-trip (verified 2026-09-19)
+## 11. Distributed snapshot round-trip (2026-09-19)
 
-Acceptance criterion 6 is met for the `0:23` / `24:output` split.
+Acceptance criterion 6 is **half met** for the `0:23` / `24:output` split: the
+save is verified, the load path was exercised, and equivalence is not yet shown
+(§6.1 #8).
 
 **Run used.** Mac: `ds4-server --role coordinator --layers 0:23 --listen
 127.0.0.1 9911 --ctx 4096 --host 127.0.0.1 --port 18080 --kv-disk-dir /tmp/ds4kv
@@ -423,7 +488,10 @@ Acceptance criterion 6 is met for the `0:23` / `24:output` split.
   save caught `127.0.0.1.55911 ↔ 127.0.0.1.60168/60170 ESTABLISHED` — the
   tunnel's `-L` listener, so the worker's slice crossed the link.
 * Load: re-sending a cached prompt reported `cached_tokens: 819,
-  cache_write_tokens: 0` and reproduced the output byte for byte.
+  cache_write_tokens: 0` and `cache hit … load=126.8 ms`. The **completion text
+  was not compared** — the two requests shared a prompt and `temperature 0`, so
+  equal text was expected and never checked. That comparison belongs in the
+  fresh-pair restore (§6.1 #7).
 
 **Defect cleared to get there.** The first attempt failed before opening any data
 connection: `kv cache skipped tokens=819 reason=cold because KV payload staging

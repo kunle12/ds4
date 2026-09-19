@@ -8,9 +8,9 @@
 
 ## 0. Verdict
 
-The blocker is **one missing quantized-matmul path in one function**, not the
-architecture. Everything else the split needs is already in the tree and has
-been exercised end to end:
+The blocker is **one missing dispatch path — the Q4_K instantiations of ten GLM
+MoE kernels** — not the architecture. Everything else the split needs is already
+in the tree and has been exercised end to end:
 
 | Requirement | State |
 | --- | --- |
@@ -55,15 +55,16 @@ Acceptance (all must hold on the target hardware):
    guard installed; zero `HW Thermal Slowdown` events attributable to the run;
    no hard-lock, and the run completes without operator intervention.
 6. **State.** Snapshot save/load across the split round-trips (DSV4/DSVL path).
-   **Verified 2026-09-19** for the `0:23` / `24:output` split at ctx 4096: a
+   **Save verified 2026-09-19** for the `0:23` / `24:output` split at ctx 4096: a
    649-token cold prompt wrote `bf072cd0…kv` (165.08 MiB, `save=18.2 ms`) with
-   the data connections observed on `127.0.0.1:55911` — the tunnel forward, so
-   the worker's slice really crossed the link — and repeating a cached prompt
-   reported `cached_tokens: 819` with byte-identical output. Two defects were
-   cleared first: the worker's advertised data port was ephemeral until pinned
-   with `--listen 127.0.0.1 55911`, and a KDA-layer sizing guard made any slice
-   containing a KDA layer unsizeable (fixed in `glm_layer_payload_tensor_bytes`;
-   see the implementation log).
+   the data connections observed on `127.0.0.1:55911` — the tunnel forward, so the
+   worker's slice really crossed the link. The **load** was exercised and reported
+   `cached_tokens: 819`; equivalence — the same output after a restore on a
+   **fresh** pair — is not yet shown and is the remaining half of this criterion.
+   Two defects were cleared first: the worker's advertised data port was ephemeral
+   until pinned with `--listen 127.0.0.1 55911`, and a KDA-layer sizing guard made
+   any slice containing a KDA layer unsizeable (fixed in
+   `glm_layer_payload_tensor_bytes`; implementation log §11 and §6.1 #8).
 
 Non-goals for this work: tensor parallelism across Metal+CUDA (architecturally
 excluded), Q4 on a single Spark, MTP under the split (`ds4_engine_has_mtp`
@@ -86,7 +87,7 @@ Measured on the target pair unless noted.
 | Q2 pipeline with thermal caps on | 32 768 ctx: **380.6 t/s prefill, 12.5 t/s decode**; board 66–77 °C, `slowdown=Not Active` (vs 90 °C board and accumulating HW slowdown uncapped) |
 | Q4_K on the Mac alone (SSD streaming) | 32 768: 84.2 t/s / 8.8 t/s · 262 144: 82.5 t/s / 8.0 t/s (53 min ingest), 99.84 GiB plan, 5 435/12 384 experts cached, no thermal warning |
 | Spark thermals | idle 43–50 °C; under pipeline prefill board 60–90 °C, GPU die ~10 °C cooler; `HW Thermal Slowdown` + 69 s `SW Power Capping` observed uncapped |
-| Distributed snapshot (Q2 pipeline) | save + load verified 2026-09-19: a 649-token cold prompt wrote a 165.08 MiB checkpoint in 18.2 ms with the data connection observed on `127.0.0.1:55911`, and re-sending a cached prompt reported `cached_tokens: 819` with byte-identical output (log §11) |
+| Distributed snapshot (Q2 pipeline) | save verified 2026-09-19: a 649-token cold prompt wrote a 165.08 MiB checkpoint in 18.2 ms with the data connection observed on `127.0.0.1:55911`; the load path reported `cached_tokens: 819`. Equivalence on a fresh pair is still to be shown (log §11, §6.1 #7–8) |
 
 ---
 
@@ -261,19 +262,25 @@ minutes of pipeline prefill. Therefore:
 * runs are bounded (frontier sweeps) with cool-downs; 250K/500K ingests are
   treated as endurance tests with the guard armed.
 
-**Observed 2026-09-19, a second contributor to the envelope.** A worker started
-while another `ds4` was already resident (~45 GiB each, over a 95 GiB mmap) left
-the Spark in a state where the *link* was healthy — `ping` 0.5 ms with 0% loss,
-TCP handshakes completing to `:22` — while `sshd` never emitted a banner on any of
-several established connections, even with a 60-second budget, and no other
-service was listening. Nothing remote could recover it; the documented recovery
-is a physical power cycle. Two candidates were eliminated rather than assumed:
-the CPU cap is only a ~14% frequency cut, and the guard already wraps every
-`nvidia-smi` call in `timeout 5`, so it cannot accumulate stuck processes. That
-leaves memory/IO pressure from two resident workers, which the precondition below
-prevents. The coordinator-side symptom is worth recognising: the route silently
-loses the worker (`distributed route incomplete: missing layer 24`) while the
-control socket still reads `ESTABLISHED` in `netstat`.
+**Observed 2026-09-19, with the mechanism now supported by evidence.** A Q2
+worker was started while a **Q4_K** worker was still resident — the leftover's
+HELLO reported `quant=Q4`, and a Q2 model reports `quant=Q2` in that same field.
+Against 121 GiB of memory that is ≈86 GiB plus ≈45 GiB: exhaustion, not pressure.
+The box then showed a healthy link — `ping` 0.5 ms with 0% loss, TCP handshakes
+completing to `:22` — while `sshd` never emitted a banner on any of several
+established connections, even with a 60-second budget, and no other service was
+listening.
+
+The guard's own journal, read after the fact, settles what happened: at 17:19–17:21
+the board was **54 °C, GPU 52 °C, 8 W, 0 % utilisation, `slowdown=Not Active`**;
+its 3-second loop then **stopped for 12 minutes** (17:22–17:33) while the kernel
+still answered ping and TCP; there were **zero ABORTs**, and the evening's peak
+board was **74 °C** under this workload. That is userland starvation with a live
+kernel, not heat. Nothing remote recovers it — the documented recovery is a
+physical power cycle, which is why the precondition below is mandatory. The
+coordinator-side symptom is worth recognising too: the route silently loses the
+worker (`distributed route incomplete: missing layer 24`) while the control socket
+still reads `ESTABLISHED` in `netstat`.
 
 **Precondition for every Spark run — do not skip:**
 
@@ -311,10 +318,11 @@ Critical path: **1 → 2 → 5 → 6**, about **1–1.5 weeks**; the full set wi
 docs is **2–3 weeks**. Nothing here requires new architecture, new file formats
 or a new transport.
 
-Already done ahead of the workstreams: the snapshot half of WS 7 was verified on
-2026-09-19 for the `0:23` / `24:output` split — save and load across the tunnel,
-with the data connection observed on `127.0.0.1:55911` (implementation log §11).
-The boundary gates in that workstream remain.
+Already done ahead of the workstreams: the snapshot **save** half of WS 7 was
+verified on 2026-09-19 for the `0:23` / `24:output` split, with the data connection
+observed on `127.0.0.1:55911`. The load path was exercised but its equivalence
+still needs the fresh-pair restore in §6 item 5 (implementation log §11,
+§6.1 #8). The boundary gates in this workstream also remain.
 
 **Order of work matters:** land the *prefill* path first (2) so a long ingest can
 be measured behind the guard, then decode (4), then the QA matrix. Each
@@ -418,8 +426,11 @@ Layered, cheapest first; each layer must pass before the next is trusted.
    this workload; the synthetic field diagnostic is reserved for a unit that
    fails it.
 4. ~~Does the 500K target need to hold with `--mtp` off?~~ Answered 2026-09-19:
-   **yes, and MTP stays a non-goal.** Planning assumes no speculative speedup, and
-   the target is met without it: the capped pair decodes 12.48 t/s at 32K and
-   11.42 t/s at 131K, against 8.00 t/s for single-Mac Q4 with SSD streaming at
-   262K. Enabling MTP under a layer split would be design work — the head and its
-   routing would have to cross a slice boundary — not a flag.
+   **yes, and MTP stays a non-goal.** The decision rests on MTP being excluded
+   under a layer split — the head and its routing would have to cross a slice
+   boundary — not on a throughput comparison. What is *not* yet measured is the
+   thing that matters here: the **Q4 pair's** decode and prefill at 262K/524K,
+   blocked behind WS 1–2. The pair's numbers so far are **Q2** (12.48 t/s at 32K,
+   11.42 at 131K) and cannot be set against the single-Mac **Q4** figure
+   (8.00 t/s at 262K): different quantisation, different depth. §6 items 5–6 are
+   what will produce the comparable pair.
