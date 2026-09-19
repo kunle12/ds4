@@ -23,6 +23,14 @@ in the tree and has been exercised end to end:
 | Mac as coordinator (inbound TCP) | **closed**: macOS does not honour the firewall's allow for adhoc-signed binaries (measured 2026-09-19); the two-forward loopback tunnel is the transport, and it carries snapshots too |
 | Spark thermal envelope | protection now installed and verified live |
 
+The Q4 quality advantage is **not** an argument for the split. It is available
+single-machine with `--ssd-streaming` today — measured at **−34.4 % NLL against Q2
+on the 100-case fixture, better on 98 of 100 cases**, with both checkpoints
+reproducing their published bands (§2, log §4.6). What the split adds is Q4 at
+262K–500K **resident**, without dependence on the expert cache, at the ingest speed
+the Q2 pipeline already demonstrates. Choosing the split is therefore a capacity
+and ingest-time decision, not a quality one.
+
 Payoff `[INFERENCE]`: pipeline prefill is `max(stage)` not `sum(stage)`, so the
 split should roughly halve long-ingest wall time versus the single-Mac streaming
 path (measured today: 82.5 t/s ⇒ 53 min for a cold 250K). Decode is `sum(stage)`
@@ -88,6 +96,7 @@ Measured on the target pair unless noted.
 | Q4_K on the Mac alone (SSD streaming) | 32 768: 84.2 t/s / 8.8 t/s · 262 144: 82.5 t/s / 8.0 t/s (53 min ingest), 99.84 GiB plan, 5 435/12 384 experts cached, no thermal warning |
 | Spark thermals | idle 43–50 °C; under pipeline prefill board 60–90 °C, GPU die ~10 °C cooler; `HW Thermal Slowdown` + 69 s `SW Power Capping` observed uncapped |
 | Distributed snapshot (Q2 pipeline) | save verified 2026-09-19: a 649-token cold prompt wrote a 165.08 MiB checkpoint in 18.2 ms with the data connection observed on `127.0.0.1:55911`; the load path reported `cached_tokens: 819`. Equivalence on a fresh pair is still to be shown (log §11, §6.1 #7–8) |
+| Quality, Q2 vs Q4_K (100-case GLM 5.3 Flash fixture, this Mac, Metal) | Q4_K `0.300477636 / 90 / 9.480` vs Q2 `0.458177271 / 90 / 7.390`; paired **98/100 cases better**, NLL **−34.4 %**, first-token match equal. Both reproduce their published bands, and the Q4 layout's M3 Ultra Metal reference is matched to three decimals (log §4.6) |
 
 ---
 

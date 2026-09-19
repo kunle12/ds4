@@ -233,6 +233,66 @@ Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board marg
 
 `en0` 10Gbase-T active; `enP7s7` 10000Mb/s full duplex; RTT 0.94–1.21 ms; single-stream TCP 4 GiB in 8.94 s ⇒ **0.46 GiB/s**; wire need ≈26 MB/s at 400 t/s. **Not the constraint.**
 
+### 4.6 Quality: Q2 vs Q4_K on the GLM 5.3 Flash 100-case fixture
+
+Run 2026-09-19 on this Mac (M4 Max, Metal), one checkpoint at a time, same build,
+same fixture (`gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100`),
+greedy, ctx 4096 — Q2 resident, Q4_K with `--ssd-streaming` because 177.8 GiB cannot
+be resident on 128 GiB. Scored with the repo's own `score_official`, compared with
+its `compare_scores.py`.
+
+```sh
+./gguf-tools/quality-testing/score_official /Users/xun/mlmodels/glm/GLM-5.3-Flash-Q2.gguf \
+  gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100/manifest.tsv /tmp/glm53-q2.tsv 4096
+./gguf-tools/quality-testing/score_official /Users/xun/mlmodels/glm/GLM-5.3-Flash-Q4_K.gguf \
+  gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100/manifest.tsv /tmp/glm53-q4.tsv 4096 --ssd-streaming
+```
+
+| Run | cases | avg NLL | first-token match | avg greedy lcp | wall time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q2, resident | 100 | 0.458177271 | 90 | 7.390 | ≈65 min |
+| Q4_K, `--ssd-streaming` | 100 | **0.300477636** | **90** | **9.480** | ≈95 min |
+| *published Q2 reference* | 100 | 0.458030488 | 89 | 7.37 | — |
+| *published Q4 reference* | 100 | 0.299917952 | 90 | 9.66 | — |
+| *M3 Ultra Metal reference, Q4 layout* | 100 | 0.300804038 | 90 | 9.48 | — |
+
+Paired, case by case (`compare_scores.py /tmp/glm53-q2.tsv /tmp/glm53-q4.tsv`):
+
+```
+cases                        100
+tokens                     11559
+old_avg_nll           0.458177271
+new_avg_nll           0.300477636
+relative_nll_change       -34.419%
+case_wins_new_old_ties  98    2    0
+first_token_matches_old_new  90   90
+avg_greedy_lcp_old_new  7.390  9.480
+```
+
+Reading:
+
+* Both checkpoints reproduce their published bands on this host, and the Q4
+  layout's Metal reference (M3 Ultra) is matched to three decimals on the greedy
+  prefix — so the local pipeline is faithful and the comparison is neither
+  backend- nor build-specific.
+* **Q4_K is better on 98 of 100 cases**, with **34.4 % lower NLL** and the *same*
+  first-token match: the gain is in the continuation, not the first token.
+* **The gap does not require the split.** It is available single-machine with
+  `--ssd-streaming` today, so it argues for Q4 as the target quantisation rather
+  than for the two-machine pipeline. What the split adds is Q4 at 262K–500K fully
+  resident, without dependence on the expert cache, at the ingest speed the Q2
+  pipeline already demonstrates.
+* The repo's SSD-streaming gate ("the summary should stay in the same quality
+  band") is satisfied here: streaming changes no quality metric.
+
+**Cost of the streaming gate on this host.** The first ~15 cases run at
+≈2.5 min/case while the expert cache warms, then settle at ≈25–30 s/case —
+measured over two windows (12 cases/300 s and 6 cases/180 s), not sampled once.
+Total ≈95 min for the fixture against ≈65 min resident for Q2: a ~1.2× cost
+concentrated in the cold ramp, not a per-case penalty. Two claims I made from a
+single cold-window sample ("flat rate", "≈9× penalty") were wrong and this is the
+corrected measurement.
+
 ---
 
 ## 5. Defects found, and their disposition
@@ -341,6 +401,14 @@ Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board marg
     worked and is the better answer anyway (an Apple-signed `sshd` owns the
     socket). The docs now say "not pursued to a conclusion" rather than
     "unavailable".
+
+13. **The SSD-streaming cost was mis-stated from one cold-window sample.** I
+    reported "a flat ≈2.5 min/case, the cache is not accelerating it" and, from
+    that, a "≈4 h" run. Measured across two later windows it is 25–30 s/case once
+    the cache warms, ≈95 min for the fixture, against ≈65 min resident for Q2
+    (§4.6). This is the same failure as #7 — generalising from a single
+    observation — and it is the second time in this work, which is why the
+    measurement convention now says: sample twice before stating a rate.
 
 ---
 
