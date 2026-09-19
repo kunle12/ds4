@@ -15,7 +15,7 @@ verbatim from the session.
 
 ---
 
-## 1. Status summary (as of 2026-09-19 16:19)
+## 1. Status summary (as of 2026-09-19 18:00)
 
 **Objective.** Run `GLM-5.3-Flash-Q4_K.gguf` (177.77 GiB, `glm5-next`, 45
 executable layers) as a two-machine pipeline — Mac Studio coordinator + DGX
@@ -26,20 +26,23 @@ thermal envelope.
 | --- | --- |
 | GLM 5.3 layer-slice correctness (wire width) | **done, validated bit-exact** |
 | Cross-machine Q2 pipeline | **working and measured** |
+| Distributed snapshot round-trip across the split | **verified 2026-09-19** — save and load, with the data connection observed crossing the tunnel |
 | Q4_K on the pair | **blocked** — CUDA GLM routed MoE is Q2_K-only; port specified in the plan |
 | Q4_K on the Mac alone | **working and measured** (SSD streaming) |
-| Spark thermal protection | **installed, enabled, verified live** |
-| Access path (macOS ALF workaround) | **installed as a boot-persistent launchd daemon, verified** |
-| Binaries deployed to `~/bin` on both hosts | **done, checksums verified** |
+| Spark thermal protection | **installed, enabled, verified live**; re-armed by itself after the 2026-09-19 power cycle |
+| Access path (macOS ALF workaround) | **installed as a boot-persistent launchd daemon, verified**; carries both forwards (`-R` control, `-L` data for snapshots) |
+| Binaries deployed to `~/bin` on both hosts | **rebuilt 2026-09-19 from byte-identical sources and reinstalled** (`ds4.c` md5 `98c92891…` on both) |
+| Spark wedge, 2026-09-19 | two resident workers left the box with a live kernel and dead userland; **physical power cycle**, then a mandatory clean-slate precondition (plan §4.3) |
 | Plan for closing the Q4 gap | **written** (`ds4-glm53-q4-split-design.md`) |
-| Fork and branch | **pushed** — `customisation` on `kunle12/ds4`, 5 commits ahead of upstream `8db1d1d` |
+| Fork and branch | **pushed** — `customisation` on `kunle12/ds4` |
 
 **Next action:** workstream 1 of the plan — type traits + dispatch predicate for
 the GLM routed MoE (`{Q2_K, Q4_K}`), then WS 2 (Q4_K prefill), which is the first
 milestone that makes a 262K Q4 ingest measurable behind the guard.
 
-**Nothing is running** except the tunnel daemon (Mac) and the thermal guard
-(Spark), both of which are permanent by design.
+**Nothing is running** except the tunnel daemon (Mac), the thermal guard (Spark),
+and — as of this writing — the Q2 pair parked in the working configuration that
+§10 restarts, so the rebuilt binaries can be exercised without a reload.
 
 ---
 
@@ -51,15 +54,19 @@ milestone that makes a 262K Q4 ingest measurable behind the guard.
 | 2 | `ds4.c:74441` (GLM branch, `ds4_session_eval_layer_slice`) | `hidden_dim = glm53 ? N_HC*N_EMBD : N_EMBD` | per-token chunk stride across a slice boundary | built both |
 | 3 | `ds4.c:73521` (`ds4_session_eval_output_head_from_hc`) | write into `gg->hc_cur` for glm53 | the head collapses the HC block; writing `gg->cur` left it stale | built both |
 | 4 | `ds4_metal.m:4754` + `:4821` | new `ds4_metal_executable_dir()`; search `<exe_dir>/metal/…` in addition to `metal/…` and `./metal/…` | kernel sources were CWD-relative only, so an installed binary (`~/bin/ds4-server` + `~/bin/metal`) only worked if started from a directory containing `metal/` | built, verified from `/tmp` |
+| 5 | `ds4.c:61000` (`glm_layer_payload_tensor_bytes`, KDA branch) | the branch no longer rejects the payload header's **uniform** `compact_live`/index counts; it returns the conv + recurrent state span and asserts it is non-zero | the guard made any slice containing a KDA layer unsizeable as soon as a context existed, so the first distributed checkpoint failed with `distributed KV shard tensor size overflow` | snapshot save **and** load verified end to end (§11) |
+| 6 | `ds4.c:46078` (`glm_graph_layer_uses_generic_routed_moe`) | **experiment, inert unless `DS4_GLM_GENERIC_MOE_Q4K` is set**: a homogeneous Q4_K expert trio may be routed through the generic MoE dispatch | a spike shortcut to exercise Q4_K on CUDA before the kernel port exists; its own comment says remove or make unconditional once the result is measured. **Not part of the design** — plan WS 1–4 supersede it | built on both backends; not a correctness path |
 
-Changes 1–3 are the fix that makes GLM 5.3 pipeline mode work at all; change 4
-is required for the `~/bin` deployment convention.
+Changes 1–3 are the fix that makes GLM 5.3 pipeline mode work at all; change 4 is
+required for the `~/bin` deployment convention; change 5 unblocks distributed
+checkpoints; change 6 is an experiment, not part of the design.
 
 **Not in the repository** (host-level, staged outside the tree): the Spark
-thermal-protection scripts/units (§7) and the launchd tunnel job (§7).
+thermal-protection scripts/units (§7) and the launchd tunnel job (§7). Both are
+backed up on the Mac and documented in §7.
 
-Working tree also contains an untracked `docs/custom/` (this log and the plan) and
-the user's pre-existing `README.md` modification.
+`docs/custom/` is tracked as of commit `413d331`; the user's pre-existing
+`README.md` modification and an uncommitted `.gitignore` change remain local.
 
 ---
 
@@ -161,6 +168,20 @@ the user's pre-existing `README.md` modification.
 
 **Remote workflow from here:** `git fetch upstream && git merge upstream/main` (or rebase) to take antirez's changes; `git push` publishes to the fork. Nothing in this phase changes the code, the installed services, or the Spark.
 
+### Phase J — Wedge, recovery, and distributed snapshot verification
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| J1 | Started a second worker on the Spark while a leftover from the earlier spike was still resident | the route registered from the **leftover** (`data_port=39215` ephemeral, `ctx=33792`), not the new worker, which never finished loading |
+| J2 | The Spark wedged | `sshd` completed TCP handshakes and never wrote a banner on any established connection (60 s budget); only `:22` open; ping 0.5 ms, 0 % loss |
+| J3 | Eliminated the network and the guard as causes | `en0` 0.1 KB/s in / 0.4 KB/s out, every socket to the Spark with empty queues, and new logins bypass the tunnel entirely; every `nvidia-smi` in the guard is wrapped in `timeout 5`; the CPU cap is a 14 % cut |
+| J4 | User power-cycled the box | up in 1 min; 118 GiB free, zero `ds4`; guard and CPU cap re-armed by themselves; board 55 °C |
+| J5 | Tunnel self-healed | `KeepAlive` re-established the session and the Mac held `127.0.0.1:55911` again; the plan gained a mandatory clean-slate precondition (§4.3) |
+| J6 | Worker pinned with `--listen 127.0.0.1 55911` | `data_listen=127.0.0.1:55911`; the coordinator logged `data_port=55911` (not the ephemeral 39215) and `ctx=4096` |
+| J7 | First snapshot attempt failed before any data connection | `kv cache skipped tokens=819 reason=cold because KV payload staging failed: distributed KV shard tensor size overflow` — the KDA guard of §2 #5 |
+| J8 | Fixed, rebuilt, re-ran | save wrote `bf072cd0…kv` (165.08 MiB, `save=18.2 ms`), data sockets observed on 55911, load reported `cached_tokens: 819` with identical output — details in §11 |
+| J9 | Rebuilt **all five** binaries on both hosts from byte-identical sources | `ds4.c` md5 `98c92891b4a880429dd1937c58ce4b67` on both; Spark build `make -j20 cuda-spark` (`sm_121`) |
+
 ---
 
 ## 4. Measurements
@@ -218,7 +239,8 @@ Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board marg
 | Spark hard-locks under sustained load | board 90 °C, `HW_THERMAL_SLOWDOWN`, unreachable; NVIDIA field-diagnostic PowerStress failure | **mitigated** (caps + governor); user has declined RMA |
 | Guard: `set -u` exit on first `set_cap`; slow-down parse; initial `board=0C` | journal `board: parameter not set`, status `2` | **fixed** and stub-verified |
 | Install hang: plymouth boot stall | `is-system-running = starting` for 17 min | **fixed** (unit ordering) + `set-default multi-user.target` |
-| Snapshot over the tunnel | coordinator derives worker address from the socket = `127.0.0.1` | **open** — recorded in the plan §4.2 |
+| Snapshot over the tunnel | coordinator derives worker address from the socket = `127.0.0.1` | **fixed** — second forward `-L 55911:127.0.0.1:55911` plus a worker pinned with `--listen 127.0.0.1 55911`; save and load verified, data sockets observed on 55911 |
+| GLM 5.3 KDA layers made any containing slice unsizeable | `staging failed: distributed KV shard tensor size overflow`; `glm_layer_payload_tensor_bytes` rejected the uniform `compact_live` the header carries for every layer | **fixed** in `ds4.c` (guard removed, span is conv+recurrent state); snapshot round-trip then verified — see §11 |
 
 ---
 
@@ -235,6 +257,19 @@ Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board marg
    the Spark leads.
 4. **"`gb10-thermal-status.sh` has a defect" was wrong** — the missing section
    was my `sed` range truncating the output, not the script.
+5. **The tunnel was not failing from data volume.** During the 2026-09-19 wedge
+   the working hypothesis was too much traffic through the tunnel. Measured:
+   `en0` carried 0.1 KB/s in / 0.4 KB/s out, every socket to the Spark had empty
+   queues, and the failing SSH logins never traverse the tunnel at all. The
+   Spark's `sshd` completed TCP handshakes and never wrote a banner — a wedged
+   userland, which needed a physical power cycle. Both machines are fine; the
+   tunnel re-established itself with `KeepAlive` once the box was back.
+6. **The thermal guard was eliminated, not assumed, as a wedge cause.** Every
+   `nvidia-smi` call in `gb10-thermal-guard.sh` is already wrapped in `timeout 5`,
+   so the sampler cannot accumulate stuck processes; the CPU cap is a ~14 %
+   frequency cut. Two resident workers (a leftover plus a new one, ~45 GiB each
+   over a 95 GiB mmap) remain the plausible trigger, which is why the plan now
+   carries a clean-slate precondition.
 
 ---
 
@@ -244,10 +279,10 @@ Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board marg
 
 | Path | What |
 | --- | --- |
-| `~/dev/ds4/` | source tree at `8db1d1d` + §2 changes |
+| `~/dev/ds4/` | source tree, branch `customisation` (fork point `8db1d1d`); §2 #5–6 were uncommitted when the binaries were rebuilt |
 | `~/dev/ds4/docs/custom/ds4-glm53-q4-split-design.md` | the plan |
 | `~/dev/ds4/docs/custom/ds4-glm53-q4-implementation-log.md` | this log |
-| `~/bin/` | `ds4`, `ds4-server`, `ds4-agent`, `ds4-bench`, `ds4-eval` (from today's build) + `metal/` (27 files) |
+| `~/bin/` | `ds4`, `ds4-server`, `ds4-agent`, `ds4-bench`, `ds4-eval` (rebuilt 2026-09-19 17:46) + `metal/` (26 kernels) |
 | `~/ds4-tunnel/` | tunnel kit: daemon + agent plists, `install.sh`, `install-agent.sh`, `uninstall.sh`, `README.md` |
 | `~/thermal-protect/` | backup copy of the Spark protection kit |
 | `/Library/LaunchDaemons/com.local.ds4-tunnel.plist` | installed by the user; job `com.local.ds4-tunnel`, runs as `xun` |
@@ -257,8 +292,8 @@ Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board marg
 
 | Path | What |
 | --- | --- |
-| `~/dev/ds4/` | source tree at `8db1d1d` + §2 #1–3 |
-| `~/bin/` | the same five binaries (CUDA `sm_121`) |
+| `~/dev/ds4/` | source tree content-matched to the Mac's (`ds4.c` md5 `98c92891…` on both), on branch `main` at `8db1d1d` |
+| `~/bin/` | the same five binaries, rebuilt 2026-09-19 from that tree with `make -j20 cuda-spark` (CUDA `sm_121`) |
 | `~/thermal-protect/` | kit source |
 | `/usr/local/bin/gb10-thermal-guard.sh`, `gb10-cpu-cap.sh`, `gb10-thermal-status.sh` | installed |
 | `/etc/systemd/system/gb10-thermal-guard.service`, `gb10-cpu-cap.service`, `gb10-cpu-cap.timer` | installed, enabled |
@@ -275,12 +310,20 @@ Default target changed to `multi-user.target` (headless).
 1. **IQ2_XXS in the same port pass, or Q4_K only?** Q4_K is the stated goal;
    IQ2_XXS is one more template instantiation (~1–2 days code) but widens the QA
    matrix, and it is what would let the Spark run IQ2 GLM artifacts.
-2. **Snapshots:** accept the tunnel limitation, or take the ALF-allow route with
-   explicit binds, or add the worker's reachable host to HELLO (protocol change).
+2. ~~**Snapshots:** accept the tunnel limitation, or take the ALF-allow route with
+   explicit binds, or add the worker's reachable host to HELLO (protocol change)?~~
+   Answered 2026-09-19: none of those. The tunnel carries the data connection too
+   (`-L 55911:127.0.0.1:55911`) with the worker pinned (`--listen 127.0.0.1 55911`),
+   and save plus load are verified (§11). The ALF route is closed (plan §3.3) and
+   no protocol change is needed.
 3. **`make install`** target so rebuild → `~/bin` is one command (currently manual
    `cp`).
 4. Confirm 500K must hold **without** MTP (excluded in distributed mode by
    `ds4_engine_has_mtp`), i.e. decode stays at ~11–14 t/s.
+5. **The `DS4_GLM_GENERIC_MOE_Q4K` experiment (§2 #6):** drop it now that the
+   result is measured, or keep it until WS 2 lands as a comparison point? It is
+   inert unless the variable is set, so keeping it costs nothing at runtime, but
+   it leaves a second dispatch path in the tree that the plan does not use.
 
 ---
 
@@ -321,7 +364,67 @@ cd /tmp && ~/bin/ds4 --inspect -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf | head -3
 
 # working cross-machine configuration (Q2)
 ssh 192.168.2.2 'pkill -x ds4; (setsid nohup ~/bin/ds4 --cuda -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf \
-  --role worker --layers 24:output --coordinator 127.0.0.1 9911 --ctx 524288 >/tmp/w.log 2>&1 </dev/null &)'
+  --role worker --layers 24:output --coordinator 127.0.0.1 9911 --listen 127.0.0.1 55911 --ctx 524288 >/tmp/w.log 2>&1 </dev/null &)'
 cd /tmp && ~/bin/ds4 -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf --role coordinator --layers 0:23 \
   --listen 127.0.0.1 9911 --ctx 32768 --temp 0 -n 32 -p "your prompt"
+
+# snapshot acceptance (distributed checkpoint save + load, §11)
+~/bin/ds4-server -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf --role coordinator --layers 0:23 \
+  --listen 127.0.0.1 9911 --ctx 4096 --host 127.0.0.1 --port 18080 \
+  --kv-disk-dir /tmp/ds4kv --kv-cache-min-tokens 512
+#   a cold prompt above min-tokens forces a save; re-sending it must report
+#   cached_tokens == prompt_tokens and no cache_write_tokens
+curl -s http://127.0.0.1:18080/v1/completions -H 'Content-Type: application/json' \
+  -d '{"model":"glm-5.2","prompt":"<prompt above 512 tokens>","max_tokens":4,"temperature":0}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["usage"])'
+ls -la /tmp/ds4kv/          # one .kv entry per cold checkpoint
 ```
+
+---
+
+## 11. Distributed snapshot round-trip (verified 2026-09-19)
+
+Acceptance criterion 6 is met for the `0:23` / `24:output` split.
+
+**Run used.** Mac: `ds4-server --role coordinator --layers 0:23 --listen
+127.0.0.1 9911 --ctx 4096 --host 127.0.0.1 --port 18080 --kv-disk-dir /tmp/ds4kv
+--kv-cache-min-tokens 512`. Spark: `ds4 --cuda --role worker --layers 24:output
+--coordinator 127.0.0.1 9911 --listen 127.0.0.1 55911 --ctx 4096`.
+
+**Evidence**
+
+* The worker registered with the pinned port — `registered worker
+  127.0.0.1:60159 data_port=55911 … ctx=4096`. Before `--listen` was passed it
+  advertised an ephemeral port (39215), which no static forward can reach.
+* Cold save: `kv cache stored tokens=649 trimmed=0 reason=cold size=161.02 MiB
+  save=18.2 ms`, writing `bf072cd0…kv` (173,096,280 bytes).
+* The data path was genuinely used: sampling `netstat` every 10 ms during the
+  save caught `127.0.0.1.55911 ↔ 127.0.0.1.60168/60170 ESTABLISHED` — the
+  tunnel's `-L` listener, so the worker's slice crossed the link.
+* Load: re-sending a cached prompt reported `cached_tokens: 819,
+  cache_write_tokens: 0` and reproduced the output byte for byte.
+
+**Defect cleared to get there.** The first attempt failed before opening any data
+connection: `kv cache skipped tokens=819 reason=cold because KV payload staging
+failed: distributed KV shard tensor size overflow`. Root cause: a layer-payload
+header carries **one uniform `compact_live` for every layer of the slice**, and
+`glm_layer_payload_tensor_bytes` rejected exactly that combination for KDA layers
+— so any slice containing a KDA layer became unsizeable as soon as a context
+existed. A KDA layer holds no KV rows: its span is the conv state plus the
+recurrent state, independent of those counts. The guard is removed and `*out != 0`
+is asserted instead. This also affected `ds4_session_layer_payload_bytes`, i.e.
+the single-node sizing path, not just distributed snapshots.
+
+**Rebuilt since.** Both hosts now run binaries built from this fix (§3 J9), so the
+roles-swapped restore in plan §6 item 5 no longer needs a separate build, and the
+round-trip was re-verified on those binaries: cold save `size=164.89 MiB
+save=18.1 ms`, six data-socket observations on `127.0.0.1:55911`, then `cache hit
+… load=126.8 ms` with `cached_tokens: 819`. What remains untested is the restore
+on a **fresh** pair and with the roles swapped — this section covers save and load
+on a live pair with the `0:23` / `24:output` split, which is the configuration the
+goal uses.
+
+One log line to read correctly when it appears: `kv cache skipped tokens=818
+reason=evict … session has no valid checkpoint to stage` is a benign eviction
+no-op after a hit, not the defect — the defect's message is
+`distributed KV shard tensor size overflow`.

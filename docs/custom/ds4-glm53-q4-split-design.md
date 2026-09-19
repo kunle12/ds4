@@ -20,7 +20,7 @@ been exercised end to end:
 | Link | 10GbE direct, measured 0.46 GiB/s single-stream vs ~26 MB/s needed |
 | Q4_K *arithmetic* on CUDA | exists twice over: vendored MMQ (`ds4_mmq_dense_impl<GGML_TYPE_Q4_K>`) and DeepSeek MoE Q4_K kernels |
 | GLM routed MoE on CUDA **for Q4_K** | **missing** — `ds4_cuda.cu:32103` accepts `type 10` (Q2_K) only |
-| Mac as coordinator (inbound TCP) | blocked by macOS for adhoc-signed binaries; workaround in use (`ssh -R` tunnel) or grant Local Network permission |
+| Mac as coordinator (inbound TCP) | **closed**: macOS does not honour the firewall's allow for adhoc-signed binaries (measured 2026-09-19); the two-forward loopback tunnel is the transport, and it carries snapshots too |
 | Spark thermal envelope | protection now installed and verified live |
 
 Payoff `[INFERENCE]`: pipeline prefill is `max(stage)` not `sum(stage)`, so the
@@ -55,6 +55,15 @@ Acceptance (all must hold on the target hardware):
    guard installed; zero `HW Thermal Slowdown` events attributable to the run;
    no hard-lock, and the run completes without operator intervention.
 6. **State.** Snapshot save/load across the split round-trips (DSV4/DSVL path).
+   **Verified 2026-09-19** for the `0:23` / `24:output` split at ctx 4096: a
+   649-token cold prompt wrote `bf072cd0…kv` (165.08 MiB, `save=18.2 ms`) with
+   the data connections observed on `127.0.0.1:55911` — the tunnel forward, so
+   the worker's slice really crossed the link — and repeating a cached prompt
+   reported `cached_tokens: 819` with byte-identical output. Two defects were
+   cleared first: the worker's advertised data port was ephemeral until pinned
+   with `--listen 127.0.0.1 55911`, and a KDA-layer sizing guard made any slice
+   containing a KDA layer unsizeable (fixed in `glm_layer_payload_tensor_bytes`;
+   see the implementation log).
 
 Non-goals for this work: tensor parallelism across Metal+CUDA (architecturally
 excluded), Q4 on a single Spark, MTP under the split (`ds4_engine_has_mtp`
@@ -77,6 +86,7 @@ Measured on the target pair unless noted.
 | Q2 pipeline with thermal caps on | 32 768 ctx: **380.6 t/s prefill, 12.5 t/s decode**; board 66–77 °C, `slowdown=Not Active` (vs 90 °C board and accumulating HW slowdown uncapped) |
 | Q4_K on the Mac alone (SSD streaming) | 32 768: 84.2 t/s / 8.8 t/s · 262 144: 82.5 t/s / 8.0 t/s (53 min ingest), 99.84 GiB plan, 5 435/12 384 experts cached, no thermal warning |
 | Spark thermals | idle 43–50 °C; under pipeline prefill board 60–90 °C, GPU die ~10 °C cooler; `HW Thermal Slowdown` + 69 s `SW Power Capping` observed uncapped |
+| Distributed snapshot (Q2 pipeline) | save + load verified 2026-09-19: a 649-token cold prompt wrote a 165.08 MiB checkpoint in 18.2 ms with the data connection observed on `127.0.0.1:55911`, and re-sending a cached prompt reported `cached_tokens: 819` with byte-identical output (log §11) |
 
 ---
 
@@ -122,10 +132,15 @@ where the user sits. Fix it only if the Spark-headed topology is wanted.
 
 ### 3.3 macOS inbound TCP (operational, not code)
 
-`ds4` is adhoc/linker-signed, so non-loopback inbound is blackholed. Two
-options, both already demonstrated: grant the binary Local Network permission
-(preferred, durable) or keep a supervised `ssh -R` tunnel. This must be settled
-before any long session, because a tunnel drop aborts a run mid-ingest.
+`ds4` is adhoc/linker-signed, so non-loopback inbound is blackholed. **Settled
+2026-09-19: the firewall route is closed**, because `~/bin/ds4` was listed as
+*Allow incoming connections* while SYNs to its listener on the direct-link
+address were still dropped, whereas Apple-signed `/usr/bin/nc` on the same address
+and port accepted the same probe from the Spark. So no Local Network grant was
+obtained, and the supervised loopback tunnel is the transport (§4.2), extended
+with a second forward so snapshots have a path as well. Supervision matters: a
+tunnel drop aborts a run mid-ingest, so it runs under `launchd` `KeepAlive`, and
+long steps are preceded by a snapshot.
 
 ---
 
@@ -178,16 +193,60 @@ agent, server) on the machine the user sits at, and it sidesteps gap 3.2
 entirely. Direction is performance-neutral at a balanced cut (the repo's own
 `ds4-v41-split-design.md` §11.10 conclusion), so this costs nothing.
 
-**Access path, and its one constraint.** macOS's Application Firewall blackholes
-inbound TCP for the adhoc-signed `ds4`, so the coordinator is reached through a
-persistent reverse tunnel (`~/ds4-tunnel/`, boot-persistent launchd daemon) that
-binds `9911` on the Spark's loopback and forwards it to the Mac's loopback.
-Generation, prefill and decode all work through it (verified end to end).
-**Snapshots do not**: the worker's HELLO advertises only a port, and the
-coordinator derives the worker's address from the accepted socket — which through
-the tunnel is `127.0.0.1`. So acceptance criterion 6 (snapshot round-trip) needs
-either a direct connection (ALF allow + explicit binds) or a small protocol
-addition carrying the worker's reachable host. Decide this before WS 7.
+**Access path (decided and revised 2026-09-19: the loopback tunnel, with a second
+forward for the data connection).** The direct connection was implemented and
+measured, and it does not work. The `~/bin` binaries were allowed in the
+Application Firewall and the coordinator was bound to `--listen 192.168.2.1 9911`;
+a probe from the Spark was still dropped — with `~/bin/ds4` listed as *Allow
+incoming connections* at that moment — while Apple-signed `/usr/bin/nc` on the
+same address and port accepted the same probe from the Spark. The Spark's `ufw`
+is **inactive** (its unit is active but the firewall reports `System: inactive`),
+so it filters nothing and is not a factor. The block is therefore in macOS's
+handling of adhoc/linker-signed binaries on non-loopback addresses, and it is not
+fixable from the command line: the two plausible layers — ALF's per-app decision,
+and Local Network privacy's attribution to a process's responsible app — both need
+a GUI grant that an SSH-launched process cannot obtain.
+
+So the tunnel is no longer an indirection to remove; it is the supported
+transport, because it routes around that restriction through `sshd`, which is
+Apple-signed and permitted:
+
+* **control** — `-R 9911:127.0.0.1:9911`: the worker dials `127.0.0.1` on its own
+  box and sshd forwards to the Mac's loopback, where the coordinator accepts;
+* **data** — `-L 55911:127.0.0.1:55911`: the worker runs `--listen 127.0.0.1
+  55911`, putting its data listener on the Spark's loopback where nothing off-box
+  can reach it; the coordinator derives the worker's address from the accepted
+  socket (`peer_host` is `127.0.0.1` through the tunnel — `dist_route_build` in
+  `ds4_distributed.c` pairs it with the HELLO's `listen_port`), so it dials
+  `127.0.0.1:55911` and sshd forwards that to the Spark's listener.
+
+Consequences, all favourable: **acceptance criterion 6 needs no protocol change**,
+because the snapshot data connection now has a path — verified at the socket level
+(a dial to `127.0.0.1:55911` on the Mac reached a listener bound to
+`127.0.0.1:55911` on the Spark, the Mac-side socket owned by `sshd`, not `ds4`).
+The LAN exposure problem disappears with it: the worker's listener binds loopback,
+so the Mac's pf `rdr` has nothing to forward and neither a pf rule nor a `ufw`
+change is needed. ALF entries also stop mattering, so a rebuild needs no firewall
+re-entry.
+
+| Socket | Binds | Reachable by |
+| --- | --- | --- |
+| coordinator HTTP (`--host/--port`) | per `~/bin/llm_config.json` | the owner's clients — independent of this link |
+| coordinator distributed (`--listen`) | `127.0.0.1:9911` | `sshd` only (tunnel) |
+| worker data listener (`--listen`) | `127.0.0.1:55911` on the Spark | `sshd` only (tunnel) |
+
+One exposure remains, unchanged and independent of the tunnel: the HTTP API has
+**no authentication** (the repository says so and recommends fronting it with a
+proxy), so serving clients beyond a trusted network needs a proxy or VPN.
+
+**Transport caveat, worth stating plainly:** the tunnel is a *single SSH stream*,
+so all activation traffic for a hop shares one TCP connection. That is invisible
+for control, and the measured pipeline runs (decode at ~84 t/s over the tunnel)
+were not limited by it, but if prefill throughput across the link ever becomes the
+bottleneck, this is the constraint to revisit — a throughput caveat, never a
+correctness one. It is not implicated in the 2026-09-19 wedge (§4.3): during that
+failure the link carried 0.1 KB/s and every socket to the Spark had an empty
+queue.
 
 ### 4.3 Thermal envelope is part of the deliverable, not an afterthought
 
@@ -201,6 +260,32 @@ minutes of pipeline prefill. Therefore:
   temperature for the run; a Spark figure without one is not evidence;
 * runs are bounded (frontier sweeps) with cool-downs; 250K/500K ingests are
   treated as endurance tests with the guard armed.
+
+**Observed 2026-09-19, a second contributor to the envelope.** A worker started
+while another `ds4` was already resident (~45 GiB each, over a 95 GiB mmap) left
+the Spark in a state where the *link* was healthy — `ping` 0.5 ms with 0% loss,
+TCP handshakes completing to `:22` — while `sshd` never emitted a banner on any of
+several established connections, even with a 60-second budget, and no other
+service was listening. Nothing remote could recover it; the documented recovery
+is a physical power cycle. Two candidates were eliminated rather than assumed:
+the CPU cap is only a ~14% frequency cut, and the guard already wraps every
+`nvidia-smi` call in `timeout 5`, so it cannot accumulate stuck processes. That
+leaves memory/IO pressure from two resident workers, which the precondition below
+prevents. The coordinator-side symptom is worth recognising: the route silently
+loses the worker (`distributed route incomplete: missing layer 24`) while the
+control socket still reads `ESTABLISHED` in `netstat`.
+
+**Precondition for every Spark run — do not skip:**
+
+```sh
+pgrep -ax ds4 || echo clear      # expect "clear"
+free -g | head -2                # expect the worker's slice to be free
+sudo pkill -x ds4                # only if the first line was not empty
+```
+
+Two `ds4` processes on this box is not a supported configuration, not even
+transiently: the guard's `TARGET_KILL=ds4` at `ZONE_ABORT=95 °C` is a backstop
+for the hardware, not a licence to over-subscribe memory.
 
 ---
 
@@ -225,6 +310,11 @@ Estimates assume a developer fluent in this codebase and its QA habits.
 Critical path: **1 → 2 → 5 → 6**, about **1–1.5 weeks**; the full set with QA and
 docs is **2–3 weeks**. Nothing here requires new architecture, new file formats
 or a new transport.
+
+Already done ahead of the workstreams: the snapshot half of WS 7 was verified on
+2026-09-19 for the `0:23` / `24:output` split — save and load across the tunnel,
+with the data connection observed on `127.0.0.1:55911` (implementation log §11).
+The boundary gates in that workstream remain.
 
 **Order of work matters:** land the *prefill* path first (2) so a long ingest can
 be measured behind the guard, then decode (4), then the QA matrix. Each
@@ -254,7 +344,9 @@ Layered, cheapest first; each layer must pass before the next is trusted.
    route drop; worker restart mid-ingest and mid-decode.
 5. **Capacity/long-context.** 262 144 cold ingest, then 524 288 alloc + a short
    generation; snapshot save, restore on a fresh pair, and restore with the
-   roles swapped (topology-neutral checkpoint).
+   roles swapped (topology-neutral checkpoint). Save and load on a live pair are
+   **verified** for the `0:23` / `24:output` split (log §11); the fresh-pair and
+   roles-swapped restores remain.
 6. **Thermal endurance.** Same runs with the guard armed at 88 °C band: record
    peak board per frontier, require zero thermal events and completion without
    intervention; repeat the 262K ingest twice to show it is not a one-off.
@@ -271,7 +363,7 @@ Layered, cheapest first; each layer must pass before the next is trusted.
 | Templating the tuned kernels perturbs Q2_K codegen (register pressure, shared-memory layout) | Q2_K regression | instantiate and benchmark both; keep the Q2_K path byte-run-identical where possible and gate with the existing Q2 fixtures |
 | Cross-backend numeric drift larger than tolerance (CUDA f32 mid vs Metal FP16) | fails acceptance | choose and document the intermediate; if drift is structural, adopt the repo's precedent of a tolerance + selected-token gate rather than forcing bit-identity |
 | Spark thermal trip during endurance runs | lost work, hardware risk | caps installed; guard aborts at 95 °C; bounded runners with cool-downs; peak-board recorded |
-| macOS inbound permission never granted and the tunnel drops mid-ingest | aborted 250K run | prefer the permission grant; if tunnelling, supervise with restart-on-failure and snapshot before long steps |
+| Tunnel drops mid-ingest (it is the transport, since the firewall route is closed) | aborted 250K run | `launchd` `KeepAlive` restart-on-failure; snapshot before long steps; the two-forward form is verified end to end (save and load, log §11) |
 | Time: the port expands (decode variants, IQ2_XXS, boundary bugs) | slip | ship prefill first; the fallbacks in §9 remain valid throughout |
 
 ---
@@ -281,6 +373,11 @@ Layered, cheapest first; each layer must pass before the next is trusted.
 * No new user-facing flags; the type support is a capability of the CUDA GLM
   path. `DS4_CUDA_GLM_MOE_TYPES` is diagnostic, documented with the other
   env vars.
+* **`DS4_GLM_GENERIC_MOE_Q4K` is an experiment, not part of this design.** It
+  routes a homogeneous Q4_K expert trio through the generic MoE dispatch and is
+  inert unless the variable is set. It exists to exercise Q4_K on CUDA before the
+  kernel port lands; WS 1–2 supersede it. Drop it when they land, or promote it
+  deliberately — do not leave two dispatch paths unexamined.
 * Update, in the same change set: `docs/DGX_SPARK.md` §GLM 5.3 (state that Q4 is
   the pipeline target and needs both machines), `MODELS.md` (the two-machine Q4
   row), `docs/DISTRIBUTED.md` (a Q4 pipeline example), and
@@ -306,8 +403,10 @@ Layered, cheapest first; each layer must pass before the next is trusted.
 1. Is Q4_K the target, or should the same work also cover **IQ2_XXS** (the
    released GLM 5.3 IQ2 artifacts) in the same pass? It is one more
    instantiation of the same template (WS 11) but widens the QA matrix.
-2. Grant `ds4` Local Network permission on the Mac, or standardise on the
-   supervised tunnel?
+2. ~~Grant `ds4` Local Network permission on the Mac, or standardise on the
+   supervised tunnel?~~ Answered 2026-09-19: the grant is unavailable to a
+   process launched from an SSH session, and the firewall's allow is not honoured
+   for adhoc-signed binaries, so the tunnel is standard (§4.2).
 3. Is the Spark's hard-lock RMA-worthy on this unit (field diagnostic
    PowerStress)? The caps are a workaround; a defective unit will still trip.
 4. Does the 500K target need to hold with `--mtp` off? MTP is excluded under the
