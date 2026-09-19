@@ -4751,6 +4751,29 @@ static const char *ds4_gpu_source =
 "\n"
 "\n";
 
+/* Directory holding the running executable, cached. Kernel sources are looked
+ * up relative to the process CWD, which breaks an installed build (e.g.
+ * ~/bin/ds4-server with ~/bin/metal/) when it is started from anywhere else,
+ * so the executable's own directory is searched as well. Returns @"" when the
+ * path cannot be determined. */
+static NSString *ds4_metal_executable_dir(void) {
+    static NSString *cached = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        char buf[PATH_MAX];
+        uint32_t size = (uint32_t)sizeof(buf);
+        if (_NSGetExecutablePath(buf, &size) != 0) {
+            cached = @"";
+            return;
+        }
+        char resolved[PATH_MAX];
+        const char *path = realpath(buf, resolved) ? resolved : buf;
+        NSString *str = [NSString stringWithUTF8String:path];
+        cached = str ? [str stringByDeletingLastPathComponent] : @"";
+    });
+    return cached;
+}
+
 static NSString *ds4_gpu_full_source(void) {
     NSString *base = [NSString stringWithUTF8String:ds4_gpu_source];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -4797,6 +4820,10 @@ static NSString *ds4_gpu_full_source(void) {
         }
         [paths addObject:spec[1]];
         [paths addObject:[@"./" stringByAppendingString:spec[1]]];
+        NSString *exe_dir = ds4_metal_executable_dir();
+        if (exe_dir.length) {
+            [paths addObject:[exe_dir stringByAppendingPathComponent:spec[1]]];
+        }
 
         NSString *loaded = nil;
         NSString *loaded_path = nil;
