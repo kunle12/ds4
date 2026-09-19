@@ -338,12 +338,30 @@ router is *not* bounded to 256 (it accepts up to 384 experts), and Metal's clamp
 form matches my `glm_moe_swiglu` mirror exactly (`gate = min(gate, limit)`, `up =
 clamp(up, ±limit)`) — so the clamp fix's arithmetic is right, not merely closer.
 
-**Still open**: why the pre-fix Q2_K tile8 and warp dumps were byte-identical.
-With the trace showing tile8 is taken, and the bound being type-independent, they
-should have differed. The likeliest cause is my harness — the same command form
-demonstrably failed to propagate a MoE env var to one worker — which would make
-that comparison vacuous. One run with the flag confirmed present in the worker's
-environment settles it.
+**Resolved — and it invalidates the Q2_K half of my reasoning.** The Q2_K model
+never enters the GLM routed-MoE dispatch at all. Two independent pieces of
+evidence settle it: its expert tensors are IQ2_XXS for gate/up and Q2_K for down
+(types 16 and 10, read straight from the GGUF), which is exactly the signature of
+the *other* dispatcher — `ds4_gpu_routed_moe_batch_tensor`'s `iq2_path` — not this
+one; and a worker run with `DS4_GLM_MOE_TRACE=1` *confirmed present in its own
+process* (the startup banner added in this phase printed it, which is why that
+banner exists) produced this dispatch's per-call trace **zero** times while the
+pair ran to completion.
+
+So the Q2_K tile8 and warp dumps were byte-identical because **neither path ran
+in either run**: the flag gated code that model never reaches. That is worse than
+vacuous, and it retracts the Q2_K-based reasoning wholesale — "the tile8 machinery
+is sound for Q2_K" (Phase M, row M6) never had a basis, and the 0.196 "Q2_K
+calibration" is a valid whole-pipeline observation but says nothing about these
+kernels.
+
+What survives is everything measured on the Q4_K model, where the trace confirms
+the dispatch runs — tile8 for prefill (21 calls at 1091 tokens), warp for decode
+(63 calls at 1 token). The parity checks, the clamp improvement and the three
+regressions all rest on that model. Which is also the point of the port: the GLM
+dispatch appears to be exercised only by a model whose experts are Q4_K, and its
+Q2_K paths are effectively dead for the files on hand — including the two that
+still refuse Q4_K.
 
 ---
 

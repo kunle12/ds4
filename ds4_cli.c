@@ -2259,6 +2259,26 @@ static cli_config parse_options(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
+
+    /* Name the GLM MoE switches set in this process. They are read per MoE call,
+     * so a run that depends on one is only meaningful if this process actually
+     * received it - and a comparison between two runs proves nothing unless they
+     * differ in the switch they claim to. Silent when none are set. */
+    {
+        static const char *const moe_env[] = {
+            "DS4_CUDA_GLM_MOE_TYPES", "DS4_GLM_MOE_TRACE",
+            "DS4_GLM_MOE_NO_EXPERT_TILE8", "DS4_GLM_MOE_NO_DOWN_TILE8_EXACT",
+            "DS4_GLM_MOE_EXPERT_MAJOR", "DS4_GLM_MOE_SCALAR",
+            "DS4_GLM_MOE_NO_LOCAL_BATCH_IO", "DS4_GLM_MOE_SCRATCH_TIER0",
+            "DS4_GLM_MTP_NO_MOE_TOK2",
+        };
+        for (size_t i = 0; i < sizeof moe_env / sizeof moe_env[0]; i++) {
+            const char *v = getenv(moe_env[i]);
+            if (v && v[0] != '\0') {
+                fprintf(stderr, "ds4: env %s=%s\n", moe_env[i], v);
+            }
+        }
+    }
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prefix.count != 0) {
             fprintf(stderr, "ds4: --dump-tokens does not support --prefix-file\n");

@@ -32192,6 +32192,32 @@ static int glm_moe_unsupported_path(uint32_t weight_type, const char *path) {
         }                                                                    \
     } while (0)
 
+/* GLM routed-MoE environment switches. They are read per call, so a test can
+ * set one around a single dispatch, and DS4_GLM_MOE_TRACE prints the effective
+ * choice per call - which is the way to confirm a switch actually reached the
+ * process before trusting a run that depends on it.
+ *
+ *   DS4_CUDA_GLM_MOE_TYPES=q2k|q4k,...  which weight types this build accepts
+ *                                       (default q2k,q4k)
+ *   DS4_GLM_MOE_TRACE=1                 print type/tokens/experts/used/path per
+ *                                       call on stderr
+ *   DS4_GLM_MOE_NO_EXPERT_TILE8=1       force the small-batch warp kernels
+ *                                       instead of the tile8 prefill path
+ *   DS4_GLM_MOE_NO_DOWN_TILE8_EXACT=1   keep tile8 gate/up but use the warp
+ *                                       down pass rather than the exact terms
+ *   DS4_GLM_MOE_EXPERT_MAJOR=1          expert-major path (only after tile8 is
+ *                                       disabled, which otherwise wins)
+ *   DS4_GLM_MOE_SCALAR=1                scalar reference kernels (Q2_K only)
+ *   DS4_GLM_MOE_NO_LOCAL_BATCH_IO=1     do not stage mid/out on the local device
+ *   DS4_GLM_MOE_SCRATCH_TIER0=1         allocate scratch on device 0
+ *   DS4_GLM_MTP_NO_MOE_TOK2=1           disable the two-token MTP gate/up reuse
+ *                                       (Q2_K only)
+ *
+ * force_resident is accepted to match ds4_gpu.h and the Metal implementation,
+ * where it means "do not stream experts". This backend ignores it: weight
+ * resolution decides streaming on its own. That was already true before the
+ * parameter arrived (it never did, see the log's Phase P), so it is not a
+ * behaviour change - but do not read it as honoured here. */
 extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
