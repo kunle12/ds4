@@ -338,10 +338,13 @@ Default target changed to `multi-user.target` (headless).
    **yes** — decode stays ~11–14 t/s and MTP remains excluded under the split;
    enabling it there is design work (taking the head and its routing across a
    slice boundary), not a flag.
-5. **The `DS4_GLM_GENERIC_MOE_Q4K` experiment (§2 #6):** drop it now that the
-   result is measured, or keep it until WS 2 lands as a comparison point? It is
-   inert unless the variable is set, so keeping it costs nothing at runtime, but
-   it leaves a second dispatch path in the tree that the plan does not use.
+5. ~~**The `DS4_GLM_GENERIC_MOE_Q4K` experiment (§2 #6):** drop it now that the
+   result is measured, or keep it until WS 2 lands as a comparison point?~~
+   Decided 2026-09-19: **keep until WS 2 lands**, then remove or promote
+   deliberately. It is inert unless the variable is set, it is documented as an
+   experiment rather than a path, and it is the only artefact of the Q4_K-on-CUDA
+   comparison — so the cost of keeping it briefly is lower than the cost of
+   destroying the comparison before the kernels that supersede it exist.
 
 ---
 
