@@ -27,7 +27,7 @@ thermal envelope.
 | GLM 5.3 layer-slice correctness (wire width) | **done, validated bit-exact** |
 | Cross-machine Q2 pipeline | **working and measured** |
 | Distributed snapshot round-trip across the split | **save verified 2026-09-19** (165 MiB checkpoint, worker's shard fetched over the data forward); load path exercised and reported a hit — equivalence still needs the fresh-pair restore (§6.1 #8) |
-| Q4_K on the pair | **in progress** — WS 1 landed and verified (type predicate + escape hatch, log Phase L); the Q4_K kernels are WS 2–4, so a Q4_K run currently fails loudly by design |
+| Q4_K on the pair | **working** — WS 2 landed (log Phase M): correct output (mean \|Δ\| 0.085 vs the Metal reference on the same prompt), 56.5 t/s prefill / 11.4 t/s generation against 40.8 / 5.7 for Mac-only streaming. The tile8 prefill kernels are held back for Q4_K pending the defect in Phase M, which costs 1.8× prefill |
 | Q4_K on the Mac alone | **working and measured** (SSD streaming) |
 | Spark thermal protection | **installed, enabled, verified live**; re-armed by itself after the 2026-09-19 power cycle |
 | Access path (macOS ALF workaround) | **installed as a boot-persistent launchd daemon, verified**; carries both forwards (`-R` control, `-L` data for snapshots) |
@@ -203,9 +203,45 @@ owner asked to begin.
 | L4 | Verified on the pair, all three paths | **A** Q4_K default → `glm routed moe: q4_K expert kernels are not implemented in this build`, coordinator `prompt processing failed … at pos 0` — no freeze, no garbage; **B** Q2_K default → `route ready` and a correct generation, unchanged; **C** `DS4_CUDA_GLM_MOE_TYPES=q2k` → `unsupported types q4_K/q4_K/q4_K (12/12/12)`, so the hatch narrows the set and the old numeric signature survives in the logs |
 | L5 | Incremental CUDA build + install on the Spark | 96 s, no warnings; the Mac is unaffected because the file is CUDA-only (Metal's Q4_K MoE already works — which is why the coordinator's half loaded for tests A and C) |
 
-**Next: WS 2** — Q4_K prefill instantiations (tile8 gate/up, down terms + reduce),
-the first milestone that makes a 262K Q4 ingest measurable and the stop/go gate for
-the rest of the port.
+### Phase M — Workstream 2: Q4_K routed-MoE kernels
+
+First working Q4_K pair path, with a measured prefill and one open defect.
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| M1 | Surveyed what already existed | The Q4_K×q8_K dots were already in `ds4_cuda.cu` (`dev_dot_q4_K_q8_K_block`, `_vec`, `_block8`) and are exercised by the other routed-MoE dispatcher's `q4k_path`; what was Q2_K-only was the GLM dispatch and its kernels |
+| M2 | Templated the four GLM kernels on the block type | tile8 gate/up and down-terms (prefill), warp gate/up and down (decode/small-batch). Block stride and dot now come from `sizeof(block_t)` and two overloads (`glm_moe_dot`, `glm_moe_dot8`), so no `84u` remains in them. The reduce kernel was already type-agnostic, and `ds4_gpu_glm_routed_moe_one_tensor` forwards to the batch entry, so no caller was left half-migrated |
+| M3 | Kept the unported paths refusing by name | expert-major, scalar and MTP tok2 return `glm_moe_unsupported_path(...)` for a Q4_K trio instead of reaching Q2_K arithmetic |
+| M4 | Ran a Q4_K pair end to end | first working Q4_K pair run: coherent output, `prefill 103.45 t/s, generation 11.36 t/s` |
+| M5 | Compared logits against the Metal reference, with a Q2_K calibration | `--dump-logits` on `{pair, Mac-alone} × {Q2_K, Q4_K}` after the same 1091-token prefill: Q2_K pair vs Metal mean \|Δ\| 0.196 / max 1.48 / top-16 15-of-16; Q4_K pair vs Metal 1.100 / 9.09 / 9-of-16. Argmax and top-3 order agreed in both, so the divergence was in degree |
+| M6 | Localised it to the tile8 path | the same CUDA path through the warp kernels instead matched Metal at mean \|Δ\| **0.085** / max 0.50 / top-16 15-of-16. For Q2_K the two paths are **bit-identical** (max 0.0000), so the tile8 machinery is sound there and the defect is specific to its Q4_K instantiation. Bisecting with `DS4_GLM_MOE_NO_DOWN_TILE8_EXACT` attributed it to the tile8 **gate/up** kernel (tile8-gate/up + warp-down still deviated at 1.148) |
+| M7 | Ruled out the arithmetic, nondeterminism and staging | a unit test on the Spark over random blocks, built from the real helpers extracted verbatim (`/tmp/q4dots_test.cu`; sizes confirmed 144 / 84 / 292), shows `dev_dot_q4_K_q8_K_block8` is **bit-identical** to n single-block calls for n=1..8 — and substituting the single-block expression inside the tile8 kernel left the logits dump **byte-identical**. A repeat run is byte-identical, and disabling the local batch IO staging changes nothing |
+| M8 | Landed the correction | Q4_K prefill takes the warp path (`use_expert_tile8` now requires Q2_K). Verified: byte-identical to the warp run, mean \|Δ\| 0.108 vs Metal, top-16 15-of-16, argmax agreeing |
+
+**Measured, same 1091-token prompt, greedy, ctx 8192:**
+
+| Configuration | prefill | generation | vs Metal (mean \|Δ\| over vocab) |
+| --- | --- | --- | --- |
+| Mac alone, Q4_K + SSD streaming (**the baseline to beat**) | 40.80 t/s | 5.73 t/s | reference |
+| Pair, Q4_K, tile8 kernels | 103.45 t/s | 11.36 t/s | 1.100 — **wrong, not usable** |
+| Pair, Q4_K, warp kernels (**landed**) | 56.48 t/s | 11.37 t/s | 0.085 — correct |
+
+So the corrected Q4_K pair path is **1.38× the streaming prefill and 1.98× its
+generation**, and the plan's ≥2× prefill gate is missed *only* because the
+tile8 Q4_K kernel is unusable as it stands. Restoring it is worth 1.8× more
+prefill, which is where the remaining work is.
+
+**Open defect.** The tile8 Q4_K instantiation produces different `mid` values
+than the warp path for the same inputs, while the identical code is
+bit-identical for Q2_K. Excluded so far: the block dots (unit test and
+substitution), the block stride (`sizeof(block_t)`, which the warp path also
+uses while matching the reference), the tile mapping (type-independent, and
+bit-identical for Q2_K at the same prompt), aliasing, staging, and
+nondeterminism. The remaining candidates are the weight and activation row
+addresses inside the tile8 gate/up kernel, so the next probe is to dump `mid`
+from both kernels in a single dispatch and diff it per pair and row. Until
+then, Q4_K deliberately does not reach tile8, and Q2_K is untouched: the guard
+is a conjunction that evaluates exactly as before when the weights are Q2_K.
 
 ---
 

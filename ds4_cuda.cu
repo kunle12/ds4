@@ -31539,10 +31539,62 @@ __global__ static void glm_routed_moe_batch_q2K_down_kernel(
     out[(uint64_t)tok * out_dim + r] = acc;
 }
 
-/* Warp-per-row routed MoE (q2_K x q8_K). Each block stages the token's
+/* Block-type overloads for the GLM routed-MoE kernels that are instantiated for
+ * more than one K-quant. The Q2_K and Q4_K block dots take the same arguments,
+ * so the kernels below are written once as a template over the block type; the
+ * overload picked here supplies the arithmetic and, through sizeof, the block
+ * stride. Neither may hardcode 84u again: that constant is what tied this
+ * dispatch to Q2_K. */
+__device__ __forceinline__ static float glm_moe_dot(
+        const cuda_block_q2_K *w, const cuda_block_q8_K *y) {
+    return dev_dot_q2_K_q8_K_block(w, y);
+}
+
+__device__ __forceinline__ static float glm_moe_dot(
+        const cuda_block_q4_K *w, const cuda_block_q8_K *y) {
+    return dev_dot_q4_K_q8_K_block(w, y);
+}
+
+__device__ __forceinline__ static void glm_moe_dot8(
+        const cuda_block_q2_K *w,
+        const cuda_block_q8_K *y0, const cuda_block_q8_K *y1,
+        const cuda_block_q8_K *y2, const cuda_block_q8_K *y3,
+        const cuda_block_q8_K *y4, const cuda_block_q8_K *y5,
+        const cuda_block_q8_K *y6, const cuda_block_q8_K *y7,
+        uint32_t n, float acc[8]) {
+    dev_dot_q2_K_q8_K_block8(w, y0, y1, y2, y3, y4, y5, y6, y7, n, acc);
+}
+
+__device__ __forceinline__ static void glm_moe_dot8(
+        const cuda_block_q4_K *w,
+        const cuda_block_q8_K *y0, const cuda_block_q8_K *y1,
+        const cuda_block_q8_K *y2, const cuda_block_q8_K *y3,
+        const cuda_block_q8_K *y4, const cuda_block_q8_K *y5,
+        const cuda_block_q8_K *y6, const cuda_block_q8_K *y7,
+        uint32_t n, float acc[8]) {
+    /* Deliberately the same call the warp kernels make, one token at a time.
+     * dev_dot_q4_K_q8_K_block8 is arithmetically identical to this loop (a
+     * unit test over random blocks is bit-identical for every n), yet on the
+     * pair the tile8 path built on it produced logits that deviate from the
+     * Metal reference while this arithmetic matches it (mean |delta| 0.085
+     * over the vocabulary, against 1.10 for the block8 path). Until that
+     * discrepancy is explained, the tile8 kernels use the expression that is
+     * known to match the reference. */
+    if (n > 0u) acc[0] += dev_dot_q4_K_q8_K_block(w, y0);
+    if (n > 1u) acc[1] += dev_dot_q4_K_q8_K_block(w, y1);
+    if (n > 2u) acc[2] += dev_dot_q4_K_q8_K_block(w, y2);
+    if (n > 3u) acc[3] += dev_dot_q4_K_q8_K_block(w, y3);
+    if (n > 4u) acc[4] += dev_dot_q4_K_q8_K_block(w, y4);
+    if (n > 5u) acc[5] += dev_dot_q4_K_q8_K_block(w, y5);
+    if (n > 6u) acc[6] += dev_dot_q4_K_q8_K_block(w, y6);
+    if (n > 7u) acc[7] += dev_dot_q4_K_q8_K_block(w, y7);
+}
+
+/* Warp-per-row routed MoE (q2_K or q4_K x q8_K). Each block stages the token's
  * q8_K activation row in shared memory; one warp produces one mid row
  * (gate dot + up dot + silu*mul fused). Grid:
  * (expert_mid_dim/warps, n_expert, n_tokens). */
+template <typename block_t>
 __global__ static void glm_routed_moe_gateup_warp_kernel(
         float *mid,
         const char *gate_base,
@@ -31586,10 +31638,10 @@ __global__ static void glm_routed_moe_gateup_warp_kernel(
                      (uint64_t)r * up_row_bytes;
     float g = 0.0f, u = 0.0f;
     for (uint32_t b = lane; b < xq_blocks; b += 32u) {
-        g += dev_dot_q2_K_q8_K_block(
-                (const cuda_block_q2_K *)(gr + (uint64_t)b * 84u), xrow + b);
-        u += dev_dot_q2_K_q8_K_block(
-                (const cuda_block_q2_K *)(ur + (uint64_t)b * 84u), xrow + b);
+        g += glm_moe_dot(
+                (const block_t *)(gr + (uint64_t)b * sizeof(block_t)), xrow + b);
+        u += glm_moe_dot(
+                (const block_t *)(ur + (uint64_t)b * sizeof(block_t)), xrow + b);
     }
     for (int off = 16; off > 0; off >>= 1) {
         g += __shfl_down_sync(0xffffffffu, g, off);
@@ -31694,9 +31746,10 @@ __global__ static void glm_routed_moe_gateup_tok2_reuse_kernel(
     }
 }
 
-/* Warp-per-output-row down projection: stages all n_expert quantized mid
- * rows for the token in shared memory, each warp accumulates one out row
- * across every selected expert. Grid: (out_dim/warps, n_tokens). */
+/* Warp-per-output-row down projection (q2_K or q4_K x q8_K): stages all n_expert
+ * quantized mid rows for the token in shared memory, each warp accumulates one
+ * out row across every selected expert. Grid: (out_dim/warps, n_tokens). */
+template <typename block_t>
 __global__ static void glm_routed_moe_down_warp_kernel(
         float *out,
         const char *down_base,
@@ -31738,9 +31791,9 @@ __global__ static void glm_routed_moe_down_warp_kernel(
         const int32_t expert = selected[(uint64_t)tok * n_expert + slot];
         if (expert < 0) continue;
         const float w = weights[(uint64_t)tok * n_expert + slot];
-        const cuda_block_q2_K *dr = (const cuda_block_q2_K *)(down_base +
+        const block_t *dr = (const block_t *)(down_base +
             (uint64_t)expert * down_expert_bytes + (uint64_t)r * down_row_bytes);
-        acc += w * dev_dot_q2_K_q8_K_block(dr + b, msh + slot * midq_blocks + b);
+        acc += w * glm_moe_dot(dr + b, msh + slot * midq_blocks + b);
     }
     for (int off = 16; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -31789,9 +31842,10 @@ __global__ static void glm_moe_build_expert_tiles8_kernel(
     *tile_total = total;
 }
 
-/* Expert-tiled Q2_K gate/up for GLM prefill. One warp keeps the same
- * block-to-lane assignment and reduction tree as the token-major W32
+/* Expert-tiled gate/up (q2_K or q4_K x q8_K) for GLM prefill. One warp keeps the
+ * same block-to-lane assignment and reduction tree as the token-major W32
  * kernel, but evaluates eight pairs against each loaded expert row. */
+template <typename block_t>
 __global__ static void glm_routed_moe_gateup_expert_tile8_kernel(
         float *mid,
         const char *gate_base,
@@ -31852,11 +31906,11 @@ __global__ static void glm_routed_moe_gateup_expert_tile8_kernel(
         const cuda_block_q8_K *x5 = np > 5u ? xq + (uint64_t)tok[5] * xq_blocks + b : NULL;
         const cuda_block_q8_K *x6 = np > 6u ? xq + (uint64_t)tok[6] * xq_blocks + b : NULL;
         const cuda_block_q8_K *x7 = np > 7u ? xq + (uint64_t)tok[7] * xq_blocks + b : NULL;
-        dev_dot_q2_K_q8_K_block8(
-                (const cuda_block_q2_K *)(gr + (uint64_t)b * 84u),
+        glm_moe_dot8(
+                (const block_t *)(gr + (uint64_t)b * sizeof(block_t)),
                 x0, x1, x2, x3, x4, x5, x6, x7, np, g);
-        dev_dot_q2_K_q8_K_block8(
-                (const cuda_block_q2_K *)(ur + (uint64_t)b * 84u),
+        glm_moe_dot8(
+                (const block_t *)(ur + (uint64_t)b * sizeof(block_t)),
                 x0, x1, x2, x3, x4, x5, x6, x7, np, u);
     }
     for (uint32_t p = 0; p < np; p++) {
@@ -31962,10 +32016,12 @@ __global__ static void glm_routed_moe_down_expert_kernel(
     }
 }
 
-/* Expert-tiled down projection with an exact token-major reduction. The
- * first kernel reuses each Q2_K row across eight routed pairs, but materializes
- * each block dot. The second kernel applies the router weight and consumes the
- * dots with the same lane assignment and warp tree as the native kernel. */
+/* Expert-tiled down projection (q2_K or q4_K x q8_K) with an exact token-major
+ * reduction. The first kernel reuses each expert row across eight routed pairs,
+ * but materializes each block dot. The second kernel applies the router weight
+ * and consumes the dots with the same lane assignment and warp tree as the
+ * native kernel. */
+template <typename block_t>
 __global__ static void glm_routed_moe_down_expert_tile8_terms_kernel(
         float *terms,
         const char *down_base,
@@ -32011,12 +32067,12 @@ __global__ static void glm_routed_moe_down_expert_tile8_terms_kernel(
     __syncthreads();
     if (row >= out_dim || lane >= midq_blocks) return;
 
-    const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_base +
+    const block_t *wr = (const block_t *)(down_base +
         (uint64_t)expert * down_expert_bytes +
         (uint64_t)row * down_row_bytes);
     for (uint32_t p = 0; p < np; p++) {
         const uint32_t pr = pair[p];
-        const float dot = dev_dot_q2_K_q8_K_block(wr + lane, &mq[p][lane]);
+        const float dot = glm_moe_dot(wr + lane, &mq[p][lane]);
         terms[((uint64_t)(pr - pair_base) * out_dim + row) *
               midq_blocks + lane] =
             dot;
@@ -32095,6 +32151,29 @@ static int glm_moe_types_allowed(uint32_t gate_type, uint32_t up_type,
     }
 }
 
+/* Refuse a weight type at a path that has not been instantiated for it. The
+ * caller has already established that the type is a known one, so the message
+ * names the path and the type rather than a bare type list. */
+static int glm_moe_unsupported_path(uint32_t weight_type, const char *path) {
+    fprintf(stderr,
+            "ds4: glm routed moe: %s path is not implemented for %s weights in this build\n",
+            path, glm_moe_type_name(weight_type));
+    return 0;
+}
+
+/* Launch one of the GLM routed-MoE kernels that are instantiated per weight
+ * type. Their only template argument is the block type, so this is the whole
+ * type dispatch for the ported paths; the shared-memory size is explicit so
+ * every call site reads the same. Relies on the caller's weight_is_q2_K. */
+#define GLM_MOE_LAUNCH_TYPED(KERNEL, GRID, BLOCKDIM, SHMEM, ...)             \
+    do {                                                                     \
+        if (weight_is_q2_K) {                                                \
+            KERNEL<cuda_block_q2_K><<<GRID, BLOCKDIM, SHMEM>>>(__VA_ARGS__); \
+        } else {                                                             \
+            KERNEL<cuda_block_q4_K><<<GRID, BLOCKDIM, SHMEM>>>(__VA_ARGS__); \
+        }                                                                    \
+    } while (0)
+
 extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
@@ -32136,16 +32215,11 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                 glm_moe_type_name(down_type), gate_type, up_type, down_type);
         return 0;
     }
-    if (gate_type != 10u) {
-        /* Known and allowed, but its kernel instantiations are not in this
-         * build yet: fail here rather than let a Q4_K expert trio reach Q2_K
-         * arithmetic and produce plausible-looking garbage. This guard is
-         * removed as WS 2-4 land. */
-        fprintf(stderr,
-                "ds4: glm routed moe: %s expert kernels are not implemented in this build\n",
-                glm_moe_type_name(gate_type));
-        return 0;
-    }
+    /* Which weight type the ported kernels below are instantiated for. The
+     * paths that are still Q2_K-only (expert-major, scalar, MTP tok2) refuse a
+     * Q4_K trio by name at their own branch rather than letting it reach Q2_K
+     * arithmetic and produce plausible-looking garbage. */
+    const bool weight_is_q2_K = gate_type == 10u;
     if (mid_token_stride != n_expert * expert_mid_dim) {
         fprintf(stderr,
             "ds4: glm routed moe: mid stride %u != %u (packed rows expected)\n",
@@ -32222,8 +32296,17 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
 
     static ds4_gpu_tensor *map_scratch[DS4_MAX_GPUS] = {0};
     static ds4_gpu_tensor *down_terms_scratch[DS4_MAX_GPUS] = {0};
+    /* Q4_K prefill runs on the warp kernels. The GLM tile8 kernels are
+     * bit-identical to the warp kernels for Q2_K but deviate for Q4_K: on the
+     * pair, tile8 Q4_K next-token logits differ from the Metal reference by
+     * mean |delta| 1.10 over the vocabulary (max 9.09) against 0.085 (max
+     * 0.50) for the warp path, and the deviation reproduces byte-for-byte.
+     * The dots are ruled out: a unit test over random blocks shows the block8
+     * and single-block forms are bit-identical, and substituting one for the
+     * other leaves the dump unchanged. See the log's Phase M. */
     const bool use_expert_tile8 =
-        n_tokens >= 128u && !getenv("DS4_GLM_MOE_NO_EXPERT_TILE8");
+        n_tokens >= 128u && weight_is_q2_K &&
+        !getenv("DS4_GLM_MOE_NO_EXPERT_TILE8");
     const bool use_expert_major =
         n_tokens >= 16u && getenv("DS4_GLM_MOE_EXPERT_MAJOR");
     if (use_expert_tile8 || use_expert_major) {
@@ -32267,7 +32350,9 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                         counts, 256u);
                 dim3 ge1((expert_mid_dim + 7u) / 8u,
                           tile_capacity, 1);
-                glm_routed_moe_gateup_expert_tile8_kernel<<<ge1, 256>>>(
+                GLM_MOE_LAUNCH_TYPED(
+                        glm_routed_moe_gateup_expert_tile8_kernel,
+                        ge1, 256, 0,
                         mid_work, gw, uw,
                         (const cuda_block_q8_K *)xq_scratch[dev]->ptr,
                         counts, lists,
@@ -32322,8 +32407,9 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                             }
                             dim3 gd1((out_dim + 31u) / 32u,
                                      chunk_tile_capacity, 1);
-                            glm_routed_moe_down_expert_tile8_terms_kernel<<<
-                                    gd1, 256>>>(
+                            GLM_MOE_LAUNCH_TYPED(
+                                    glm_routed_moe_down_expert_tile8_terms_kernel,
+                                    gd1, 256, 0,
                                     (float *)down_terms_scratch[dev]->ptr,
                                     dw,
                                     (const cuda_block_q8_K *)midq_scratch[dev]->ptr,
@@ -32353,8 +32439,9 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                           n_tokens, 1);
                 const uint32_t sh2 = n_expert * midq_blocks *
                                      (uint32_t)sizeof(cuda_block_q8_K);
-                glm_routed_moe_down_warp_kernel<<<
-                        ge2, warps * 32u, sh2>>>(
+                GLM_MOE_LAUNCH_TYPED(
+                        glm_routed_moe_down_warp_kernel,
+                        ge2, warps * 32u, sh2,
                         out_work, dw,
                         (const cuda_block_q8_K *)midq_scratch[dev]->ptr,
                         (const int32_t *)selected->ptr,
@@ -32364,6 +32451,9 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                 return glm_routed_moe_finish_batch(
                         out, out_work, out_work_bytes,
                         "glm routed moe expert tile8");
+            }
+            if (!weight_is_q2_K) {
+                return glm_moe_unsupported_path(gate_type, "expert-major");
             }
             dim3 ge1((expert_mid_dim + 7u) / 8u, 256u, 1);
             glm_routed_moe_gateup_expert_kernel<<<ge1, 256>>>(
@@ -32393,6 +32483,9 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
     if (n_tokens == 2u &&
         g_glm_mtp_verify_mode &&
         getenv("DS4_GLM_MTP_NO_MOE_TOK2") == NULL) {
+        if (!weight_is_q2_K) {
+            return glm_moe_unsupported_path(gate_type, "MTP tok2");
+        }
         const uint32_t warps = 8u;
         dim3 g1((expert_mid_dim + warps - 1u) / warps,
                 2u * n_expert, 1u);
@@ -32407,6 +32500,9 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                 up_expert_bytes, up_row_bytes,
                 xq_blocks, expert_mid_dim, n_expert);
     } else if (getenv("DS4_GLM_MOE_SCALAR")) {
+        if (!weight_is_q2_K) {
+            return glm_moe_unsupported_path(gate_type, "scalar");
+        }
         dim3 g1(n_tokens, n_expert, 1);
         glm_routed_moe_batch_q2K_gateup_kernel<<<g1, 128>>>(
                 mid_work, gw, uw,
@@ -32418,7 +32514,9 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         const uint32_t warps = 8u;
         dim3 g1((expert_mid_dim + warps - 1u) / warps, n_expert, n_tokens);
         const uint32_t sh1 = xq_blocks * (uint32_t)sizeof(cuda_block_q8_K);
-        glm_routed_moe_gateup_warp_kernel<<<g1, warps * 32u, sh1>>>(
+        GLM_MOE_LAUNCH_TYPED(
+                glm_routed_moe_gateup_warp_kernel,
+                g1, warps * 32u, sh1,
                 mid_work, gw, uw,
                 (const cuda_block_q8_K *)xq_scratch[dev]->ptr,
                 (const int32_t *)selected->ptr,
@@ -32434,6 +32532,9 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
     }
 
     if (getenv("DS4_GLM_MOE_SCALAR")) {
+        if (!weight_is_q2_K) {
+            return glm_moe_unsupported_path(gate_type, "scalar");
+        }
         dim3 g2((out_dim + 127u) / 128u, n_tokens, 1);
         glm_routed_moe_batch_q2K_down_kernel<<<g2, 128>>>(
                 out_work, dw,
@@ -32447,7 +32548,9 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         dim3 g2((out_dim + warps - 1u) / warps, n_tokens, 1);
         const uint32_t sh2 = n_expert * midq_blocks *
                              (uint32_t)sizeof(cuda_block_q8_K);
-        glm_routed_moe_down_warp_kernel<<<g2, warps * 32u, sh2>>>(
+        GLM_MOE_LAUNCH_TYPED(
+                glm_routed_moe_down_warp_kernel,
+                g2, warps * 32u, sh2,
                 out_work, dw,
                 (const cuda_block_q8_K *)midq_scratch[dev]->ptr,
                 (const int32_t *)selected->ptr,
@@ -32459,6 +32562,8 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
             out, out_work, out_work_bytes,
             "glm routed moe batch launch");
 }
+
+#undef GLM_MOE_LAUNCH_TYPED
 
 extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
