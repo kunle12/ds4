@@ -71776,7 +71776,14 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
 
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
     (void)e;
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) return DS4_N_EMBD;
+    /* GLM 5.2 is a single hidden stream. GLM 5.3 carries the mHC block, and
+     * its tape reads and writes all DS4_N_HC streams across a layer-slice
+     * boundary (the `g->glm53 ? DS4_N_HC : 1u` transfers), so the wire and
+     * buffer width must match that block rather than the collapsed vector. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        return ds4_model_is_glm53() ? (uint64_t)DS4_N_HC * DS4_N_EMBD
+                                    : (uint64_t)DS4_N_EMBD;
+    }
     return (uint64_t)DS4_N_HC * DS4_N_EMBD;
 }
 
@@ -73512,7 +73519,12 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #else
     if (ds4_session_is_glm(s)) {
         ds4_glm_gpu_graph *gg = &s->glm_graph;
-        bool ok = ds4_gpu_tensor_write(gg->cur,
+        /* GLM 5.3's payload is the N_HC-stream mHC block and
+         * glm_graph_encode_output_head collapses it; GLM 5.2 is the plain
+         * single-stream layout. */
+        ds4_gpu_tensor *head_hidden = ds4_model_is_glm53() ? gg->hc_cur
+                                                           : gg->cur;
+        bool ok = ds4_gpu_tensor_write(head_hidden,
                                        0,
                                        last_hc,
                                        hidden_dim * sizeof(float)) != 0;
@@ -74431,7 +74443,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             return 1;
         }
 
-        const uint64_t hidden_dim = DS4_N_EMBD;
+        const uint64_t hidden_dim = ds4_model_is_glm53()
+            ? (uint64_t)DS4_N_HC * DS4_N_EMBD
+            : (uint64_t)DS4_N_EMBD;
 #ifdef DS4_ROCM_BUILD
         const bool rocm_layer_slice_token_decode =
             glm_graph_env_truthy(
