@@ -27,7 +27,7 @@ thermal envelope.
 | GLM 5.3 layer-slice correctness (wire width) | **done, validated bit-exact** |
 | Cross-machine Q2 pipeline | **working and measured** |
 | Distributed snapshot round-trip across the split | **save verified 2026-09-19** (165 MiB checkpoint, worker's shard fetched over the data forward); load path exercised and reported a hit — equivalence still needs the fresh-pair restore (§6.1 #8) |
-| Q4_K on the pair | **blocked** — CUDA GLM routed MoE is Q2_K-only; port specified in the plan |
+| Q4_K on the pair | **in progress** — WS 1 landed and verified (type predicate + escape hatch, log Phase L); the Q4_K kernels are WS 2–4, so a Q4_K run currently fails loudly by design |
 | Q4_K on the Mac alone | **working and measured** (SSD streaming) |
 | Spark thermal protection | **installed, enabled, verified live**; re-armed by itself after the 2026-09-19 power cycle |
 | Access path (macOS ALF workaround) | **installed as a boot-persistent launchd daemon, verified**; carries both forwards (`-R` control, `-L` data for snapshots) |
@@ -189,6 +189,23 @@ backed up on the Mac and documented in §7.
 | K1 | Rebuilt all five binaries on both hosts from byte-identical sources and installed them | Mac `make` 17:46 (`~/bin` + 26 Metal kernels), Spark `make -j20 cuda-spark` (`sm_121`) 17:49 → `~/bin` 17:50; both builds reported zero errors and zero warnings; Mac smoke test from `/tmp`: `--inspect` binds `glm5-next`, all five answer `--help` |
 | K2 | Stopped the stale pair, then re-verified on the rebuilt binaries | worker `data_port=55911` + `ctx=4096`, route ready; cold save `size=164.89 MiB save=18.1 ms` with six data-socket observations on `127.0.0.1:55911`, then `cache hit … load=126.8 ms` and `cached_tokens: 819` |
 | K3 | Committed as three focused commits and pushed to the fork | `6e1f447` KDA sizing fix, `5881ac0` env-gated experiment, `1b82376` docs; `origin/customisation = 1b82376`, 9 commits ahead of upstream `8db1d1d`; the working tree's `ds4.c` md5 equals the compiled one, so the binaries match the commits |
+
+### Phase L — Workstream 1: GLM routed-MoE type predicate
+
+First implementation step of the plan (§4.1, WS 1), started 2026-09-19 after the
+owner asked to begin.
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| L1 | Read the CUDA entry and the dispatch beneath it | `ds4_gpu_glm_routed_moe_batch_tensor` gated on `gate/up/down_type == 10`; activations are already quantized to Q8_K on every path, and the streaming lookahead is expert-count based (`256 * expert_bytes`), so both are type-independent exactly as §4.1 predicted |
+| L2 | Added `glm_moe_types_allowed` + `glm_moe_type_name` + the `DS4_CUDA_GLM_MOE_TYPES` hatch (default `q2k,q4k`) | `ds4_cuda.cu`. `ds4.c`'s `DS4_TENSOR_*` enum is file-local, so this uses literals with comments, matching the file's existing `8u /* DS4_TENSOR_Q8_0 */` convention |
+| L3 | Kept a loud interim guard for a known-but-unimplemented type | a Q4_K trio fails with its own message rather than reaching Q2_K arithmetic and producing plausible-looking garbage |
+| L4 | Verified on the pair, all three paths | **A** Q4_K default → `glm routed moe: q4_K expert kernels are not implemented in this build`, coordinator `prompt processing failed … at pos 0` — no freeze, no garbage; **B** Q2_K default → `route ready` and a correct generation, unchanged; **C** `DS4_CUDA_GLM_MOE_TYPES=q2k` → `unsupported types q4_K/q4_K/q4_K (12/12/12)`, so the hatch narrows the set and the old numeric signature survives in the logs |
+| L5 | Incremental CUDA build + install on the Spark | 96 s, no warnings; the Mac is unaffected because the file is CUDA-only (Metal's Q4_K MoE already works — which is why the coordinator's half loaded for tests A and C) |
+
+**Next: WS 2** — Q4_K prefill instantiations (tile8 gate/up, down terms + reduce),
+the first milestone that makes a 262K Q4 ingest measurable and the stop/go gate for
+the rest of the port.
 
 ---
 

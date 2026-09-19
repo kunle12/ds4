@@ -32066,6 +32066,35 @@ static int glm_routed_moe_finish_batch(
                    "glm routed moe local output copy");
 }
 
+/* GLM routed-MoE weight types as seen from this translation unit (ds4.c's
+ * DS4_TENSOR_* enum is file-local): 10 = Q2_K is the shipped recipe, 12 = Q4_K
+ * is the split target whose kernel instantiations are added incrementally.
+ * DS4_CUDA_GLM_MOE_TYPES narrows the accepted set, e.g. "q2k" restores the
+ * historical single-type behaviour. */
+#define DS4_CUDA_GLM_MOE_TYPES_DEFAULT "q2k,q4k"
+
+static const char *glm_moe_type_name(uint32_t type) {
+    switch (type) {
+    case 10u: return "q2_K";
+    case 12u: return "q4_K";
+    default:  return "unknown";
+    }
+}
+
+static int glm_moe_types_allowed(uint32_t gate_type, uint32_t up_type,
+                                 uint32_t down_type) {
+    /* One type for the whole trio: the expert layouts are per-tensor, and a
+     * mixed trio is a recipe this dispatch has never been validated for. */
+    if (gate_type != up_type || up_type != down_type) return 0;
+    const char *set = getenv("DS4_CUDA_GLM_MOE_TYPES");
+    if (!set || set[0] == '\0') set = DS4_CUDA_GLM_MOE_TYPES_DEFAULT;
+    switch (gate_type) {
+    case 10u: return strstr(set, "q2k") != NULL;
+    case 12u: return strstr(set, "q4k") != NULL;
+    default:  return 0;
+    }
+}
+
 extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
@@ -32100,9 +32129,21 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         (expert_in_dim & 255u) != 0u || (expert_mid_dim & 255u) != 0u) {
         return 0;
     }
-    if (gate_type != 10u || up_type != 10u || down_type != 10u) {
-        fprintf(stderr, "ds4: glm routed moe: unsupported types %u/%u/%u\n",
-                gate_type, up_type, down_type);
+    if (!glm_moe_types_allowed(gate_type, up_type, down_type)) {
+        fprintf(stderr,
+                "ds4: glm routed moe: unsupported types %s/%s/%s (%u/%u/%u)\n",
+                glm_moe_type_name(gate_type), glm_moe_type_name(up_type),
+                glm_moe_type_name(down_type), gate_type, up_type, down_type);
+        return 0;
+    }
+    if (gate_type != 10u) {
+        /* Known and allowed, but its kernel instantiations are not in this
+         * build yet: fail here rather than let a Q4_K expert trio reach Q2_K
+         * arithmetic and produce plausible-looking garbage. This guard is
+         * removed as WS 2-4 land. */
+        fprintf(stderr,
+                "ds4: glm routed moe: %s expert kernels are not implemented in this build\n",
+                glm_moe_type_name(gate_type));
         return 0;
     }
     if (mid_token_stride != n_expert * expert_mid_dim) {
