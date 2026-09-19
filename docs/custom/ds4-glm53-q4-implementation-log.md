@@ -233,7 +233,61 @@ Cap cost at 32K: **−0.8 % prefill, −2.7 % decode** for ~20 °C of board marg
 
 `en0` 10Gbase-T active; `enP7s7` 10000Mb/s full duplex; RTT 0.94–1.21 ms; single-stream TCP 4 GiB in 8.94 s ⇒ **0.46 GiB/s**; wire need ≈26 MB/s at 400 t/s. **Not the constraint.**
 
-### 4.6 Quality: Q2 vs Q4_K on the GLM 5.3 Flash 100-case fixture
+### 4.6 Q4_K at 512K single-machine: viability, depth cost, and MTP
+
+Measured 2026-09-19 on this Mac, after the owner stated that **500K context is a
+normal session build-up** — which makes the single-machine alternative to the
+split a live question rather than a hypothetical one.
+
+**It fits.** The memory guard admits 512K comfortably, because streaming keeps only
+the active layer window resident:
+
+```
+GLM memory guard ctx=524288 required=13.09 GiB budget=115.19 GiB (model 4.08, graph 9.01, transient 0.00)
+GLM memory guard ctx=524288 required=102.00 GiB budget=115.19 GiB (… transient 88.90)   ← prefill phase
+compact DSA cache rows=524288 logical_ctx=524288 kv_layers=45 indexer_layers=11 f16 5.84 GiB
+SSD streaming cache target 78.50 GiB = 70.90 GiB dynamic cache (5378 experts)
+```
+
+The whole 512K KV is only **5.84 GiB** (compact DSA), and the expert cache is
+barely smaller than at 262K (5378 vs 5435 experts) — so depth costs almost nothing
+in capacity. The tight number is the **prefill transient: 102.00 GiB of a 115.19
+GiB budget, i.e. ~13 GiB of slack.**
+
+**Depth costs decode, though — this is the finding that matters:**
+
+| ctx | decode | note |
+| ---: | ---: | --- |
+| 262 144 | 8.00 t/s | §4.2, cached run |
+| 524 288 | **4.63 / 4.90 / 5.02 t/s** | three runs, same prompt |
+
+Streaming is cache-bound, so decode falls ~40 % from 262K to 512K with the cache
+held at the same size.
+
+**MTP does not rescue it.** At 512K, bracketed on the same prompt (plain before and
+after, MTP in the middle, so cache warmth cannot explain it):
+
+| run | decode |
+| --- | ---: |
+| plain (before) | 4.90 t/s |
+| `--mtp --mtp-timing` | **3.88 t/s** |
+| plain (after) | 5.02 t/s |
+
+The draft is rejected in the visible cycles (`verify2 399.2 ms, head+draft
+71.9 ms, reject (draft 25 ':' vs true 55798 '**')`): acceptance collapses at
+depth while the verify cost remains, so MTP is a **21 % loss**, not a gain. This
+matches the repo's own warning — "poor acceptance can make it slower. Measure your
+workload rather than assuming" — and it removes the earlier hypothesis that MTP
+would let the single-machine path outrun the pair at depth.
+
+**Consequence for the split decision.** At 512K the single-machine route delivers
+Q4 quality at 4.6–4.9 t/s decode and a ~100-minute cold 500K ingest (~80 t/s),
+with no lever left to improve it. The pair's estimates are ~6.5 t/s decode and
+~180–220 t/s prefill (`[INFERENCE]`: the Q2 pair at 131K scaled by weight bits),
+i.e. **~1.3–1.4× decode and ~2× ingest**, with capacity measured at 524K
+(94.88 + 92.07 GiB, §4.4) and no dependence on which experts happen to be cached.
+
+### 4.7 Quality: Q2 vs Q4_K on the GLM 5.3 Flash 100-case fixture
 
 Run 2026-09-19 on this Mac (M4 Max, Metal), one checkpoint at a time, same build,
 same fixture (`gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100`),

@@ -25,11 +25,13 @@ in the tree and has been exercised end to end:
 
 The Q4 quality advantage is **not** an argument for the split. It is available
 single-machine with `--ssd-streaming` today — measured at **−34.4 % NLL against Q2
-on the 100-case fixture, better on 98 of 100 cases**, with both checkpoints
-reproducing their published bands (§2, log §4.6). What the split adds is Q4 at
-262K–500K **resident**, without dependence on the expert cache, at the ingest speed
-the Q2 pipeline already demonstrates. Choosing the split is therefore a capacity
-and ingest-time decision, not a quality one.
+on the 100-case fixture, better on 98 of 100 cases** (§2, log §4.7) — and it does
+reach **512K on this Mac**: the guard admits it (13.09 GiB decode, 102.00 GiB
+prefill transient of a 115.19 GiB budget) with a 5.84 GiB KV and a 70.90 GiB
+expert cache. What that route cannot hold is *speed at depth*: decode falls to
+**4.63–5.02 t/s** at 512K from 8.00 at 262K, and **MTP is a 22 % loss there**
+(log §4.6). So the split is a **speed-at-depth and predictability** decision — and
+ingest time — not a quality or capacity one.
 
 Payoff `[INFERENCE]`: pipeline prefill is `max(stage)` not `sum(stage)`, so the
 split should roughly halve long-ingest wall time versus the single-Mac streaming
@@ -96,7 +98,8 @@ Measured on the target pair unless noted.
 | Q4_K on the Mac alone (SSD streaming) | 32 768: 84.2 t/s / 8.8 t/s · 262 144: 82.5 t/s / 8.0 t/s (53 min ingest), 99.84 GiB plan, 5 435/12 384 experts cached, no thermal warning |
 | Spark thermals | idle 43–50 °C; under pipeline prefill board 60–90 °C, GPU die ~10 °C cooler; `HW Thermal Slowdown` + 69 s `SW Power Capping` observed uncapped |
 | Distributed snapshot (Q2 pipeline) | save verified 2026-09-19: a 649-token cold prompt wrote a 165.08 MiB checkpoint in 18.2 ms with the data connection observed on `127.0.0.1:55911`; the load path reported `cached_tokens: 819`. Equivalence on a fresh pair is still to be shown (log §11, §6.1 #7–8) |
-| Quality, Q2 vs Q4_K (100-case GLM 5.3 Flash fixture, this Mac, Metal) | Q4_K `0.300477636 / 90 / 9.480` vs Q2 `0.458177271 / 90 / 7.390`; paired **98/100 cases better**, NLL **−34.4 %**, first-token match equal. Both reproduce their published bands, and the Q4 layout's M3 Ultra Metal reference is matched to three decimals (log §4.6) |
+| Quality, Q2 vs Q4_K (100-case GLM 5.3 Flash fixture, this Mac, Metal) | Q4_K `0.300477636 / 90 / 9.480` vs Q2 `0.458177271 / 90 / 7.390`; paired **98/100 cases better**, NLL **−34.4 %**, first-token match equal. Both reproduce their published bands, and the Q4 layout's M3 Ultra Metal reference is matched to three decimals (log §4.7) |
+| Q4_K single-machine at 512K (the alternative to the split) | **viable**: guard needs 13.09 GiB decode / 102.00 GiB prefill-transient of a 115.19 GiB budget, KV 5.84 GiB, 70.90 GiB expert cache (5378 experts). But **decode falls to 4.63–5.02 t/s** (from 8.00 at 262K), and **MTP at depth is a 22 % loss** (5.02 → 3.88 → 4.90 bracketed), so no lever remains on that route (log §4.6) |
 
 ---
 
@@ -437,9 +440,12 @@ Layered, cheapest first; each layer must pass before the next is trusted.
 4. ~~Does the 500K target need to hold with `--mtp` off?~~ Answered 2026-09-19:
    **yes, and MTP stays a non-goal.** The decision rests on MTP being excluded
    under a layer split — the head and its routing would have to cross a slice
-   boundary — not on a throughput comparison. What is *not* yet measured is the
-   thing that matters here: the **Q4 pair's** decode and prefill at 262K/524K,
+   boundary — not on a throughput comparison. And the measurement now removes the
+   worry that this gives something up: at 512K on the single-machine route **MTP is
+   a 22 % loss** (5.02 → 3.88 → 4.90 t/s bracketed, acceptance collapsing at depth,
+   log §4.6), so nothing is being surrendered by excluding it under the split.
+   What is *not* yet measured is the Q4 pair's decode and prefill at 262K/524K,
    blocked behind WS 1–2. The pair's numbers so far are **Q2** (12.48 t/s at 32K,
-   11.42 at 131K) and cannot be set against the single-Mac **Q4** figure
-   (8.00 t/s at 262K): different quantisation, different depth. §6 items 5–6 are
-   what will produce the comparable pair.
+   11.42 at 131K) and cannot be set against a single-Mac **Q4** figure: different
+   quantisation, different depth. §6 items 5–6 are what will produce the comparable
+   pair.
