@@ -348,6 +348,13 @@ process* (the startup banner added in this phase printed it, which is why that
 banner exists) produced this dispatch's per-call trace **zero** times while the
 pair ran to completion.
 
+The control is symmetric, which is what makes this conclusive rather than merely
+suggestive: the identical script, identical `env` form and identical worker
+binary run against the Q4_K model under the same switch give the banner *and*
+42 trace lines. So the environment reaches both workers and the difference is
+the model's dispatcher routing — not the harness, which is where I spent the
+previous attempt.
+
 So the Q2_K tile8 and warp dumps were byte-identical because **neither path ran
 in either run**: the flag gated code that model never reaches. That is worse than
 vacuous, and it retracts the Q2_K-based reasoning wholesale — "the tile8 machinery
