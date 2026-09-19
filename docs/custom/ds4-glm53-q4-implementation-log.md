@@ -258,6 +258,22 @@ fault was in the routing data feeding it. What caught it was comparing logits
 against a different implementation — the thing the plan's parity harnesses
 exist for.
 
+### Phase O — Workstream 3 (expert-major), and three more instances of the same hardcoding
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| O1 | Templated the expert-major gate/up and down kernels for Q4_K | same recipe as the tile8 and warp kernels (`template <typename block_t>`, `glm_moe_dot`, `sizeof(block_t)`); the guard that refused Q4_K on this path is gone |
+| O2 | The first verification failed, with the Phase N signature | forcing the worker onto expert-major gave Q4_K logits deviating by mean 1.485 against the Metal reference (max 3.88, top-16 11-of-16) — the same shape of error as the pre-fix tile8 path, which is what made it recognisable |
+| O3 | Cause: the expert index is the grid's y dimension and it was a literal 256 | `dim3 ge1(..., 256u, 1)` and `dim3 ge2(..., 256u, 1)` launch one block row per expert, so experts 256–287 were never launched at all. `tile_capacity` carried the same fault in a different form: its slack was `256u` where the bound is one partial tile per expert, under-sized for a 288-expert model and a latent overflow |
+| O4 | Fixed and re-verified | the grids span `n_total_expert` and the slack is `+ n_total_expert`. Expert-major: mean \|Δ\| **0.152** against the Metal reference (max 0.27, top-16 14-of-16), down from 1.485, and 0.132 against the warp path — the residual is the float-atomic accumulation order this path uses by design, not an error. Tile8 re-checked in the same pass: byte-identical to the previous run, so the slack change is behaviour-preserving |
+| O5 | Swept for the rest of the class | no `dim3` uses 256 as an expert dimension, no `256 * {gate,up,down}_expert_bytes` / `256 * sizeof(int32_t)` / `256 * cap` sizing remains, and the dispatch's remaining 256s are weight-block sizes (`expert_in_dim / 256`), thread counts and grid rounding. Those three were the last instances |
+
+**Still guarded, loudly and by name**: the MTP tok2 path and the scalar debug
+path. tok2 is a small mechanical instantiation by the same recipe, but
+verifying it needs a GLM MTP support model and there is none on this
+workstation, so it keeps refusing Q4_K rather than running unverified —
+speculative decoding must not be silently wrong.
+
 ---
 
 ## 4. Measurements

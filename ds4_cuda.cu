@@ -31925,6 +31925,7 @@ __global__ static void glm_routed_moe_gateup_expert_tile8_kernel(
     }
 }
 
+template <typename block_t>
 __global__ static void glm_routed_moe_gateup_expert_kernel(
         float *mid,
         const char *gate_base,
@@ -31958,10 +31959,10 @@ __global__ static void glm_routed_moe_gateup_expert_kernel(
         const cuda_block_q8_K *xrow = xq + (uint64_t)(pair / n_expert) * xq_blocks;
         float g = 0.0f, u = 0.0f;
         for (uint32_t b = lane; b < xq_blocks; b += 32u) {
-            g += dev_dot_q2_K_q8_K_block(
-                    (const cuda_block_q2_K *)(gr + (uint64_t)b * 84u), xrow + b);
-            u += dev_dot_q2_K_q8_K_block(
-                    (const cuda_block_q2_K *)(ur + (uint64_t)b * 84u), xrow + b);
+            g += glm_moe_dot(
+                    (const block_t *)(gr + (uint64_t)b * sizeof(block_t)), xrow + b);
+            u += glm_moe_dot(
+                    (const block_t *)(ur + (uint64_t)b * sizeof(block_t)), xrow + b);
         }
         for (int off = 16; off > 0; off >>= 1) {
             g += __shfl_down_sync(0xffffffffu, g, off);
@@ -31974,6 +31975,7 @@ __global__ static void glm_routed_moe_gateup_expert_kernel(
     }
 }
 
+template <typename block_t>
 __global__ static void glm_routed_moe_down_expert_kernel(
         float *out,
         const char *down_base,
@@ -32003,8 +32005,8 @@ __global__ static void glm_routed_moe_down_expert_kernel(
         const cuda_block_q8_K *mrow = midq + (uint64_t)pair * midq_blocks;
         float s = 0.0f;
         for (uint32_t b = lane; b < midq_blocks; b += 32u) {
-            s += dev_dot_q2_K_q8_K_block(
-                    (const cuda_block_q2_K *)(dr + (uint64_t)b * 84u), mrow + b);
+            s += glm_moe_dot(
+                    (const block_t *)(dr + (uint64_t)b * sizeof(block_t)), mrow + b);
         }
         for (int off = 16; off > 0; off >>= 1) {
             s += __shfl_down_sync(0xffffffffu, s, off);
@@ -32314,8 +32316,11 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         const uint64_t lists_off = (counts_bytes + 255u) & ~255ull;
         const uint64_t lists_bytes =
             (uint64_t)n_total_expert * cap * sizeof(int32_t);
+        /* The worst case is one tile per eight pairs plus one partial tile per
+         * expert that is used at all, so the slack has to be the model's
+         * expert count. A literal 256 under-sized this for a 288-expert model. */
         const uint32_t tile_capacity =
-            (n_pairs + 7u) / 8u + 256u;
+            (n_pairs + 7u) / 8u + n_total_expert;
         const uint64_t tile_total_off =
             (lists_off + lists_bytes + 255u) & ~255ull;
         const uint64_t tile_experts_off =
@@ -32392,7 +32397,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                             uint32_t chunk_tile_capacity = tile_capacity;
                             if (n_tokens > max_chunk_tokens) {
                                 chunk_tile_capacity =
-                                    (chunk_pairs + 7u) / 8u + 256u;
+                                    (chunk_pairs + 7u) / 8u + n_total_expert;
                                 cudaMemsetAsync(counts, 0, counts_bytes);
                                 glm_moe_expert_map_kernel<<<
                                         (chunk_pairs + 255u) / 256u, 256>>>(
@@ -32450,11 +32455,12 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                         out, out_work, out_work_bytes,
                         "glm routed moe expert tile8");
             }
-            if (!weight_is_q2_K) {
-                return glm_moe_unsupported_path(gate_type, "expert-major");
-            }
-            dim3 ge1((expert_mid_dim + 7u) / 8u, 256u, 1);
-            glm_routed_moe_gateup_expert_kernel<<<ge1, 256>>>(
+            /* blockIdx.y is the expert index, so it must span the model's
+             * experts, not a literal 256 (GLM 5.3 Flash has 288). */
+            dim3 ge1((expert_mid_dim + 7u) / 8u, n_total_expert, 1);
+            GLM_MOE_LAUNCH_TYPED(
+                    glm_routed_moe_gateup_expert_kernel,
+                    ge1, 256, 0,
                     mid_work, gw, uw,
                     (const cuda_block_q8_K *)xq_scratch[dev]->ptr,
                     counts, lists,
@@ -32466,8 +32472,10 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                     mid_work, expert_mid_dim, n_tokens * n_expert);
             cudaMemsetAsync(out_work, 0,
                             (uint64_t)n_tokens * out_dim * sizeof(float));
-            dim3 ge2((out_dim + 7u) / 8u, 256u, 1);
-            glm_routed_moe_down_expert_kernel<<<ge2, 256>>>(
+            dim3 ge2((out_dim + 7u) / 8u, n_total_expert, 1);
+            GLM_MOE_LAUNCH_TYPED(
+                    glm_routed_moe_down_expert_kernel,
+                    ge2, 256, 0,
                     out_work, dw,
                     (const cuda_block_q8_K *)midq_scratch[dev]->ptr,
                     counts, lists, (const float *)weights->ptr,
