@@ -31463,6 +31463,21 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
     return 0;
 }
 
+/* swiglu(gate, up) with the model's clamp, matching ds4.c's CPU reference
+ * exactly: gate is clamped only above, up on both sides, and a clamp at or
+ * below 1e-6 disables it. The GLM MoE gate/up kernels used to omit this, which
+ * is invisible until a gate pre-activation exceeds the clamp (10.0 for GLM 5.3)
+ * - and the dispatch could not even receive the value, because its definition
+ * was missing the parameter that ds4_gpu.h and its only caller both pass. */
+__device__ __forceinline__ static float glm_moe_swiglu(float g, float u, float clamp) {
+    if (clamp > 1.0e-6f) {
+        if (g > clamp) g = clamp;
+        if (u > clamp) u = clamp;
+        if (u < -clamp) u = -clamp;
+    }
+    return (g / (1.0f + expf(-g))) * u;
+}
+
 /* Scalar-correct GLM routed MoE (q2_K experts): per (token, slot) block
  * quantizes nothing - dots q2_K rows against a q8_K-quantized activation
  * staged in shared memory. Grid: (n_tokens, n_expert). Mid buffer holds
@@ -31482,7 +31497,8 @@ __global__ static void glm_routed_moe_batch_q2K_gateup_kernel(
         uint32_t expert_mid_dim,
         uint32_t n_expert,
         uint32_t n_tokens,
-        uint32_t mid_token_stride) {
+        uint32_t mid_token_stride,
+        float swiglu_clamp) {
     const uint32_t tok = blockIdx.x;
     const uint32_t slot = blockIdx.y;
     if (tok >= n_tokens || slot >= n_expert) return;
@@ -31501,7 +31517,7 @@ __global__ static void glm_routed_moe_batch_q2K_gateup_kernel(
             g += dev_dot_q2_K_q8_K_block(gr + b, xrow + b);
             u += dev_dot_q2_K_q8_K_block(ur + b, xrow + b);
         }
-        mrow[r] = (g / (1.0f + expf(-g))) * u;   /* silu(g)*u */
+        mrow[r] = glm_moe_swiglu(g, u, swiglu_clamp);
     }
 }
 
@@ -31545,6 +31561,7 @@ __global__ static void glm_routed_moe_batch_q2K_down_kernel(
  * overload picked here supplies the arithmetic and, through sizeof, the block
  * stride. Neither may hardcode 84u again: that constant is what tied this
  * dispatch to Q2_K. */
+
 __device__ __forceinline__ static float glm_moe_dot(
         const cuda_block_q2_K *w, const cuda_block_q8_K *y) {
     return dev_dot_q2_K_q8_K_block(w, y);
@@ -31608,7 +31625,8 @@ __global__ static void glm_routed_moe_gateup_warp_kernel(
         uint32_t xq_blocks,
         uint32_t expert_mid_dim,
         uint32_t n_expert,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        float swiglu_clamp) {
     const uint32_t tok = blockIdx.z;
     const uint32_t slot = blockIdx.y;
     const uint32_t warps = blockDim.x >> 5;
@@ -31649,7 +31667,7 @@ __global__ static void glm_routed_moe_gateup_warp_kernel(
     }
     if (lane == 0u) {
         mid[((uint64_t)tok * n_expert + slot) * expert_mid_dim + r] =
-            (g / (1.0f + expf(-g))) * u;
+            glm_moe_swiglu(g, u, swiglu_clamp);
     }
 }
 
@@ -31668,7 +31686,8 @@ __global__ static void glm_routed_moe_gateup_tok2_reuse_kernel(
         uint64_t up_row_bytes,
         uint32_t xq_blocks,
         uint32_t expert_mid_dim,
-        uint32_t n_expert) {
+        uint32_t n_expert,
+        float swiglu_clamp) {
     const uint32_t owner = blockIdx.y;
     const uint32_t tok = owner / n_expert;
     const uint32_t slot = owner - tok * n_expert;
@@ -31741,7 +31760,7 @@ __global__ static void glm_routed_moe_gateup_tok2_reuse_kernel(
         if (lane == 0u) {
             const uint32_t pair = p == 0u ? pair0 : pair1;
             mid[(uint64_t)pair * expert_mid_dim + r] =
-                (g[p] / (1.0f + expf(-g[p]))) * u[p];
+                glm_moe_swiglu(g[p], u[p], swiglu_clamp);
         }
     }
 }
@@ -31863,7 +31882,8 @@ __global__ static void glm_routed_moe_gateup_expert_tile8_kernel(
         uint32_t xq_blocks,
         uint32_t expert_mid_dim,
         uint32_t n_expert,
-        uint32_t cap) {
+        uint32_t cap,
+        float swiglu_clamp) {
     const uint32_t tile = blockIdx.y;
     if (tile >= *tile_total) return;
     const uint32_t warps = blockDim.x >> 5u;
@@ -31920,7 +31940,7 @@ __global__ static void glm_routed_moe_gateup_expert_tile8_kernel(
         }
         if (lane == 0u) {
             mid[(uint64_t)pair[p] * expert_mid_dim + r] =
-                (g[p] / (1.0f + expf(-g[p]))) * u[p];
+                glm_moe_swiglu(g[p], u[p], swiglu_clamp);
         }
     }
 }
@@ -31940,7 +31960,8 @@ __global__ static void glm_routed_moe_gateup_expert_kernel(
         uint32_t xq_blocks,
         uint32_t expert_mid_dim,
         uint32_t n_expert,
-        uint32_t cap) {
+        uint32_t cap,
+        float swiglu_clamp) {
     const uint32_t e = blockIdx.y;
     const int32_t nt = counts[e];
     if (nt == 0) return;
@@ -31970,7 +31991,7 @@ __global__ static void glm_routed_moe_gateup_expert_kernel(
         }
         if (lane == 0u) {
             mid[(uint64_t)pair * expert_mid_dim + r] =
-                (g / (1.0f + expf(-g))) * u;
+                glm_moe_swiglu(g, u, swiglu_clamp);
         }
     }
 }
@@ -32200,10 +32221,13 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_total_expert,
         uint32_t                n_expert,
+        float                   swiglu_clamp,
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
-        uint32_t                mid_token_stride) {
+        uint32_t                mid_token_stride,
+        bool                    force_resident) {
+    (void)force_resident;   /* this dispatch resolves weights per call */
     (void)layer_index;
     /* n_total_expert is the model's expert count (288 for GLM 5.3 Flash) and
      * every expert-indexed buffer below is sized and bounded by it. It used to
@@ -32362,7 +32386,8 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                         tile_total, tile_experts, tile_starts,
                         gate_expert_bytes, gate_row_bytes,
                         up_expert_bytes, up_row_bytes,
-                        xq_blocks, expert_mid_dim, n_expert, cap);
+                        xq_blocks, expert_mid_dim, n_expert, cap,
+                        swiglu_clamp);
                 q8_K_quantize_kernel<<<
                         dim3(midq_blocks, n_tokens * n_expert, 1), 256>>>(
                         (cuda_block_q8_K *)midq_scratch[dev]->ptr,
@@ -32466,7 +32491,8 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                     counts, lists,
                     gate_expert_bytes, gate_row_bytes,
                     up_expert_bytes, up_row_bytes,
-                    xq_blocks, expert_mid_dim, n_expert, cap);
+                    xq_blocks, expert_mid_dim, n_expert, cap,
+                    swiglu_clamp);
             q8_K_quantize_kernel<<<dim3(midq_blocks, n_tokens * n_expert, 1), 256>>>(
                     (cuda_block_q8_K *)midq_scratch[dev]->ptr,
                     mid_work, expert_mid_dim, n_tokens * n_expert);
@@ -32504,7 +32530,8 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                 (const int32_t *)selected->ptr,
                 gate_expert_bytes, gate_row_bytes,
                 up_expert_bytes, up_row_bytes,
-                xq_blocks, expert_mid_dim, n_expert);
+                xq_blocks, expert_mid_dim, n_expert,
+                swiglu_clamp);
     } else if (getenv("DS4_GLM_MOE_SCALAR")) {
         if (!weight_is_q2_K) {
             return glm_moe_unsupported_path(gate_type, "scalar");
@@ -32515,7 +32542,8 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                 (const cuda_block_q8_K *)xq_scratch[dev]->ptr,
                 (const int32_t *)selected->ptr,
                 gate_expert_bytes, gate_row_bytes, up_expert_bytes, up_row_bytes,
-                xq_blocks, expert_mid_dim, n_expert, n_tokens, mid_token_stride);
+                xq_blocks, expert_mid_dim, n_expert, n_tokens, mid_token_stride,
+                swiglu_clamp);
     } else {
         const uint32_t warps = 8u;
         dim3 g1((expert_mid_dim + warps - 1u) / warps, n_expert, n_tokens);
@@ -32527,7 +32555,8 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                 (const cuda_block_q8_K *)xq_scratch[dev]->ptr,
                 (const int32_t *)selected->ptr,
                 gate_expert_bytes, gate_row_bytes, up_expert_bytes, up_row_bytes,
-                xq_blocks, expert_mid_dim, n_expert, n_tokens);
+                xq_blocks, expert_mid_dim, n_expert, n_tokens,
+                swiglu_clamp);
     }
 
     {
@@ -32595,10 +32624,10 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_total_expert,
         uint32_t                n_expert,
+        float                   swiglu_clamp,
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         bool                    force_resident) {
-    (void)force_resident;
     return ds4_gpu_glm_routed_moe_batch_tensor(out, mid,
             model_map, model_size,
             gate_offset, up_offset, down_offset,
@@ -32607,8 +32636,8 @@ extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
             up_expert_bytes, up_row_bytes,
             down_expert_bytes, down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
-            selected, weights, n_total_expert, n_expert, layer_index,
-            x, 1, n_expert * expert_mid_dim);
+            selected, weights, n_total_expert, n_expert, swiglu_clamp, layer_index,
+            x, 1, n_expert * expert_mid_dim, force_resident);
 }
 
 /* Parallel router select: 256 threads cover up to two experts each, then top-k

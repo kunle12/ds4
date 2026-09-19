@@ -409,6 +409,16 @@ tests/test_cuda_q8_rows: tests/test_cuda_q8_rows.o ds4_cuda.o ds4_image.o $(MMQ_
 test-cuda-q8-rows: tests/test_cuda_q8_rows
 	./tests/test_cuda_q8_rows
 
+tests/test_glm53_moe_q4k.o: tests/test_glm53_moe_q4k.c ds4_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
+
+tests/test_glm53_moe_q4k: tests/test_glm53_moe_q4k.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-glm53-moe-q4k
+test-glm53-moe-q4k: tests/test_glm53_moe_q4k
+	./tests/test_glm53_moe_q4k
+
 tests/test_cuda_reductions.o: tests/test_cuda_reductions.cu ds4_gpu.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<
 

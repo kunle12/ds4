@@ -27,7 +27,7 @@ thermal envelope.
 | GLM 5.3 layer-slice correctness (wire width) | **done, validated bit-exact** |
 | Cross-machine Q2 pipeline | **working and measured** |
 | Distributed snapshot round-trip across the split | **save verified 2026-09-19** (165 MiB checkpoint, worker's shard fetched over the data forward); load path exercised and reported a hit — equivalence still needs the fresh-pair restore (§6.1 #8) |
-| Q4_K on the pair | **working and measured** — WS 2 and WS 3 landed (log Phases M, N, O): correct output (logits byte-identical to the warp path, top-16 15-of-16 against the Metal reference), **100.6 t/s prefill / 11.4 t/s generation** against 40.8 / 5.7 for Mac-only streaming — 2.47× and 1.99×, so the ≥2× gate passes. Phases N and O fixed four instances of a pre-existing 256-vs-288 expert-count hardcoding. The MTP tok2 and scalar paths still refuse Q4_K by name, unverified |
+| Q4_K on the pair | **working and measured** — WS 2, WS 3 and WS 5's first slice landed (log Phases M–P): correct output (logits byte-identical to the warp path, top-16 16-of-16 against the Metal reference), **100.6 t/s prefill / 11.4 t/s generation** against 40.8 / 5.7 for Mac-only streaming — 2.47× and 1.99×, so the ≥2× gate passes. Phases N and O fixed four instances of a pre-existing 256-vs-288 expert hardcoding; Phase P fixed a swiglu clamp the CUDA MoE ignored, which improved agreement with the Metal reference (mean \|Δ\| 0.085 → 0.073). `make test-glm53-moe-q4k` passes bit-exact. The MTP tok2 and scalar paths still refuse Q4_K by name, unverified |
 | Q4_K on the Mac alone | **working and measured** (SSD streaming) |
 | Spark thermal protection | **installed, enabled, verified live**; re-armed by itself after the 2026-09-19 power cycle |
 | Access path (macOS ALF workaround) | **installed as a boot-persistent launchd daemon, verified**; carries both forwards (`-R` control, `-L` data for snapshots) |
@@ -273,6 +273,25 @@ path. tok2 is a small mechanical instantiation by the same recipe, but
 verifying it needs a GLM MTP support model and there is none on this
 workstation, so it keeps refusing Q4_K rather than running unverified —
 speculative decoding must not be silently wrong.
+
+### Phase P — WS 5, first slice: the swiglu clamp, and a parity test that passes
+
+| # | Action | Evidence / result |
+| --- | --- | --- |
+| P1 | Found that the CUDA GLM MoE ignored the model's swiglu clamp | `ds4_gpu.h` and the only caller both pass `swiglu_clamp`, but the CUDA *definition* was missing that parameter (and a trailing `force_resident`). It worked at all only by ABI accident: on AArch64 the extra `float` lands in the FP argument registers and the trailing `bool` beyond the integer parameters, so the integer arguments stayed aligned. `ds4_metal.m` defines the same symbol with the full signature and only one backend is linked into a given binary, which is why nothing complained |
+| P2 | Confirmed the clamp is live for this model | `DS4_SHAPE_GLM53.swiglu_clamp_exp = 10.0f`, and both `ds4.c`'s `swiglu()` and the Metal kernels clamp gate above and up on both sides. The CUDA routed-MoE kernels did a plain `silu(g)*u` at four sites, plus two in the scalar and tok2 variants |
+| P3 | Fixed the signature and plumbed the clamp | `float swiglu_clamp` before `layer_index` and `bool force_resident` at the end, matching the header; a `glm_moe_swiglu` helper mirroring the CPU reference exactly; wired into all six gate/up kernels and passed at every launch site; `one_tensor` forwards both |
+| P4 | Verified on real weights | plumbing the clamp changed the pair's next-token logits and moved them **closer** to the Metal reference: mean \|Δ\| **0.085 → 0.0727**, max **0.50 → 0.197**, top-16 **15/16 → 16/16**. The clamp had been binding, and the earlier agreement was hiding it |
+| P5 | Landed the first slice of the WS-5 harness | `tests/test_glm53_moe_q4k.c` with `make test-glm53-moe-q4k`: a synthetic 288-expert MoE built through the public `ds4_gpu_*` API, compared against a host mirror of the q8_K quantizer, the Q4_K block dot and the MoE math. **PASS, bit-exact (`worst rel = 0.000e+00`)** for 8 tokens (warp / small-batch) and 128 tokens (tile8) |
+| P6 | The test is built around the three regressions | `mid` is filled with NaN before the call and the test asserts that no selected pair is left unwritten, with a `selected` that deliberately uses expert **287**, expert **256** (the first a 256-expert bound drops), expert **255**, a negative slot, and an expert nobody selects. A 256 expert bound, a 256-wide expert-major grid, or a 256 tile slack each fail it |
+
+**Scope note.** The value comparison is Q4_K only: the Q2_K device dot spans more
+than the single 84-byte block per row that keeps the host mirror readable, and
+Q2_K point arithmetic is already covered by `make q4k-dot-test` and the Q2_K pair
+runs. The coverage checks are the type-independent part and the Q4_K case proves
+them. The clamp is verified on real weights (P4) rather than synthetically -
+making it bind on purpose needs weights whose dot deterministically exceeds it,
+and that construction is worth doing separately.
 
 ---
 
