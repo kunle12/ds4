@@ -965,6 +965,48 @@ indexer state are the likely remainder, and `--dist-activation-bits 16` halving 
 payload would be consistent with that `[INFERENCE]`; the tensor list was not
 inspected. Peak 260 MB/s is ~20 % of the 10GbE link, average ~2 %.
 
+**What the tensor table says about any reassignment.** Parsed from the GGUF header
+(46 `blk` entries; validated because layers 24:44 plus the head comes to 86.322 GiB
+against the engine's own startup figure of 86.32 GiB):
+
+| slice | layers | weights |
+| --- | ---: | ---: |
+| `token_embd` / output head | - | 1.182 GiB each |
+| blk.0-2, the dense ones | 3 | 0.408 GiB each |
+| blk.3-44, MoE | 42 | ~4.08 GiB each |
+| blk.45, the MTP block | 1 | 4.019 GiB (not mapped without `--mtp`) |
+| Mac `0:23` today | 24 | 86.236 GiB |
+| Spark `24:44` today | 21 + head | 85.140 + 1.182 = 86.322 GiB |
+
+**The Spark can absorb only two more layers at ctx 524288**, and that bounds every
+role or split change: budget 103.63 GiB less KV 2.66 and buffers 3.09 leaves 97.88
+GiB for weights against 86.32 used, i.e. 11.56 GiB free, at ~4.08 GiB/layer = 2.83
+layers. Three layers need 12.25 GiB and do not fit - which is why the +13 %
+rebalance in §4.8 is already qualified as short-context only. Two layers gives
+Mac 22 / Spark 23: 22 x 0.406 = 8.93 s against today's 24 x 0.406 = 9.74 s, about
+**+9 %** prefill.
+
+**The balance point is unreachable at any context.** Equating 0.406m with 0.262s
+over 45 layers puts the optimum near Mac 18 / Spark 27, needing ~110.8 GiB of
+weights on the Spark against the 97.88 GiB available. The Spark cannot carry enough
+to stop being the idle stage, so the Mac stays binding and the gain available from
+any reassignment is ~+9 % at 524288 (~+13 % at short context).
+
+**Swapping roles is not a separate lever.** The coordinator holds the prefix, so a
+swap puts the Spark on 0:N and the Mac on the tail plus head - the same effect as
+changing `--layers`, under the same memory ceiling. What a swap changes uniquely is
+operational: HTTP, tokenization, session/KV and the token loop move to the Spark,
+the 1.182 GiB head moves to the Mac, and Spark duty rises from ~57 % toward ~67 %
+on the machine that is already thermally constrained (Phase Y: 83.9 C peak at 57 %
+duty). A pure `--layers` change is the cheaper way to test the same throughput
+question.
+
+**Correction to the per-layer comparison used above.** It is confounded. Per byte
+of weights the Spark is ~1.75x faster per layer (4.054 GiB/layer in 0.262 s against
+3.593 GiB/layer in 0.406 s), but the Mac's prefix includes blk.0-2 - 0.408 GiB each
+and compute-heavy per byte, the only dense layers - so part of its apparent
+slowness is layer mix, not machine speed. The direction holds; the ratio does not.
+
 **Consequence for reading §4.9.** The pair's ~4.3x prefill advantage is *not* two
 GPUs computing in parallel — the Mac alone sets the rate. It is the Mac running 24
 *resident* layers instead of 45 *streamed* ones: at 82.47 t/s over 45 layers a
