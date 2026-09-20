@@ -94,10 +94,20 @@ Q4 does not fit resident on one Spark, and GLM Spark-to-Spark tensor parallelism
 not implemented (the two-Mac RDMA instructions do not apply to GLM on CUDA). The
 supported way to run GLM 5.3 Flash at Q4_K is the **pipeline split** against a
 128 GB Mac — see the Q4_K pipeline example in [DISTRIBUTED.md](DISTRIBUTED.md).
-Measured on the pair: **389 t/s prefill / 10.3 t/s decode** at ctx 32768 with the Mac
-on `0:23` and the Spark on `24:output`, and **440 t/s prefill** rebalanced to `0:20` /
-`21:output` — though that leaves only ~12 GiB free on the Spark, so it is a
-short-context option. At ctx 524288 the `0:23` split holds ~92 GiB resident here.
+Measured on the pair at ctx 524288 on a 286,646-token prompt: **415.0 t/s prefill /
+121.1 ms per token** with the Mac on `0:20` and the Spark on `21:output`, which is the
+recommended split. The previously used `0:23` / `24:output` gives 356.3 t/s and
+120.5 ms, so the Spark-heavy split is +16.5 % prefill at depth with decode unchanged.
+The Spark plans 104.73 GiB of a 107.61 GiB budget in this configuration — set
+`DS4_GLM_MEMORY_GUARD_RESERVE_GB=14`; the reserve and fraction are runtime-tunable, so
+this is a setting rather than the machine's memory limit — and the Mac plans 82.22 GiB
+of 115.19 GiB.
+
+At the `0:20` split the Spark runs about 74 % GPU duty, against about 57 % at `0:23`.
+The board zone peaks at 83.5 °C with `hw_thermal_slowdown` and `sw_power_cap` both
+Not Active and the SM clock holding 2093 MHz, the top of its lock; the `0:23`
+measurement peaked at 83.9 °C. The extra throughput costs duty cycle, not thermal
+headroom.
 
 ## Vision and speculative decoding
 

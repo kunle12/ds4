@@ -165,6 +165,12 @@ Q2 is close enough to a 128 GB machine's memory budget that other workloads
 and context size matter. Follow the [Metal](METAL.md), [Spark](DGX_SPARK.md),
 or [Strix Halo](STRIX_HALO.md) starting configuration for your host.
 
+With GLM 5.3 Flash loaded the server advertises `glm-5.3-flash`,
+`glm-5.3-flash-chat` and `glm-5.3-flash-reasoner`, each with `context_length`
+524288. For the Mac+Spark Q4_K pipeline, use coordinator `--layers 0:20` and worker
+`--layers 21:output` with `DS4_GLM_MEMORY_GUARD_RESERVE_GB=14` on the Spark; see
+[inference across machines](DISTRIBUTED.md).
+
 Ordinary decode is the default. Enable the embedded draft block with `--mtp`:
 
 ```sh

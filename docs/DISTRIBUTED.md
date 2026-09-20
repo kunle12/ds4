@@ -165,36 +165,71 @@ long-prefill throughput, not as a guaranteed decode speedup.
 
 The same model file on both machines; the Mac coordinates and the Spark works.
 Q4_K does not fit on the Spark alone, so this split is what makes it usable there.
-Measured at ctx 32768: **389 t/s prefill / 10.3 t/s decode** on `0:23` / `24:output`.
+Neither machine can hold the whole model, and the split is a contiguous layer range
+chosen at launch: the coordinator takes `0:N`, the worker `N+1:output` plus the head.
+
+**Recommended: coordinator `0:20`, worker `21:output`.** Measured at ctx 524288 on a
+286,646-token prompt, cold: **415.0 t/s prefill and 121.1 ms per token** — an
+11.5-minute ingest. The previously used `0:23` / `24:output` gives 356.3 t/s and
+120.5 ms at the same depth, so the Spark-heavy split is **+16.5 % prefill with decode
+unchanged**. At 39,865 tokens the same comparison is 455.2 against 398.8 t/s and
+103.0 against 98.5 ms.
 
 The two hosts talk **directly** over the point-to-point link — no tunnel. The
 coordinator listens on the link address and the worker dials it:
 
 ```sh
-# Spark — worker.
+# Spark — worker. The 14 GiB guard reserve is what lets this larger slice fit.
+DS4_GLM_MEMORY_GUARD_RESERVE_GB=14 \
 ~/bin/ds4 --cuda -m ~/mlmodels/glm/GLM-5.3-Flash-Q4_K.gguf \
-  --role worker --layers 24:output --coordinator 192.168.2.1 9911 \
+  --role worker --layers 21:output --coordinator 192.168.2.1 9911 \
   --listen 192.168.2.2 55911 --ctx 524288
 
 # Mac — coordinator, serving HTTP on 8081.
 ~/bin/ds4-server -m ~/mlmodels/glm/GLM-5.3-Flash-Q4_K.gguf \
-  --role coordinator --layers 0:23 --listen 192.168.2.1 9911 \
+  --role coordinator --layers 0:20 --listen 192.168.2.1 9911 \
   --ctx 524288 --host 0.0.0.0 --port 8081
 ```
 
-Start the worker first. The worker's `--listen` is its data listener, which the
-coordinator dials directly for snapshots. Use the **literal IPv4** of the direct link
-on both sides, never a hostname — an mDNS resolution failure killed an earlier
-session-scoped run mid-ingest.
+Start the worker first — it retries until the coordinator's control port answers, so
+ordering is convenience rather than requirement. The worker's `--listen` is its data
+listener, which the coordinator dials directly for snapshots. Use the **literal
+IPv4** of the direct link on both sides, never a hostname — an mDNS resolution
+failure killed an earlier session-scoped run mid-ingest.
+
+Operational notes for this pair:
+
+* **macOS has no `setsid`.** Wrapping a launch in it fails silently and the process
+  never starts; start the worker in a terminal or under `launchd`.
+* **Give any `ssh` inside a backgrounded job `-n`,** or it consumes the job's stdin
+  and hangs.
+* **Judge readiness by the served payload** — a real completion, or `/v1/models` —
+  never by the port being open, which happens before the weights are mapped.
+* After a failed run, check `journalctl -k | grep "r8127: enP7s7: link down"` on the
+  Spark: that NIC flaps intermittently and a flap aborts the run.
 
 If a future macOS release refuses non-loopback accepts for a locally built binary
 again — it did on 2026-09-19, which is why `~/ds4-tunnel` exists — fall back to the
 loopback form with the two forwards it provides rather than fighting the OS.
 
-At ctx 524288 the worker holds ~92 GiB resident. Rebalancing three layers to the
-Spark (`0:20` / `21:output`) measures **440 t/s prefill** — ~13 % faster, because the
-Mac's per-layer cost is the slower stage — but leaves only ~12 GiB free on the
-Spark, so treat it as a short-context option rather than the default.
+**Memory here is a setting, not a hardware limit.** At `0:20` the Spark plans
+104.73 GiB of a 107.61 GiB budget and the Mac 82.22 GiB of 115.19 GiB, so this split
+is the default at full context rather than a short-context option. The guard sizes
+itself as `min(0.99 x base, base - reserve)`, where the base is `hw.memsize` on Apple
+and the CUDA device's recommended working set elsewhere, and the GLM 5.3 reserve is
+18 GiB by default — 14 GiB here, set at runtime with
+`DS4_GLM_MEMORY_GUARD_RESERVE_GB` (and `DS4_GLM_MEMORY_GUARD_FRACTION`). The Spark's
+OS-visible total is 121.61 GiB, because the GB10 keeps ~6.4 GiB of its 128 GB from
+Linux, and the Mac's 115.19 GiB comes from `iogpu.wired_limit_mb=120000`.
+
+**Choose the split for prefill, not decode.** Moving one layer from the Spark to the
+Mac costs **15.8 t/s of prefill** and buys only **1.30 ms of decode**, because
+prefill costs `max(stage)` while decode costs `sum(stage)`: rebalancing recovers the
+whole stage difference for prefill, but for decode it merely swaps one stage's cost
+for the other's. Prefill is coordinator-bound (Mac GPU at 99-100 %, Spark ~74 % duty
+at `0:20`); decode is **not** GPU-bound on either machine (~71 % Mac, ~62 % Spark,
+never above 90 %) and is weight-bandwidth-bound at batch 1 — which is why the split
+barely moves it, and why speculation does not rescue it either.
 
 ### Full PRO Q4
 

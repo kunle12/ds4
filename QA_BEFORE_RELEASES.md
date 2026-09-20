@@ -1021,6 +1021,11 @@ loading code changes.
   WiFi/VPN routing.
 - Start workers first, then the coordinator.
 - Test a small prompt and a longer prompt.
+- Launch the worker in a terminal or under `launchd`: macOS has no `setsid`, and a
+  `setsid` wrapper silently loses the process. Give any `ssh` inside a backgrounded
+  job `-n`, or it hangs on the job's stdin. Judge readiness by the served payload —
+  a real completion, or `/v1/models` — never by the port being open, which happens
+  before the weights are mapped.
 - Verify the coordinator waits for a complete route and exits cleanly.
 - Verify `Ctrl+C` returns control after the current distributed token or chunk
   drains.
@@ -1028,11 +1033,15 @@ loading code changes.
 - If CUDA distributed is relevant, test across the CUDA hosts and record
   generation speed, not just "it works".
 - For GLM 5.3 Flash Q4_K across a Mac and a Spark, run the pipeline split
-  (`0:23` / `24:output`) with the coordinator serving HTTP and confirm a real
-  completion through it before recording numbers. At ctx 524288 this holds ~92 GiB
-  resident on the Spark. The `0:20` / `21:output` rebalance is faster (440 vs
-  389 t/s prefill, because the Mac's per-layer cost is the slower stage) but leaves
-  only ~12 GiB free, so run it at short context only. Afterwards check
+  coordinator `--layers 0:20` / worker `--layers 21:output`, with
+  `DS4_GLM_MEMORY_GUARD_RESERVE_GB=14` on the Spark, at ctx 524288, and confirm a
+  real completion through the HTTP coordinator before recording numbers. At
+  286,646 prompt tokens this measures 415.0 t/s prefill / 121.1 ms per token (an
+  11.5-minute ingest) against 356.3 t/s and 120.5 ms for `0:23` / `24:output`; at
+  39,865 tokens, 455.2 vs 398.8 t/s and 103.0 vs 98.5 ms. Spark memory is a
+  setting, not a limit: it plans 104.73 GiB of a 107.61 GiB budget and the Mac
+  82.22 GiB of 115.19 GiB, so this is the default at full context rather than a
+  short-context-only option. Afterwards check
   `journalctl -k | grep "r8127: enP7s7: link down"` — this NIC flaps intermittently
   on the Spark, and a flap aborts the run and can leave the host off the network
   until the interface state is re-established.
@@ -1057,7 +1066,9 @@ The server must keep compatibility across OpenAI, Responses, and Anthropic
 clients.
 
 - `GET /v1/models/deepseek-v4-flash` and `GET /v1/models/deepseek-v4-pro`
-  should both serve whichever GGUF is loaded.
+  should both serve whichever GGUF is loaded. With GLM 5.3 Flash loaded, the same
+  endpoint must advertise `glm-5.3-flash`, `glm-5.3-flash-chat` and
+  `glm-5.3-flash-reasoner`, each with `context_length` 524288.
 - Test OpenAI chat completion, OpenAI Responses, and Anthropic messages.
 - After tool-parser changes, run `make test-frontends` and
   `make test-session-state`. These targets do not load model weights. Repeat
@@ -1424,7 +1435,8 @@ context sweeps and memory limits.
 | Two M5 Max, Metal RDMA TP | GLM 5.2 IQ2_XXS, 4096-token prefill, 256 teacher-forced decode tokens | about 214 t/s | about 16.7 t/s |
 | M5 Max, Metal | GLM 5.3 full Q2 SSD, 16 GiB expert budget, section 7 commands | 12.59 t/s median | 6.14 t/s median |
 | DGX Spark, CUDA | GLM 5.3 Flash Q2, 2048-token prefill, 16 decode tokens | 531.39 t/s | 14.35 t/s |
-| Mac coordinator + DGX Spark worker, pipeline | GLM 5.3 Flash **Q4_K**, 28657-token prompt, ctx 32768 | 389.16 t/s (440.42 with `0:20`/`21:output`) | 10.3 t/s |
+| Mac coordinator + DGX Spark worker, pipeline | GLM 5.3 Flash **Q4_K**, 286,646-token prompt, ctx 524288 | 415.0 t/s (`0:20`/`21:output`); 356.3 t/s with `0:23`/`24:output` | 121.1 ms/token (`0:20`); 120.5 ms (`0:23`) |
+| Same pair, 39,865-token prompt | GLM 5.3 Flash **Q4_K**, ctx 524288 | 455.2 t/s (`0:20`); 398.8 t/s (`0:23`) | 103.0 ms (`0:20`); 98.5 ms (`0:23`) |
 | Strix Halo, ROCm | Flash 0731 IQ2, temperature-1 128-token code prompt | - | 16.26 ordinary; 12.28 opportunistic; 13.52 exact t/s |
 | 8x L40S, CUDA TP | Flash Q4, 2048-token prefill benchmark | 1524.84 t/s | 46.93 t/s |
 | 8x L40S, CUDA TP | Flash Q4, 16-row decode oracle | - | 126.0 aggregate t/s |

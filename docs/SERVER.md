@@ -29,8 +29,10 @@ relative runtime files such as Metal kernels can be found.
 | `POST /v1/completions` | Text completions |
 | `POST /v1/messages` | Anthropic-style messages |
 
-The Flash and PRO names accepted by the model endpoints are compatibility
-aliases, not separate loaded models. The GGUF passed at startup selects the model.
+The DeepSeek Flash and PRO names accepted by the model endpoints are compatibility
+aliases, not separate loaded models, and so are the GLM names: a GLM 5.3 Flash server
+advertises `glm-5.3-flash`, `glm-5.3-flash-chat` and `glm-5.3-flash-reasoner`, each
+with `context_length` 524288. The GGUF passed at startup selects the model.
 
 ```sh
 curl http://127.0.0.1:8000/v1/chat/completions \

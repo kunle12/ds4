@@ -25,12 +25,12 @@ in the tree and has been exercised end to end:
 
 The Q4 quality advantage is **not** an argument for the split. It is available
 single-machine with `--ssd-streaming` today — measured at **−34.4 % NLL against Q2
-on the 100-case fixture, better on 98 of 100 cases** (§2, log §4.7) — and it does
+on the 100-case fixture, better on 98 of 100 cases** (implementation log §4.5) — and it does
 reach **512K on this Mac**: the guard admits it (13.09 GiB decode, 102.00 GiB
 prefill transient of a 115.19 GiB budget) with a 5.84 GiB KV and a 70.90 GiB
 expert cache. What that route cannot hold is *speed at depth*: decode falls to
 **4.63–5.02 t/s** at 512K from 8.00 at 262K, and **MTP is a 22 % loss there**
-(log §4.6). So the split is a **speed-at-depth and predictability** decision — and
+(implementation log §4.4). So the split is a **speed-at-depth and predictability** decision — and
 ingest time — not a quality or capacity one.
 
 Payoff `[INFERENCE]`: pipeline prefill is `max(stage)` not `sum(stage)`, so the
@@ -48,7 +48,7 @@ depth confound):
 | --- | ---: | ---: |
 | Mac coordinator + Spark worker | **346.41 t/s** | 9.26 t/s |
 | Mac alone (whole model resident) | 186.89 t/s | **19.71 t/s** |
-| Spark alone, 512K | *wedges the box* (log §4.1b) | — |
+| Spark alone, 512K | *wedges the box* (implementation log §3.2, §8) | — |
 
 Two conclusions this forces, both of which contradict the earlier `[INFERENCE]`:
 
@@ -84,14 +84,21 @@ Acceptance (all must hold on the target hardware):
 3. **Throughput.** ≥ 150 t/s prefill and ≥ 10 t/s decode at 32K on the pair
    (today: 380.6 / 12.5 t/s for **Q2** on the pair; 82.5 / 8.0 t/s for **Q4** on
    one Mac). **Met 2026-09-20** for Q4_K: at ctx 32768 with a 28 657-token prompt
-   the pair prefills at **389.0 t/s** (2.6× the bar) and decodes at 10.2–10.35 t/s —
-   and **440.4 t/s** with the split rebalanced to Mac `0:20` / Spark `21:output`,
-   which moves prefill onto the faster per-layer machine (log §15).
+   the pair prefills at **389.0 t/s** (2.6× the bar) and decodes at 10.2–10.35 t/s.
+   The split was then swept, and **Mac `0:20` / Spark `21:output` is the recommended
+   configuration**: at ctx 524288 on a 286,646-token prompt it measures **415.0 t/s
+   prefill and 121.1 ms per token**, against 356.3 t/s and 120.5 ms for `0:23` /
+   `24:output` — +16.5 % prefill at depth with decode unchanged. It needs
+   `DS4_GLM_MEMORY_GUARD_RESERVE_GB=14` on the Spark, because the guard's 18 GiB
+   default refuses the larger slice. The rule behind the choice: moving one layer to
+   the Mac costs 15.8 t/s of prefill and buys only 1.30 ms of decode, because prefill
+   is `max(stage)` while decode is `sum(stage)` — so set the split for prefill
+   (implementation log §3.3, §4.3).
    The prefill bar was missed for as long as the GLM-specific Q4_K kernels held the
-   default — they prefill at 2.7× less (log §13) — and the fix was routing, not
-   tuning: `--dist-activation-bits 16`, `--dist-prefill-chunk` and
-   `--dist-prefill-window` change nothing measurable (log §14). Decode is met with
-   a 2–3 % margin at this scale and should not be read as headroom at 262K/524K.
+   default — they prefill at 2.7× less — and the fix was routing, not tuning:
+   `--dist-activation-bits 16`, `--dist-prefill-chunk` and `--dist-prefill-window`
+   change nothing measurable (implementation log §3.1). Decode is met with a 2–3 %
+   margin at this scale and should not be read as headroom at 262K/524K.
 4. **Capacity.** 262 144-token cold ingest completes in one session; 524 288
    context allocates and runs.
 5. **Thermal.** Board (`acpitz`) stays ≤ 88 °C for the whole ingest with the
@@ -107,7 +114,7 @@ Acceptance (all must hold on the target hardware):
    Two defects were cleared first: the worker's advertised data port was ephemeral
    until pinned with `--listen 127.0.0.1 55911`, and a KDA-layer sizing guard made
    any slice containing a KDA layer unsizeable (fixed in
-   `glm_layer_payload_tensor_bytes`; implementation log §11 and §6.1 #8).
+   `glm_layer_payload_tensor_bytes`; implementation log §7 and Appendix B).
 
 Non-goals for this work: tensor parallelism across Metal+CUDA (architecturally
 excluded), Q4 on a single Spark, MTP under the split (`ds4_engine_has_mtp`
@@ -130,9 +137,9 @@ Measured on the target pair unless noted.
 | Q2 pipeline with thermal caps on | 32 768 ctx: **380.6 t/s prefill, 12.5 t/s decode**; board 66–77 °C, `slowdown=Not Active` (vs 90 °C board and accumulating HW slowdown uncapped) |
 | Q4_K on the Mac alone (SSD streaming) | 32 768: 84.2 t/s / 8.8 t/s · 262 144: 82.5 t/s / 8.0 t/s (53 min ingest), 99.84 GiB plan, 5 435/12 384 experts cached, no thermal warning |
 | Spark thermals | idle 43–50 °C; under pipeline prefill board 60–90 °C, GPU die ~10 °C cooler; `HW Thermal Slowdown` + 69 s `SW Power Capping` observed uncapped |
-| Distributed snapshot (Q2 pipeline) | save verified 2026-09-19: a 649-token cold prompt wrote a 165.08 MiB checkpoint in 18.2 ms with the data connection observed on `127.0.0.1:55911`; the load path reported `cached_tokens: 819`. Equivalence on a fresh pair is still to be shown (log §11, §6.1 #7–8) |
-| Quality, Q2 vs Q4_K (100-case GLM 5.3 Flash fixture, this Mac, Metal) | Q4_K `0.300477636 / 90 / 9.480` vs Q2 `0.458177271 / 90 / 7.390`; paired **98/100 cases better**, NLL **−34.4 %**, first-token match equal. Both reproduce their published bands, and the Q4 layout's M3 Ultra Metal reference is matched to three decimals (log §4.7) |
-| Q4_K single-machine at 512K (the alternative to the split) | **viable**: guard needs 13.09 GiB decode / 102.00 GiB prefill-transient of a 115.19 GiB budget, KV 5.84 GiB, 70.90 GiB expert cache (5378 experts). But **decode falls to 4.63–5.02 t/s** (from 8.00 at 262K), and **MTP at depth is a 22 % loss** (5.02 → 3.88 → 4.90 bracketed), so no lever remains on that route (log §4.6) |
+| Distributed snapshot (Q2 pipeline) | save verified 2026-09-19: a 649-token cold prompt wrote a 165.08 MiB checkpoint in 18.2 ms with the data connection observed on `127.0.0.1:55911`; the load path reported `cached_tokens: 819`. Equivalence on a fresh pair is still to be shown (implementation log §7, Appendix B) |
+| Quality, Q2 vs Q4_K (100-case GLM 5.3 Flash fixture, this Mac, Metal) | Q4_K `0.300477636 / 90 / 9.480` vs Q2 `0.458177271 / 90 / 7.390`; paired **98/100 cases better**, NLL **−34.4 %**, first-token match equal. Both reproduce their published bands, and the Q4 layout's M3 Ultra Metal reference is matched to three decimals (implementation log §4.5) |
+| Q4_K single-machine at 512K (the alternative to the split) | **viable**: guard needs 13.09 GiB decode / 102.00 GiB prefill-transient of a 115.19 GiB budget, KV 5.84 GiB, 70.90 GiB expert cache (5378 experts). But **decode falls to 4.63–5.02 t/s** (from 8.00 at 262K), and **MTP at depth is a 22 % loss** (5.02 → 3.88 → 4.90 bracketed), so no lever remains on that route (implementation log §4.4) |
 
 ---
 
@@ -346,10 +353,11 @@ and completes it (186.89 / 19.71 t/s, measured); the Spark does **not** — the 
 driver refused the allocations outright (`NVRM: … Out of memory [NV_ERR_NO_MEMORY]
 … _memdescAllocInternal`), logging stopped inside 7 seconds, and the box reset
 abruptly 19 minutes later with the watchdog never armed and zero guard ABORTs
-(log §4.1b). The guard's budget derives from system RAM and does not include NVRM's
+(implementation log §3.2, §8). The guard's budget derives from system RAM and does not include NVRM's
 own reservation, so it cannot authorise a whole-model run on that box. The **split
-slices are the supported shape**: `0:23` and `24:output` measured 94.88 and
-92.07 GiB, and the pair ran a 403K ingest at 67 °C with the machine responsive.
+slices are the supported shape**: the recommended `0:20` / `21:output` plans
+82.22 GiB on the Mac and 104.73 GiB on the Spark (of 107.61 with the 14 GiB
+reserve), and the pair ran a 403K ingest at 67 °C with the machine responsive.
 
 ---
 
@@ -378,7 +386,7 @@ or a new transport.
 Already done ahead of the workstreams: the snapshot **save** half of WS 7 was
 verified on 2026-09-19 for the `0:23` / `24:output` split, with the data connection
 observed on `127.0.0.1:55911`. The load path was exercised but its equivalence
-still needs the fresh-pair restore in §6 item 5 (implementation log §11,
+still needs the fresh-pair restore in §6 item 5 (implementation log §7,
 §6.1 #8). The boundary gates in this workstream also remain.
 
 **Order of work matters:** land the *prefill* path first (2) so a long ingest can
@@ -410,7 +418,7 @@ Layered, cheapest first; each layer must pass before the next is trusted.
 5. **Capacity/long-context.** 262 144 cold ingest, then 524 288 alloc + a short
    generation; snapshot save, restore on a fresh pair, and restore with the
    roles swapped (topology-neutral checkpoint). Save and load on a live pair are
-   **verified** for the `0:23` / `24:output` split (log §11); the fresh-pair and
+   **verified** for the `0:23` / `24:output` split (implementation log §7); the fresh-pair and
    roles-swapped restores remain.
 6. **Thermal endurance.** Same runs with the guard armed at 88 °C band: record
    peak board per frontier, require zero thermal events and completion without
@@ -428,7 +436,7 @@ Layered, cheapest first; each layer must pass before the next is trusted.
 | Templating the tuned kernels perturbs Q2_K codegen (register pressure, shared-memory layout) | Q2_K regression | instantiate and benchmark both; keep the Q2_K path byte-run-identical where possible and gate with the existing Q2 fixtures |
 | Cross-backend numeric drift larger than tolerance (CUDA f32 mid vs Metal FP16) | fails acceptance | choose and document the intermediate; if drift is structural, adopt the repo's precedent of a tolerance + selected-token gate rather than forcing bit-identity |
 | Spark thermal trip during endurance runs | lost work, hardware risk | caps installed; guard aborts at 95 °C; bounded runners with cool-downs; peak-board recorded |
-| Tunnel drops mid-ingest (it is the transport, since the firewall route is closed) | aborted 250K run | `launchd` `KeepAlive` restart-on-failure; snapshot before long steps; the two-forward form is verified end to end (save and load, log §11) |
+| Tunnel drops mid-ingest (it is the transport, since the firewall route is closed) | aborted 250K run | `launchd` `KeepAlive` restart-on-failure; snapshot before long steps; the two-forward form is verified end to end (save and load, implementation log §7) |
 | Time: the port expands (decode variants, IQ2_XXS, boundary bugs) | slip | ship prefill first; the fallbacks in §9 remain valid throughout |
 
 ---
@@ -449,7 +457,7 @@ Layered, cheapest first; each layer must pass before the next is trusted.
   the ported GLM-specific Q4_K kernels are a reachable-by-hatch fallback covered
   by `make test-glm53-moe-q4k`. The reason is mechanism: the generic path uses
   tensor-core tile16 Q4_K kernels, the ported ones do not. This is the difference
-  between criterion 3 passing and failing (implementation log §13).
+  between criterion 3 passing and failing (implementation log §10).
 * Update, in the same change set: `docs/DGX_SPARK.md` §GLM 5.3 (state that Q4 is
   the pipeline target and needs both machines), `MODELS.md` (the two-machine Q4
   row), `docs/DISTRIBUTED.md` (a Q4 pipeline example), and
@@ -466,7 +474,7 @@ Layered, cheapest first; each layer must pass before the next is trusted.
 | --- | --- | --- |
 | Q4 quality, long context, one machine | Mac alone + `--ssd-streaming` | 82.5 t/s prefill, 8.0 t/s decode at 262K; 53 min cold ingest; 99.84 GiB plan |
 | Best throughput available on the pair | Q2 pipeline (Mac coord + Spark worker) | 380.6 t/s prefill, 12.5 t/s decode at 32K, board 66–77 °C |
-| Q2, one machine | **Mac resident** — not the Spark at 512K | Mac, whole model, ctx 524288, 403K prompt: **186.89 t/s prefill, 19.71 t/s decode** (measured 2026-09-19). The Spark's repo-QA figure (531 / 14.35 t/s) is at a smaller context; a whole-model 512K run **wedged the box** (log §4.1b) |
+| Q2, one machine | **Mac resident** — not the Spark at 512K | Mac, whole model, ctx 524288, 403K prompt: **186.89 t/s prefill, 19.71 t/s decode** (measured 2026-09-19). The Spark's repo-QA figure (531 / 14.35 t/s) is at a smaller context; a whole-model 512K run **wedged the box** (implementation log §3.2, §8) |
 
 ---
 
@@ -495,7 +503,7 @@ Layered, cheapest first; each layer must pass before the next is trusted.
    boundary — not on a throughput comparison. And the measurement now removes the
    worry that this gives something up: at 512K on the single-machine route **MTP is
    a 22 % loss** (5.02 → 3.88 → 4.90 t/s bracketed, acceptance collapsing at depth,
-   log §4.6), so nothing is being surrendered by excluding it under the split.
+   implementation log §4.5), so nothing is being surrendered by excluding it under the split.
    What is *not* yet measured is the Q4 pair's decode and prefill at 262K/524K,
    blocked behind WS 1–2. The pair's numbers so far are **Q2** (12.48 t/s at 32K,
    11.42 at 131K) and cannot be set against a single-Mac **Q4** figure: different
