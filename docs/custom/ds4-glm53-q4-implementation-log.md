@@ -9,40 +9,55 @@ entry.
 workstreams), `ds4-technical-analysis.md` (engine), `ds4-v41-split-design.md`
 (the analogous V4.1 port study).
 
+**Contents.** §1 status · §2 source changes · §3 chronological log (Phases A–X) ·
+§4 measurements · §5 defects and disposition · §6 corrections · §7 artifacts and host
+configuration · §8 open decisions · §9 next steps and open workstreams · §10 quick
+acceptance commands · §11 snapshot round-trip.
+
 Timestamps are local (AEST). Entries marked `≈` are reconstructed from ordering
 rather than read from a log; all quoted numbers and command outputs are
 verbatim from the session.
 
 ---
 
-## 1. Status summary (as of 2026-09-19 18:00)
+## 1. Status summary
 
-**Objective.** Run `GLM-5.3-Flash-Q4_K.gguf` (177.77 GiB, `glm5-next`, 45
-executable layers) as a two-machine pipeline — Mac Studio coordinator + DGX
-Spark worker — for 250K–500K-token coding sessions, with the Spark inside its
-thermal envelope.
+**Objective.** Run `GLM-5.3-Flash-Q4_K.gguf` (177.77 GiB, `glm5-next`, 45 executable
+layers) as a two-machine pipeline — Mac Studio coordinator + DGX Spark worker — for
+250K–500K-token coding sessions, with the Spark inside its thermal envelope.
+
+*Last updated 2026-09-20. This table is the entry point; the phases and sections it
+points at hold the evidence. Where a number appears here it is the latest measured
+one, and earlier revisions of this table are superseded rather than preserved.*
+
+**Where it stands.** Q4_K runs on the pair at **389 t/s prefill / 10.3 t/s decode**
+(ctx 32768, 28 657-token prompt), or **440 t/s** with the split rebalanced — against
+a ≥150 t/s criterion. What is outstanding is verification breadth, not capability.
 
 | Area | State |
 | --- | --- |
-| GLM 5.3 layer-slice correctness (wire width) | **done, validated bit-exact** |
-| Cross-machine Q2 pipeline | **working and measured** |
-| Distributed snapshot round-trip across the split | **save verified 2026-09-19** (165 MiB checkpoint, worker's shard fetched over the data forward); load path exercised and reported a hit — equivalence still needs the fresh-pair restore (§6.1 #8) |
-| Q4_K on the pair | **working and measured** — WS 2, WS 3 and WS 5's first slice landed (log Phases M–P): correct output (logits byte-identical to the warp path, top-16 16-of-16 against the Metal reference), **100.6 t/s prefill / 11.4 t/s generation** against 40.8 / 5.7 for Mac-only streaming — 2.47× and 1.99×, so the ≥2× gate passes. Phases N and O fixed the pre-existing 256-vs-288 hardcoding in the expert map and the expert-major grid, and tightened a third site (the tile slack) that was sufficient rather than broken; Phase P fixed a swiglu clamp the CUDA MoE ignored, which improved agreement with the Metal reference (mean \|Δ\| 0.085 → 0.073). `make test-glm53-moe-q4k` passes bit-exact. The MTP tok2 and scalar paths still refuse Q4_K by name, unverified |
-| Q4_K on the Mac alone | **working and measured** (SSD streaming) |
-| Spark thermal protection | **installed, enabled, verified live**; re-armed by itself after the 2026-09-19 power cycle |
-| Access path (macOS ALF workaround) | **installed as a boot-persistent launchd daemon, verified**; carries both forwards (`-R` control, `-L` data for snapshots) |
-| Binaries deployed to `~/bin` on both hosts | **rebuilt 2026-09-19 from byte-identical sources and reinstalled** (`ds4.c` md5 `98c92891…` on both) |
-| Spark wedge, 2026-09-19 | two resident workers left the box with a live kernel and dead userland; **physical power cycle**, then a mandatory clean-slate precondition (plan §4.3) |
-| Plan for closing the Q4 gap | **written** (`ds4-glm53-q4-split-design.md`) |
-| Fork and branch | **pushed** — `customisation` on `kunle12/ds4`, HEAD `1b82376`, 9 commits ahead of upstream `8db1d1d` |
+| GLM 5.3 layer-slice correctness (wire width) | **done, validated bit-exact** (§2 #1–3, Phase B) |
+| Cross-machine Q2 pipeline | **working and measured** — 346.41 t/s prefill / 9.26 t/s decode at 403K (§4.1, §4.1b) |
+| **Q4_K on the pair** | **working, measured, and the default** — 389 t/s prefill / 10.3 t/s decode (§4.8). Phase S found the GLM-specific Q4_K kernels 2.7× slower than the pre-existing generic ones, so a homogeneous Q4_K trio routes to the generic dispatch and the ported kernels became the fallback |
+| Q4_K on the Mac alone | **working and measured** — SSD streaming, 82.47 t/s prefill at 262K (§4.2) |
+| Criterion 3 (≥150 t/s prefill, ≥10 t/s decode at 32K) | **met** — 389.0 t/s and 10.2–10.35 t/s (§4.8, Phase T); decode's margin is 2–3 % and is *not* headroom at 262K |
+| Criteria 1, 2, 4, 5 (oracle, boundaries, capacity, endurance) | **not run** — WS 6, 7, 8; see §9 |
+| Distributed snapshot round-trip (criterion 6) | **save and load verified on a live pair** (§11); fresh-pair and roles-swapped restore still open |
+| Spark thermal protection | **installed, enabled, verified live**; re-arms by itself after a power cycle |
+| Access path | **no tunnel required as of 2026-09-20** — macOS 26.7 accepts non-loopback connections from these binaries (Phase V). `~/ds4-tunnel` is retained as a documented fallback, not a dependency |
+| Spark `r8127` 10GbE flapping | **known DGX Spark issue, mitigated not solved** — EEE disabled (Phase U). This unit measures clean (0 % packet loss, 0 `rx_errors`) where the reported units do not, so an RMA is not the obvious path |
+| GLM 5.3 Flash served under its own model id | **fixed 2026-09-20** (Phase X) |
+| Binaries on both hosts | **2026-09-20 15:03 (Mac) / 15:09 (Spark)**, redeployed together |
+| Fork and branch | `customisation` on `kunle12/ds4`, pushed, HEAD `dda8d89` |
+| Plan | `ds4-glm53-q4-split-design.md`; WS 1–3 and 9 landed, 4/5/7 partial, 6/8 open (§9) |
 
-**Next action:** workstream 1 of the plan — type traits + dispatch predicate for
-the GLM routed MoE (`{Q2_K, Q4_K}`), then WS 2 (Q4_K prefill), which is the first
-milestone that makes a 262K Q4 ingest measurable behind the guard.
+**Nothing is running** beyond the tunnel daemon (Mac, now optional) and the thermal
+guard (Spark). No `ds4` processes are left on either host.
 
-**Nothing is running** except the tunnel daemon (Mac), the thermal guard (Spark),
-and — as of this writing — the Q2 pair parked in the working configuration that
-§10 restarts, so the rebuilt binaries can be exercised without a reload.
+**Next action:** the verification workstreams the implementation has outrun — WS 6
+(cross-machine oracle), WS 7's boundary gates, WS 8 (262K ingest, 524K alloc, thermal
+endurance) — plus the two measurements left truncated: decode for the `0:20` /
+`21:output` split, and an EEE-on/off load comparison.
 
 ---
 
@@ -57,9 +72,12 @@ and — as of this writing — the Q2 pair parked in the working configuration t
 | 5 | `ds4.c:61000` (`glm_layer_payload_tensor_bytes`, KDA branch) | the branch no longer rejects the payload header's **uniform** `compact_live`/index counts; it returns the conv + recurrent state span and asserts it is non-zero | the guard made any slice containing a KDA layer unsizeable as soon as a context existed, so the first distributed checkpoint failed with `distributed KV shard tensor size overflow` | snapshot save **and** load verified end to end (§11) |
 | 6 | `ds4.c:46076` (`glm_graph_layer_uses_generic_routed_moe`) | the Q4_K branch is now **unconditional**: a homogeneous Q4_K expert trio always routes to the generic dispatch. ~~`DS4_GLM_GENERIC_MOE_Q4K`, added to gate it while the port was being written, **removed 2026-09-20**~~ | a spike shortcut to exercise Q4_K on CUDA before the kernel port exists; its own comment said remove or make unconditional once the result is measured. Both paths were then measured against each other on the pair — speed and output — and the shortcut turned out to be **2.7× faster** (258.9 vs 95.3 t/s prefill, identical output), so it was promoted rather than dropped; see §13 | Q4_K now defaults to the generic dispatch; the GLM-specific Q4_K kernels stay reachable via `DS4_CUDA_GLM_MOE_TYPES` and are still covered by `make test-glm53-moe-q4k` |
 
+| 7 | `ds4_server.c:14951` (`send_models`, GLM branch) | advertise ids derived from `server_model_id_from_engine()` plus `-chat` / `-reasoner`, instead of three hardcoded `glm-5.2` literals | that branch keys on the GLM *family*, which covers 5.2 and 5.3 alike, so a GLM 5.3 Flash model was advertised as `glm-5.2*` | `/v1/models` returns `glm-5.3-flash` and its aliases, and a live request under that id returned `ALIAS OK` (Phase X) |
+
 Changes 1–3 are the fix that makes GLM 5.3 pipeline mode work at all; change 4 is
 required for the `~/bin` deployment convention; change 5 unblocks distributed
-checkpoints; change 6 is an experiment, not part of the design.
+checkpoints; change 6 promoted the pre-existing generic Q4_K dispatch to the default
+after measurement (Phase S); change 7 corrects the served model id.
 
 **Not in the repository** (host-level, staged outside the tree): the Spark
 thermal-protection scripts/units (§7) and the launchd tunnel job (§7). Both are
@@ -372,6 +390,417 @@ still refuse Q4_K.
 
 ---
 
+### Phase R — Q2 standalone regression check (baseline comparison)
+
+The question this answers: did any of the GLM Q4_K work break the **existing** Q2
+paths on a single machine? Q2 is the shipped sparse recipe and shares a binary
+with the Q4_K work, so it had to be checked, not assumed.
+
+**Where the changed code actually lives.** All 67 hunks in `ds4_cuda.cu` are
+inside GLM-named functions — `ds4_gpu_glm_routed_moe_batch_tensor`,
+`..._one_tensor`, `..._direct_scalar_q4_tensor` and their `glm_routed_moe_*` /
+`glm_moe_*` kernels — with **zero** non-GLM hunks. Those entry points have
+exactly one non-test caller each: `ds4.c:48508`, `48647`, `48678`, all inside the
+GLM branch of the layer-MoE dispatch. `ds4.c`, `ds4_distributed.c`,
+`ds4_metal.m`, `ds4_tp.c`, `ds4_gpu.h`, `ds4_agent.c` and `ds4_server.c` are
+**byte-identical to baseline**. The Makefile change only adds a test target;
+`ds4_cli.c` adds the env banner, which writes to stderr only and only when one of
+the nine switches is set.
+
+**Why Q2 never reaches the changed code.** The dispatch decides by tensor type:
+
+```c
+/* IQ2_XXS gate/up with a Q2_K down is the shipped sparse recipe and has
+ * always been served by the generic routed-MoE dispatch. */
+if (l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS) return true;
+```
+
+`glm_graph_layer_uses_generic_routed_moe` returns true for that recipe, and the
+caller then returns `ds4_gpu_routed_moe_batch_tensor` — the generic dispatcher,
+untouched by this work. Only a homogeneous **Q4_K** trio (type 12) falls through
+to the GLM-specific path that was fixed. That is also the mechanical explanation
+for the zero trace lines in the Q2_K runs discussed above.
+
+**Measured, not argued.** A baseline binary built from `8655de7` (the commit
+before this work, verified to differ from the current build) was run against the
+current binary — same model, same prompt, greedy decode, one machine with no
+`--role`, i.e. the standalone path — comparing generated text byte-for-byte:
+
+| model | baseline | current | result |
+| --- | --- | --- | --- |
+| GLM 5.3 Flash Q2 | 348 bytes, exit 0 | 348 bytes, exit 0 | identical |
+| DeepSeek V4 Flash Q2 | 347 bytes, exit 0 | 347 bytes, exit 0 | identical |
+
+`--dump-tokens` is *not* a valid check here: it tokenizes the prompt and exits
+before decoding, so it exercises none of this path. The comparison above is on
+generated text, which runs the decode path.
+
+**V4.1 is not measured, and here is exactly what covers it.** No V4.1 language
+model exists on either machine: `/Users/xun/mlmodels/deepseekv4/` holds only the
+970 MB `DeepSeek-V4.1-Flash-Vision.gguf` encoder, and the Spark holds no V4.1
+file at all. So a V4.1 Q2 run was not possible. What makes it safe is that every
+file implementing V4.1 behaviour (`ds4_engine_is_deepseek41` in `ds4.c`, the
+DSML4.1 syntax in `ds4_agent.c`, the model id in `ds4_server.c`, `ds4_tp.c`) is
+byte-identical to baseline, and a V4.1 Q2 model routes by the same type-based
+rule to the same untouched dispatcher. That is inference from identical inputs,
+not a measurement — if a V4.1 Q2 GGUF appears, repeat the check above against it.
+
+### Phase S — Which Q4_K dispatch is the default, and why (2026-09-20)
+
+**The short version: the ported GLM-specific Q4_K kernels are correct but slow,
+and the pre-existing generic dispatch is 2.7× faster at prefill. Q4_K now routes
+there by default, and criterion 3's prefill bar is met for the first time.**
+
+**Why both paths had to be measured before removing the spike.** Plan §8 said to
+"drop it when [WS 1–2] land, or promote it deliberately — do not leave two
+dispatch paths unexamined", and §8's own note had already argued *against*
+destroying the comparison early, because the spike was "the only artefact of the
+Q4_K-on-CUDA comparison". So the gate came out only after the two were run against
+each other. That was the right order, because the result contradicted the
+workstreams' premise.
+
+**The measurement.** Same pair, same 1091-token prompt, greedy `-n 64`, the only
+difference being which dispatch each host's layers take. The GLM dispatch prints a
+per-call trace, so the trace doubles as the discriminator that the intended path
+was really taken — 0 lines means the generic dispatch ran, and a non-zero count
+means the GLM one did. That matters: an earlier comparison in this project was
+void precisely because a switch silently failed to apply.
+
+| config | Mac | Spark | Spark trace | prefill | decode | 64-token output |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| A | GLM-specific (Metal) | GLM-specific (CUDA) | 1344 | **95.25 t/s** | 11.18 t/s | reference |
+| B | GLM-specific (Metal) | **generic** (CUDA) | **0** | **257.42 t/s** | 11.26 t/s | identical |
+| D | **generic** (Metal) | **generic** (CUDA) | **0** | **258.92 t/s** | 11.37 t/s | identical |
+
+All three outputs are **byte-identical over 64 greedy tokens** (300 bytes each).
+D is the configuration an unconditional rule produces, which is why it was run: the
+predicate lives in shared `ds4.c`, so promoting the spike also moves the **Metal**
+side, and that side is what this project spent all its time validating against.
+
+**Why the generic path wins, mechanically.** Not tuning luck — tensor cores. The
+generic dispatch's Q4_K path selects `moe_gate_up_mid_q4K_tile16_mma_kernel<512>`
+and `moe_down_q4K_tile16_mma_kernel<512>` (`ds4_cuda.cu` ~25236 / ~25711, gated by
+`use_q4_mma_tiles16`). The WS 2/3 port instantiated `glm_routed_moe_*_tile8_*`
+kernels, which do not use MMA. On a GB10 that is the whole difference.
+
+**What changed.** `glm_graph_layer_uses_generic_routed_moe` now returns true for a
+homogeneous Q4_K trio unconditionally; the `DS4_GLM_GENERIC_MOE_Q4K` gate is gone.
+The GLM-specific Q4_K kernels remain reachable through `DS4_CUDA_GLM_MOE_TYPES`
+and are still covered directly by `make test-glm53-moe-q4k`, so the port is not
+dead code — it is a reference implementation and a fallback, not the default.
+
+**Verified on the promoted default, with no routing variable set anywhere:**
+
+| check | result |
+| --- | --- |
+| Spark GLM-dispatch trace | **0** — the generic dispatch is now the default |
+| Mac startup banner | names no routing switch (proves nothing was set) |
+| prefill / decode | **257.71 t/s** / 11.34 t/s (was 95.25 / 11.18) |
+| 64-token output | byte-identical to run A |
+| `make test-glm53-moe-q4k` | PASS, `worst rel = 0.000e+00`, exit 0 |
+
+**Consequences, stated plainly.**
+
+1. **Criterion 3's prefill bar is met.** It required ≥ 150 t/s at 32K on the pair;
+   the ported path measured 100.57 t/s and could not reach it, and the promoted
+   default measures 257.71 t/s at ctx 8192. The 32K-context confirmation is the
+   remaining formality.
+2. **WS 2/3's premise was wrong, and the log should say so rather than bury it.**
+   Those workstreams existed to give the GLM-specific dispatch Q4_K support so it
+   could supersede the spike. The kernels are correct and now covered by a parity
+   test, but the dispatch was never the bottleneck the plan treated it as: a
+   cheaper path already existed and is faster. The plan's judgement that the spike
+   was a stopgap to be superseded was reasonable on the evidence available, and
+   measuring both is what settled it.
+3. **The next lever is load balance, not the Mac.** B (257.42) and D (258.92) are
+   within noise of each other, so the Mac's routing choice does not move
+   throughput at all — the Spark's stage is the critical path. Prefill on a
+   pipeline is `max(stage)`, and the split currently gives the Mac 24 layers and
+   the Spark 22; giving the Spark fewer should raise the maximum. That is
+   measurable with the existing harness and is the obvious next experiment.
+
+### Phase T — Criterion 3 measured at its stated scale (2026-09-20)
+
+Criterion 3 asks for "**≥ 150 t/s prefill and ≥ 10 t/s decode at 32K on the
+pair**". Everything measured up to this point was a 1091-token prompt at ctx
+8192, where pipeline fill/drain dominates the average and the number understates
+what the pair does on a real ingest. This is the measurement the criterion
+actually asks for: **ctx 32768, a 28 657-token prompt**, greedy `-n 16`.
+
+| run | order | flags | prefill | decode |
+| --- | --- | --- | ---: | ---: |
+| base | 1st (cold) | — | 340.49 t/s | 10.13 t/s |
+| bits16 | 2nd | `--dist-activation-bits 16` | 389.03 t/s | 10.21 t/s |
+| chunk4096 | 3rd | `--dist-prefill-chunk 4096` | 389.21 t/s | 10.29 t/s |
+| window8 | 4th | `--dist-prefill-window 8` | 389.28 t/s | 10.35 t/s |
+| **base (control)** | **5th** | **—** | **389.04 t/s** | 10.21 t/s |
+
+**Criterion 3 is met, with margin: 389.0 t/s against a 150 t/s bar (2.6×).**
+
+**The three tuning flags do nothing, and the control is what proves it.** The
+first four runs make it look as though `--dist-activation-bits 16` and the two
+chunking flags each buy ~14 %. They do not: base run **last, with no flags at
+all**, lands at 389.04 t/s — indistinguishable from the three "tuned" runs. The
+spread is run order: the first run after an idle period is ~14 % slower (cold
+caches, clocks still ramping) and everything thereafter converges to 389.0 ± 0.3
+t/s. Without that fifth run I would have reported three gains that do not exist,
+and the plan would have carried a tuning recommendation that is noise.
+
+**Output is unaffected by all four configurations** — byte-identical across base,
+bits16, chunk4096 and window8. That matters for `--dist-activation-bits 16`
+specifically, since it *does* change wire numerics by design; on this prompt it
+did not change the greedy output. It is still not worth enabling: no measured
+gain, and a documented numerical change is a cost with no benefit here.
+
+**Measurement caveat worth carrying forward.** The warm-up spread is ~14 %, which
+is larger than any effect the tuning knobs might have. Single-run comparisons
+below ~15 % are not resolvable on this pair; anything claiming a smaller win needs
+repeats, and the first run after an idle period should be discarded or repeated.
+
+**Decode is met but thin.** 10.21–10.35 t/s against a ≥ 10 t/s bar is a 2–3 %
+margin, and decode falls with depth (the plan's own single-Mac figures drop from
+8.00 t/s at 262K to 4.63–5.02 at 512K). This measurement is at 32K, so the bar is
+met *at the scale the criterion states* — but it should not be read as headroom at
+262K or 524K, where criterion 4's runs will land.
+
+**What actually fixed it.** Not tuning: the routing. The ported GLM-specific Q4_K
+kernels were the default and are 2.7× slower per layer (§13); promoting the generic
+dispatch took the same configuration from ~95 t/s to 389 t/s at 32K. The 32K
+prompt then removed the fill/drain effect that made the 1091-token number look
+worse still.
+
+### Phase U — Load balance: the lever is real, and the first test of it was invalidated by a NIC fault (2026-09-20)
+
+**Per-stage telemetry, ctx 32768, 28 657-token prompt** (`--debug`, coordinator's
+view of the worker; the worker's own lines are not emitted, so the Mac's stage is
+derived). Seven prefill chunks of 4096 (one 4081):
+
+```
+request=1 hop=0 layers=24:44 pos=0     tokens=4096 eval=5189.744ms input=256.02MiB
+request=2 hop=0 layers=24:44 pos=4096  tokens=4096 eval=5466.542ms input=256.02MiB
+...                                                       (chunks 3-6: 5498-5551ms)
+request=7 hop=0 layers=24:44 pos=24576 tokens=4081 eval=5603.423ms input=255.08MiB
+request=8 hop=0 layers=24:44 pos=28657 tokens=1    eval=59.221ms  input=0.06MiB   <- decode
+```
+
+| stage | layers | per chunk | per layer |
+| --- | ---: | ---: | ---: |
+| Spark (CUDA worker) | 21 | ~5.50 s | ~0.262 s |
+| Mac (implied, coordinator) | 24 | ~9.75 s | ~0.406 s |
+
+Total 28657 / 389.05 = 73.7 s for 7 chunks; the worker accounts for 43.4 s of
+evals, so the coordinator's stage is the slower one and prefill is bound by it.
+
+**Two consequences.**
+
+1. **The wire is not a factor, which independently explains §14's null result.**
+   Each chunk carries 256.02 MiB of activations (~0.23 s at 10GbE) against a
+   5.5 s stage — about 2 %. So `--dist-activation-bits 16` *could not* have shown a
+   measurable gain, and the telemetry says so independently of the run that
+   measured nothing.
+2. **Rebalancing should pay ~17–25 %** — in the direction of moving layers *from*
+   the Mac *to* the Spark (21/25 and 18/28 were the predicted ~8 % / ~17 % / ~25 %
+   steps), and that is also the memory-safe direction for the Mac.
+
+**What actually stopped the run was the network, not the memory — and my first
+account of this was wrong.** I originally attributed it to the 25-layer memory
+footprint exhausting the box, and said so. The evidence contradicts that, and the
+correction matters because it changes both the cause and the conclusion.
+
+The previous boot's kernel journal (recovered after the reset; the application log
+was in tmpfs and was lost) says:
+
+```
+13:08:05 kernel: r8127: enP7s7: link down
+13:08:10 kernel: r8127: enP7s7: link up
+13:08:15 r8127: enP7s7: link down   / systemd-networkd: enP7s7: Lost carrier
+13:08:19 r8127: enP7s7: link up     / Gained carrier      (5 cycles, ~32 s)
+13:08:33 r8127: enP7s7: link down
+13:08:37 r8127: enP7s7: link up     <- last link event of the boot
+```
+
+- **No OOM kill was ever invoked that boot** (`oom mentions: 0`).
+- **The box was never wedged.** It stayed alive and healthy throughout: cron ran at
+  13:15:01 and 13:17:01, `systemd-resolved` logged continuously, the thermal guard
+  kept reporting `board=50C gpu=48, 2093MHz, 7.80W, 0% slowdown` — idle and cool,
+  which also rules out a thermal trip and a compute crash.
+- What broke was the **direct 10GbE link**: `enP7s7`, driver `r8127`, carrying
+  `192.168.2.2/24`, flapped five times in ~32 seconds starting at **13:08:05**. It
+  recovered at 13:08:37, but the host's network state did not — NetworkManager went
+  to `CONNECTED_SITE` at 13:11:33 and DNS to 192.168.0.1 degraded on a loop — so the
+  box stayed off the network until the reset. `ping` failing while the LAN gateway
+  answered in 0.86 ms is exactly what a link-layer fault at this end looks like; I
+  read it as "the box is gone" when it was "the box is up and off the network".
+
+**So the rebalance failure is explained without invoking memory at all.** The b21
+worker started at 13:08:04 (the last successful ssh login logged), inside the flap
+window, and the coordinator never saw its slice — `distributed route incomplete:
+missing layer 21` is what a worker that cannot hold a link to the coordinator
+produces. The 25-layer memory question was never actually exercised.
+
+**The bound I stated is withdrawn.** "The Spark cannot hold more than ~22 layers,
+so the balance lever is closed" does not follow from this evidence and is not
+established — the experiment that would have tested it was invalidated by the NIC.
+The lever is therefore **still open**, and the prediction above (Mac→Spark
+rebalancing worth ~17–25 %, since the Mac's 0.406 s/layer against the Spark's
+0.262 binds prefill) has not been tested. It should be re-run now that the link is
+healthy — with the memory budget checked *before* the run, which is the part of the
+original caution that still stands.
+
+**Re-run, and the lever is confirmed: +13.2 %.** With the NIC fault ruled out (link
+events constant at 1 across every run) and the Spark's memory watched live through
+each run, the same split comparisons now complete:
+
+| config | Mac layers | Spark layers | prefill | min free RAM on the Spark |
+| --- | ---: | ---: | ---: | ---: |
+| base | 24 | 22 | **389.16 t/s** | 24 GiB |
+| **21 / 25** | 21 | **25** | **440.42 t/s** | 12 GiB |
+| base (control, run last) | 24 | 22 | **389.16 t/s** | 24 GiB |
+
+**+13.2 %** — the telemetry predicted ~13 % from `Mac 21 × 0.406 s = 8.53 s/chunk`
+against base's 9.75, and that is what it delivers. So prefill on this pair is
+**440 t/s**, 2.9× criterion 3's 150 t/s bar, by moving three layers from the Mac to
+the Spark.
+
+**This also refines §14's caveat, which was too pessimistic.** The two base runs are
+identical to **0.01 %** (389.16 both). The ~14 % spread seen earlier was the
+cold-first-run effect specifically, not general run-to-run noise: a warm baseline
+reproduces that tightly. So small differences *are* resolvable here — which makes
+the tuning-flags null result *stronger*, not weaker: `--dist-activation-bits 16`,
+`--dist-prefill-chunk 4096` and `--dist-prefill-window 8` each landed within 0.1 %
+of the base control, i.e. they were measured at high precision and genuinely do
+nothing.
+
+**Memory is now the binding constraint, and that is what stops the sweep.** At 25
+layers the Spark has **12 GiB** free (24 GiB at 22 layers) — roughly one more layer
+of headroom, not three. The remaining predicted step (19/27, ~487 t/s) would leave
+low single-digit GiB and was deliberately **not** run: the last attempt to grow this
+slice already cost a hard reset, and the gain left on the table (~+5–10 %) does not
+justify repeating that risk. The recommendation is therefore **Mac `0:20` / Spark
+`21:output`** — the measured 440 t/s with 12 GiB to spare — and any further gain has
+to come from making the Mac faster per layer, not from moving layers onto a machine
+that is already at 90 % of its RAM.
+
+**A harness bug of mine aborted the first re-run and is worth recording**, because it
+looked exactly like a system failure: I had added `missing layer` to the early-abort
+pattern, but `waiting for distributed route: distributed route incomplete: missing
+layer N` is a *normal transient* while the worker registers. All three runs
+(including the base configuration that had just worked) were killed by my own script
+before the route completed — the coordinator's log ended with `distributed route
+ready` and the worker's with `coordinator disconnected`. The evidence that cleared
+the system was the instrumentation added after the earlier misdiagnosis: link events
+stayed at 1 (so not the NIC) and the worker had loaded `resident model 86.32 GiB =
+89.39 GiB planned` (so not memory).
+
+**A hardware item worth watching.** `r8127` (Realtek 10GbE) flapping under
+sustained load is a known class of fault — cable, connector, 10GBASE-T thermal
+behaviour or EEE/ASPM. It happened once, at the start of a heavy transfer, and has
+not recurred since the reset (1 link event per boot, the boot-time one;
+`Speed: 10000Mb/s, Duplex: Full, Link detected: yes`, and the count held at 1
+through every run above). If a future run loses the peer, check
+`journalctl -k | grep r8127` **before** assuming a wedge: this incident cost a hard
+reset and a wrong root cause because I diagnosed from reachability instead of from
+the kernel log.
+
+### Phase V — The tunnel leaves the operational path (2026-09-20)
+
+`~/ds4-tunnel` existed for one reason, measured on 2026-09-19 and written up in its
+own README: macOS would not let an adhoc/linker-signed binary accept connections on
+a non-loopback address, and the Application Firewall did not change that, so the
+worker's connection had to be carried through `sshd` over loopback.
+
+**That no longer reproduces on macOS 26.7 (build 25G229).** Tested directly rather
+than assumed:
+
+- A `ds4-server` bound to `0.0.0.0` was fetched from the Spark over the direct link:
+  `curl http://192.168.2.1:8099/v1/models` returned the model list, exit 0. On
+  2026-09-19 the same shape of connection was dropped.
+- The **full pipeline with no tunnel anywhere**: worker on the Spark dialling
+  `--coordinator 192.168.2.1 9911` with `--listen 192.168.2.2 55911`, coordinator on
+  the Mac with `--listen 192.168.2.1 9911`. The control connection is a real socket
+  on the link (`ESTAB 192.168.2.2:55652 -> 192.168.2.1:9911`), and a real completion
+  returned exactly `NO TUNNEL OK` (`finish=stop`, 43 tokens), with the coordinator
+  logging `chat ctx=21..69:48 gen=48 THINKING decoding … avg=12.46 t/s`.
+
+So the tunnel is out of the operational path: the GLM 5.3 Flash entry in
+`~/bin/llm_config.json` and the example in `docs/DISTRIBUTED.md` now use the link
+addresses directly, and the tunnel's README leads with a NOT REQUIRED status.
+
+**Kept as a fallback, not deleted.** The blocking behaviour was real and measured,
+so it is OS-version dependent and can return — the README says exactly what to
+re-enable and which loopback form to use if the Spark can no longer reach the Mac's
+listener. Removing the mechanism outright would trade a one-file fallback for a
+debugging session the next time macOS changes its mind.
+
+**Also worth noting for the address question:** the tunnel README already recorded
+that the tunnel must use the literal IPv4 of the direct link and never a hostname,
+because an mDNS resolution failure killed an early session-scoped tunnel mid-ingest.
+That is independent corroboration of the later finding that the name `spike` resolves
+to the Mac's own LAN address and must not be used for this link.
+
+### Phase W — Both server configs, verified by running them (2026-09-20)
+
+`~/bin/llm_config.json` is per-host and outside the repository, so both entries
+described here were started and exercised rather than written from memory.
+
+**Mac — GLM 5.3 Flash Q4_K as the pair's coordinator** (`--layers 0:23`, ctx 524288,
+HTTP on 8081). Verified with a real completion through the Spark worker returning
+exactly `PIPELINE OK`, then again after dropping the tunnel with `NO TUNNEL OK`.
+The split is the plan-verified one because that is the combination with **measured
+memory at 512K** (~92 GiB resident on the Spark); the faster `0:20` / `21:output`
+rebalance was measured only at ctx 32768 with ~12 GiB free, so it is documented as a
+short-context option rather than shipped as the default.
+
+**Spark — GLM 5.3 Flash Q2 standalone** (`--ctx 262144`, HTTP on 8081). Q4_K cannot
+be a standalone entry on this machine — 178 GiB against 121 GiB — so the Spark's GLM
+entry is the Q2 model, which fits: `resident model 89.87 GiB + KV 2.92 + buffers
+3.16 = 95.96 GiB planned`. Verified with a completion returning exactly
+`SPARK Q2 OK` (`finish=stop`, 17 tokens). Context is 262144 deliberately, not 512K:
+a whole-model 512K run on this box previously wedged it (§4.1b), so the entry stays
+well below that.
+
+**The Spark's config carries the worker entry, at the owner's direction.** I first
+left it out, on the reasoning that both files hold *servers* and a worker binds no
+HTTP port, so the manager could not health-check it. The owner asked for it there —
+the Spark's role in this pipeline *is* the worker, and having it in the config means
+the pair can be started from two config entries instead of from a README. Both
+commands were then run **as read from the config files themselves**, not retyped:
+HTTP came up and a completion returned exactly `CONFIG OK`, with the worker logging
+`connected to coordinator 192.168.2.1:9911` and the coordinator `gen=3 finish=stop`.
+The entry is named "(pipeline worker)" so it is not mistaken for a server.
+
+The Mac's coordinator must still be started *after* the worker is up.
+
+### Phase X — GLM 5.3 Flash was advertised under GLM 5.2 names (2026-09-20)
+
+The owner noticed the served model list showed `glm 5.2`, `glm 5.2 chat` and
+`glm 5.2 reasoner` rather than anything named for 5.3. Cause found, not guessed:
+the GLM branch of `send_models()` in `ds4_server.c` **hardcoded three 5.2-era
+strings** and keyed on the *family* (`ds4_engine_is_glm_dsa`), which covers both
+5.2 and 5.3 — so a 5.3 model advertised 5.2 ids. The DeepSeek-4.1 branch directly
+above it derives its id instead, which is why that family never had the problem.
+
+**The model itself was never wrong**, and it is worth being precise about how that
+was established rather than assumed: `name=GLM 5.3 Flash` in the same listing comes
+from the GGUF, and the coordinator maps 24 of a **46-layer** model at 88.60 GiB — a
+79-layer GLM 5.2 shape cannot do that — so the 5.3 shape had loaded and inference was
+unaffected. The bug was three strings.
+
+**Fix:** derive the base id from `server_model_id_from_engine()` — which already
+distinguishes the variants — and append `-chat` / `-reasoner`, so 5.2 keeps its ids,
+5.3 gets its own, and the next variant needs no edit here. `glm-5.3-flash*` were
+already recognised on *input* (`server_model_alias_known`, with a unit test asserting
+it), so no aliasing work was needed — only the advertisement was stale.
+
+**Verified live, not just compiled:** `/v1/models` now returns `glm-5.3-flash`,
+`glm-5.3-flash-chat`, `glm-5.3-flash-reasoner` (all `name=GLM 5.3 Flash`), and a real
+request with `model=glm-5.3-flash` through the pair returned exactly `ALIAS OK`
+(`finish=stop`). An earlier attempt to check this by timing response codes was
+inconclusive — every request returned no HTTP code because the worker was down — so
+it was redone with the pair actually up rather than reported as evidence.
+
+---
+
 ## 4. Measurements
 
 ### 4.1 Q2 pipeline, Mac coordinator (0:23) + Spark worker (24:output), over the tunnel
@@ -612,6 +1041,21 @@ corrected measurement.
 
 ---
 
+### 4.8 2026-09-20 session (detail in Phases R–X)
+
+| Measurement | Result | Phase |
+| --- | --- | --- |
+| Q2 standalone regression, GLM 5.3 Flash + DeepSeek V4 Flash | **byte-identical output** to a `8655de7` baseline (348 / 347 bytes), standalone on CUDA; V4.1 not measurable, no LM weights on disk | R |
+| Q4_K dispatch A/B, same pair/prompt/greedy | GLM-specific **95.25 t/s** vs generic **257.42 t/s** — 2.70×, output identical; flipping the Mac side too is neutral (258.92) | S |
+| Criterion 3, ctx 32768, 28 657-token prompt | **389.0 t/s prefill / 10.2–10.35 t/s decode** (bar: 150 / 10) | T |
+| Split rebalanced to `0:20` / `21:output` | **440.42 t/s** prefill, +13.2 %; 12 GiB free on the Spark against 24 | U |
+| `--dist-activation-bits 16`, `--dist-prefill-chunk`, `--dist-prefill-window` | **no measurable effect** — the control (base, no flags, run last) reproduced the "tuned" numbers | U |
+| Per-stage telemetry | Spark 0.262 s/layer, Mac 0.406 s/layer; the wire is ~2 % of a chunk (256 MiB against 5.5 s) | U |
+| Link after EEE off | 300 packets, **0.0 % loss** both directions, `rx_errors` 0; `r8127` flaps unchanged through heavy load | U |
+| Pair over the direct link, no tunnel | `NO TUNNEL OK`; `CONFIG OK` from both configs' own `launch_cmd`; `ALIAS OK` under `glm-5.3-flash` | V–X |
+
+---
+
 ## 5. Defects found, and their disposition
 
 | Defect | Evidence | Disposition |
@@ -656,7 +1100,7 @@ corrected measurement.
    over a 95 GiB mmap) remain the plausible trigger, which is why the plan now
    carries a clean-slate precondition.
 
-### 6.1 Corrections from the self-audit (2026-09-19, after the fact)
+### 6.1 Corrections added after the fact (2026-09-19 self-audit, and the 2026-09-20 session)
 
 7. **"Byte-identical output" was inferred, not measured.** The load was reported
    as reproducing the cold run's completion text. It was not: both requests were
@@ -737,6 +1181,25 @@ corrected measurement.
     observation — and it is the second time in this work, which is why the
     measurement convention now says: sample twice before stating a rate.
 
+14. **The 2026-09-20 outage was a 10GbE link flap, not a memory wedge.** I first
+    attributed the Spark becoming unreachable to the 25-layer slice exhausting
+    memory, and committed that. The previous boot's journal says otherwise: no OOM
+    kill was invoked (`oom mentions: 0`), the box stayed alive (cron ran at 13:15:01
+    and 13:17:01, the guard logging `board=50C … 7.80W`), and `enP7s7` (`r8127`)
+    flapped five times in 32 s starting 13:08:05. The link recovered at 13:08:37;
+    the host's network state did not, which is what kept it unreachable. Corrected
+    in Phase U.
+
+15. **"The Spark cannot hold more than ~22 layers" is withdrawn** (Phase U). It was
+    a consequence of correction 14 — the experiment that would have tested the
+    memory question was invalidated by the link flap, so the Mac→Spark rebalancing
+    lever is still open rather than closed.
+
+16. **"The tunnel is required" no longer holds** (Phase V). It was required when
+    measured on 2026-09-19; on macOS 26.7 the same binaries accept non-loopback
+    connections and the pair runs on the link addresses. The tunnel is retained as a
+    documented fallback, not deleted, because the original block was real.
+
 ---
 
 ## 7. Artifacts and host configuration
@@ -745,11 +1208,11 @@ corrected measurement.
 
 | Path | What |
 | --- | --- |
-| `~/dev/ds4/` | source tree, branch `customisation` (fork point `8db1d1d`); §2 #5–6 were uncommitted when the binaries were rebuilt |
+| `~/dev/ds4/` | source tree, branch `customisation` (fork point `8db1d1d`), HEAD `dda8d89` |
 | `~/dev/ds4/docs/custom/ds4-glm53-q4-split-design.md` | the plan |
 | `~/dev/ds4/docs/custom/ds4-glm53-q4-implementation-log.md` | this log |
-| `~/bin/` | `ds4`, `ds4-server`, `ds4-agent`, `ds4-bench`, `ds4-eval` (rebuilt 2026-09-19 17:46) + `metal/` (26 kernels) |
-| `~/ds4-tunnel/` | tunnel kit: daemon + agent plists, `install.sh`, `install-agent.sh`, `uninstall.sh`, `README.md` |
+| `~/bin/` | `ds4`, `ds4-server`, `ds4-agent`, `ds4-bench`, `ds4-eval` (rebuilt 2026-09-20 15:03) + `metal/` (26 kernels) |
+| `~/ds4-tunnel/` | tunnel kit: daemon + agent plists, `install.sh`, `install-agent.sh`, `uninstall.sh`, `README.md`. **No longer required** (Phase V) — kept as a fallback, and its README says so |
 | `~/ds4-deploy.sh` | rebuild + install to `~/bin` on this host or the peer; `check` verifies source parity (`ds4.c` md5) and prints both hosts' binaries and process state |
 | `~/thermal-protect/` | backup copy of the Spark protection kit |
 | `/Library/LaunchDaemons/com.local.ds4-tunnel.plist` | installed by the user; job `com.local.ds4-tunnel`, runs as `xun` |
@@ -759,8 +1222,8 @@ corrected measurement.
 
 | Path | What |
 | --- | --- |
-| `~/dev/ds4/` | source tree content-matched to the Mac's (`ds4.c` md5 `98c92891…` on both), on branch `main` at `8db1d1d` |
-| `~/bin/` | the same five binaries, rebuilt 2026-09-19 from that tree with `make -j20 cuda-spark` (CUDA `sm_121`) |
+| `~/dev/ds4/` | source tree content-matched to the Mac's (`~/ds4-deploy.sh check` reports parity); it is an rsync'd tree, not a checkout |
+| `~/bin/` | the same five binaries, rebuilt 2026-09-20 15:09 with `make -j20 cuda-spark` (CUDA `sm_121`) |
 | `~/thermal-protect/` | kit source, README synced with the Mac backup |
 | `~/ds4-deploy.sh` | same script (md5 identical to the Mac's); `local` here rebuilds `cuda-spark` |
 | `/usr/local/bin/gb10-thermal-guard.sh`, `gb10-cpu-cap.sh`, `gb10-thermal-status.sh` | installed |
@@ -796,42 +1259,52 @@ Default target changed to `multi-user.target` (headless).
    **yes** — decode stays ~11–14 t/s and MTP remains excluded under the split;
    enabling it there is design work (taking the head and its routing across a
    slice boundary), not a flag.
-5. ~~**The `DS4_GLM_GENERIC_MOE_Q4K` experiment (§2 #6):** drop it now that the
-   result is measured, or keep it until WS 2 lands as a comparison point?~~
-   Decided 2026-09-19: **keep until WS 2 lands**, then remove or promote
-   deliberately. It is inert unless the variable is set, it is documented as an
-   experiment rather than a path, and it is the only artefact of the Q4_K-on-CUDA
-   comparison — so the cost of keeping it briefly is lower than the cost of
-   destroying the comparison before the kernels that supersede it exist.
+5. ~~**The `DS4_GLM_GENERIC_MOE_Q4K` experiment (§2 #6):** drop it, or promote it?~~
+   Answered 2026-09-20: **promoted** (Phase S). Both paths were measured against each
+   other and the generic one was 2.7× faster at prefill with identical output, so the
+   gate came out and a homogeneous Q4_K trio always routes there; the ported
+   GLM-specific kernels stay reachable via `DS4_CUDA_GLM_MOE_TYPES`.
 
 ---
 
-## 9. Next steps (from the plan)
+## 9. Next steps and open workstreams
 
-| WS | Work | Effort |
+| WS | Work | Status |
 | --- | --- | --- |
-| 1 | type traits + dispatch predicate for GLM MoE (`{Q2_K, Q4_K}`), loud failure otherwise, `DS4_CUDA_GLM_MOE_TYPES=q2k` escape hatch | 0.5–1 d |
-| 2 | Q4_K prefill instantiations (tile8 gate/up, down terms + reduce) — **first measurable milestone** | 2–3 d |
-| 3 | Q4_K expert-major gate/up + down | 1–2 d |
-| 4 | Q4_K decode instantiations (warp-per-pair, tok2-reuse, down warp, small-batch) | 2–3 d |
-| 5 | CPU/GPU parity harness for the GLM MoE Q4_K path | 1–2 d |
-| 6 | cross-machine oracle (pipeline vs single-host, logits + `--dist-replay-check`) | 1–2 d |
-| 7 | boundary gates (2 048→2 056, 4 096→4 100), snapshot round-trip | 1–2 d |
-| 8 | long-context endurance (262K ingest, 524K alloc) with peak board logged per frontier | 1–2 d |
-| 9 | docs + release gates | 0.5–1 d |
-| 10 | *(optional)* CUDA coordinator-side slice prefill fix | 1–3 d |
-| 11 | *(optional)* IQ2_XXS instantiations | 1–2 d |
+| 1 | type traits + dispatch predicate for the GLM MoE (`{Q2_K, Q4_K}`), loud failure otherwise, `DS4_CUDA_GLM_MOE_TYPES` hatch | **done** (Phase L) |
+| 2 | Q4_K prefill instantiations (tile8 gate/up, down terms + reduce) | **done** (Phases M, N) |
+| 3 | Q4_K expert-major gate/up + down | **done** (Phase O) |
+| 4 | Q4_K decode instantiations (warp-per-pair, tok2-reuse, down warp, small-batch) | **partial** — warp, down warp and small-batch land; the MTP tok2 and scalar paths still refuse Q4_K by name |
+| 5 | CPU/GPU parity harness for the GLM MoE Q4_K path | **partial** — `make test-glm53-moe-q4k` covers warp/small-batch, tile8, expert-major and tile8-off, and is validated to fail pre-fix; tok2, scalar, empty experts, tile tails and scratch reuse are uncovered, and the clamp is checked on real weights rather than synthetically |
+| 6 | cross-machine oracle (pipeline vs single-host, logits + `--dist-replay-check`) | **open** — this is acceptance criterion 1; `--dist-replay-check` already exists in the tree |
+| 7 | boundary gates (2 048→2 056, 4 096→4 100), snapshot round-trip | **partial** — live-pair save and load are verified (§11); fresh-pair and roles-swapped restores and both boundary sweeps are not run |
+| 8 | long-context endurance (262K ingest, 524K alloc) with peak board logged per frontier | **open** — criteria 4 and 5 |
+| 9 | docs + release gates | **done 2026-09-20** — `DGX_SPARK.md`, `MODELS.md`, `DISTRIBUTED.md`, and `QA_BEFORE_RELEASES.md` §6/§10 |
+| 10 | *(optional)* CUDA coordinator-side slice prefill fix | **open, optional** — not needed while the Spark is the worker |
+| 11 | *(optional)* IQ2_XXS instantiations | **deferred** by the Q4_K-only decision (§8 #1) |
 
-Critical path WS 1 → 2 → 5 → 6 ≈ 1–1.5 weeks; full set with QA and docs ≈ 2–3 weeks.
+**Measurements still missing**, as distinct from workstreams:
+
+* **Decode for the `0:20` / `21:output` split.** Its prefill is measured (440.42 t/s)
+  but the decode figure was cut short by a harness that killed the run
+  mid-generation. Prefill completes first and is sound; this one number is not.
+* **An EEE-on/off load comparison on the link.** The change is in place and no flaps
+  have recurred, but the pre-change baseline is only ~4 flaps per session, so "none
+  since" is encouraging rather than conclusive.
+* **The greedy-divergence gap** (§6.1 Q3) — still asserted as a near-tie and never
+  measured.
 
 ---
 
 ## 10. Quick acceptance commands
 
 ```sh
-# tunnel (Mac)
-launchctl print system/com.local.ds4-tunnel | grep -E "state|pid|last exit"
-ssh 192.168.2.2 'ss -tln | grep 9911'
+# no tunnel needed as of 2026-09-20 (Phase V). If a future macOS restores the block,
+# `launchctl print system/com.local.ds4-tunnel` plus the loopback form is the fallback.
+
+# link health - the r8127 flaps intermittently, and a flap aborts a run
+ssh 192.168.2.2 'ethtool --show-eee enP7s7 | grep "EEE status"'          # expect: disabled
+ssh 192.168.2.2 'journalctl -b 0 --no-pager | grep -c "r8127: enP7s7: link down"'
 
 # thermal protection (Spark)
 ssh 192.168.2.2 'systemctl is-active gb10-thermal-guard.service gb10-cpu-cap.service'
@@ -841,11 +1314,12 @@ ssh 192.168.2.2 'journalctl -u gb10-thermal-guard -n 5 --no-pager'
 # binaries work from any directory
 cd /tmp && ~/bin/ds4 --inspect -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf | head -3
 
-# working cross-machine configuration (Q2)
-ssh 192.168.2.2 'pkill -x ds4; (setsid nohup ~/bin/ds4 --cuda -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf \
-  --role worker --layers 24:output --coordinator 127.0.0.1 9911 --listen 127.0.0.1 55911 --ctx 524288 >/tmp/w.log 2>&1 </dev/null &)'
-cd /tmp && ~/bin/ds4 -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf --role coordinator --layers 0:23 \
-  --listen 127.0.0.1 9911 --ctx 32768 --temp 0 -n 32 -p "your prompt"
+# working cross-machine configuration (Q4_K, the default since Phase S): worker first
+ssh 192.168.2.2 'pkill -x ds4; (setsid nohup ~/bin/ds4 --cuda -m ~/mlmodels/glm/GLM-5.3-Flash-Q4_K.gguf \
+  --role worker --layers 24:output --coordinator 192.168.2.1 9911 --listen 192.168.2.2 55911 --ctx 32768 >/tmp/w.log 2>&1 </dev/null &)'
+cd /tmp && ~/bin/ds4-server -m ~/mlmodels/glm/GLM-5.3-Flash-Q4_K.gguf --role coordinator --layers 0:23 \
+  --listen 192.168.2.1 9911 --ctx 32768 --host 0.0.0.0 --port 8081
+curl -s http://192.168.2.1:8081/v1/models | grep -o 'glm-5.3-flash[a-z-]*' | sort -u
 
 # long one-shot runs: detach from the terminal
 #   a `nohup ... &` started from an agent/SSH PTY can leave ds4 blocked on
@@ -857,12 +1331,12 @@ cd /tmp && ~/bin/ds4 -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf --role coordinator 
 
 # snapshot acceptance (distributed checkpoint save + load, §11)
 ~/bin/ds4-server -m ~/mlmodels/glm/GLM-5.3-Flash-Q2.gguf --role coordinator --layers 0:23 \
-  --listen 127.0.0.1 9911 --ctx 4096 --host 127.0.0.1 --port 18080 \
+  --listen 192.168.2.1 9911 --ctx 4096 --host 127.0.0.1 --port 18080 \
   --kv-disk-dir /tmp/ds4kv --kv-cache-min-tokens 512
 #   a cold prompt above min-tokens forces a save; re-sending it must report
 #   cached_tokens == prompt_tokens and no cache_write_tokens
 curl -s http://127.0.0.1:18080/v1/completions -H 'Content-Type: application/json' \
-  -d '{"model":"glm-5.2","prompt":"<prompt above 512 tokens>","max_tokens":4,"temperature":0}' \
+  -d '{"model":"glm-5.3-flash","prompt":"<prompt above 512 tokens>","max_tokens":4,"temperature":0}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["usage"])'
 ls -la /tmp/ds4kv/          # one .kv entry per cold checkpoint
 ```
@@ -922,425 +1396,3 @@ no-op after a hit, not the defect — the defect's message is
 `distributed KV shard tensor size overflow`.
 
 ---
-
-## 12. Q2 standalone regression check (baseline comparison)
-
-The question this answers: did any of the GLM Q4_K work break the **existing** Q2
-paths on a single machine? Q2 is the shipped sparse recipe and shares a binary
-with the Q4_K work, so it had to be checked, not assumed.
-
-**Where the changed code actually lives.** All 67 hunks in `ds4_cuda.cu` are
-inside GLM-named functions — `ds4_gpu_glm_routed_moe_batch_tensor`,
-`..._one_tensor`, `..._direct_scalar_q4_tensor` and their `glm_routed_moe_*` /
-`glm_moe_*` kernels — with **zero** non-GLM hunks. Those entry points have
-exactly one non-test caller each: `ds4.c:48508`, `48647`, `48678`, all inside the
-GLM branch of the layer-MoE dispatch. `ds4.c`, `ds4_distributed.c`,
-`ds4_metal.m`, `ds4_tp.c`, `ds4_gpu.h`, `ds4_agent.c` and `ds4_server.c` are
-**byte-identical to baseline**. The Makefile change only adds a test target;
-`ds4_cli.c` adds the env banner, which writes to stderr only and only when one of
-the nine switches is set.
-
-**Why Q2 never reaches the changed code.** The dispatch decides by tensor type:
-
-```c
-/* IQ2_XXS gate/up with a Q2_K down is the shipped sparse recipe and has
- * always been served by the generic routed-MoE dispatch. */
-if (l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS) return true;
-```
-
-`glm_graph_layer_uses_generic_routed_moe` returns true for that recipe, and the
-caller then returns `ds4_gpu_routed_moe_batch_tensor` — the generic dispatcher,
-untouched by this work. Only a homogeneous **Q4_K** trio (type 12) falls through
-to the GLM-specific path that was fixed. That is also the mechanical explanation
-for the zero trace lines in the Q2_K runs discussed above.
-
-**Measured, not argued.** A baseline binary built from `8655de7` (the commit
-before this work, verified to differ from the current build) was run against the
-current binary — same model, same prompt, greedy decode, one machine with no
-`--role`, i.e. the standalone path — comparing generated text byte-for-byte:
-
-| model | baseline | current | result |
-| --- | --- | --- | --- |
-| GLM 5.3 Flash Q2 | 348 bytes, exit 0 | 348 bytes, exit 0 | identical |
-| DeepSeek V4 Flash Q2 | 347 bytes, exit 0 | 347 bytes, exit 0 | identical |
-
-`--dump-tokens` is *not* a valid check here: it tokenizes the prompt and exits
-before decoding, so it exercises none of this path. The comparison above is on
-generated text, which runs the decode path.
-
-**V4.1 is not measured, and here is exactly what covers it.** No V4.1 language
-model exists on either machine: `/Users/xun/mlmodels/deepseekv4/` holds only the
-970 MB `DeepSeek-V4.1-Flash-Vision.gguf` encoder, and the Spark holds no V4.1
-file at all. So a V4.1 Q2 run was not possible. What makes it safe is that every
-file implementing V4.1 behaviour (`ds4_engine_is_deepseek41` in `ds4.c`, the
-DSML4.1 syntax in `ds4_agent.c`, the model id in `ds4_server.c`, `ds4_tp.c`) is
-byte-identical to baseline, and a V4.1 Q2 model routes by the same type-based
-rule to the same untouched dispatcher. That is inference from identical inputs,
-not a measurement — if a V4.1 Q2 GGUF appears, repeat the check above against it.
-
----
-
-## 13. Which Q4_K dispatch is the default, and why (2026-09-20)
-
-**The short version: the ported GLM-specific Q4_K kernels are correct but slow,
-and the pre-existing generic dispatch is 2.7× faster at prefill. Q4_K now routes
-there by default, and criterion 3's prefill bar is met for the first time.**
-
-**Why both paths had to be measured before removing the spike.** Plan §8 said to
-"drop it when [WS 1–2] land, or promote it deliberately — do not leave two
-dispatch paths unexamined", and §8's own note had already argued *against*
-destroying the comparison early, because the spike was "the only artefact of the
-Q4_K-on-CUDA comparison". So the gate came out only after the two were run against
-each other. That was the right order, because the result contradicted the
-workstreams' premise.
-
-**The measurement.** Same pair, same 1091-token prompt, greedy `-n 64`, the only
-difference being which dispatch each host's layers take. The GLM dispatch prints a
-per-call trace, so the trace doubles as the discriminator that the intended path
-was really taken — 0 lines means the generic dispatch ran, and a non-zero count
-means the GLM one did. That matters: an earlier comparison in this project was
-void precisely because a switch silently failed to apply.
-
-| config | Mac | Spark | Spark trace | prefill | decode | 64-token output |
-| --- | --- | --- | ---: | ---: | ---: | --- |
-| A | GLM-specific (Metal) | GLM-specific (CUDA) | 1344 | **95.25 t/s** | 11.18 t/s | reference |
-| B | GLM-specific (Metal) | **generic** (CUDA) | **0** | **257.42 t/s** | 11.26 t/s | identical |
-| D | **generic** (Metal) | **generic** (CUDA) | **0** | **258.92 t/s** | 11.37 t/s | identical |
-
-All three outputs are **byte-identical over 64 greedy tokens** (300 bytes each).
-D is the configuration an unconditional rule produces, which is why it was run: the
-predicate lives in shared `ds4.c`, so promoting the spike also moves the **Metal**
-side, and that side is what this project spent all its time validating against.
-
-**Why the generic path wins, mechanically.** Not tuning luck — tensor cores. The
-generic dispatch's Q4_K path selects `moe_gate_up_mid_q4K_tile16_mma_kernel<512>`
-and `moe_down_q4K_tile16_mma_kernel<512>` (`ds4_cuda.cu` ~25236 / ~25711, gated by
-`use_q4_mma_tiles16`). The WS 2/3 port instantiated `glm_routed_moe_*_tile8_*`
-kernels, which do not use MMA. On a GB10 that is the whole difference.
-
-**What changed.** `glm_graph_layer_uses_generic_routed_moe` now returns true for a
-homogeneous Q4_K trio unconditionally; the `DS4_GLM_GENERIC_MOE_Q4K` gate is gone.
-The GLM-specific Q4_K kernels remain reachable through `DS4_CUDA_GLM_MOE_TYPES`
-and are still covered directly by `make test-glm53-moe-q4k`, so the port is not
-dead code — it is a reference implementation and a fallback, not the default.
-
-**Verified on the promoted default, with no routing variable set anywhere:**
-
-| check | result |
-| --- | --- |
-| Spark GLM-dispatch trace | **0** — the generic dispatch is now the default |
-| Mac startup banner | names no routing switch (proves nothing was set) |
-| prefill / decode | **257.71 t/s** / 11.34 t/s (was 95.25 / 11.18) |
-| 64-token output | byte-identical to run A |
-| `make test-glm53-moe-q4k` | PASS, `worst rel = 0.000e+00`, exit 0 |
-
-**Consequences, stated plainly.**
-
-1. **Criterion 3's prefill bar is met.** It required ≥ 150 t/s at 32K on the pair;
-   the ported path measured 100.57 t/s and could not reach it, and the promoted
-   default measures 257.71 t/s at ctx 8192. The 32K-context confirmation is the
-   remaining formality.
-2. **WS 2/3's premise was wrong, and the log should say so rather than bury it.**
-   Those workstreams existed to give the GLM-specific dispatch Q4_K support so it
-   could supersede the spike. The kernels are correct and now covered by a parity
-   test, but the dispatch was never the bottleneck the plan treated it as: a
-   cheaper path already existed and is faster. The plan's judgement that the spike
-   was a stopgap to be superseded was reasonable on the evidence available, and
-   measuring both is what settled it.
-3. **The next lever is load balance, not the Mac.** B (257.42) and D (258.92) are
-   within noise of each other, so the Mac's routing choice does not move
-   throughput at all — the Spark's stage is the critical path. Prefill on a
-   pipeline is `max(stage)`, and the split currently gives the Mac 24 layers and
-   the Spark 22; giving the Spark fewer should raise the maximum. That is
-   measurable with the existing harness and is the obvious next experiment.
-
----
-
-## 14. Criterion 3 measured at its stated scale (2026-09-20)
-
-Criterion 3 asks for "**≥ 150 t/s prefill and ≥ 10 t/s decode at 32K on the
-pair**". Everything measured up to this point was a 1091-token prompt at ctx
-8192, where pipeline fill/drain dominates the average and the number understates
-what the pair does on a real ingest. This is the measurement the criterion
-actually asks for: **ctx 32768, a 28 657-token prompt**, greedy `-n 16`.
-
-| run | order | flags | prefill | decode |
-| --- | --- | --- | ---: | ---: |
-| base | 1st (cold) | — | 340.49 t/s | 10.13 t/s |
-| bits16 | 2nd | `--dist-activation-bits 16` | 389.03 t/s | 10.21 t/s |
-| chunk4096 | 3rd | `--dist-prefill-chunk 4096` | 389.21 t/s | 10.29 t/s |
-| window8 | 4th | `--dist-prefill-window 8` | 389.28 t/s | 10.35 t/s |
-| **base (control)** | **5th** | **—** | **389.04 t/s** | 10.21 t/s |
-
-**Criterion 3 is met, with margin: 389.0 t/s against a 150 t/s bar (2.6×).**
-
-**The three tuning flags do nothing, and the control is what proves it.** The
-first four runs make it look as though `--dist-activation-bits 16` and the two
-chunking flags each buy ~14 %. They do not: base run **last, with no flags at
-all**, lands at 389.04 t/s — indistinguishable from the three "tuned" runs. The
-spread is run order: the first run after an idle period is ~14 % slower (cold
-caches, clocks still ramping) and everything thereafter converges to 389.0 ± 0.3
-t/s. Without that fifth run I would have reported three gains that do not exist,
-and the plan would have carried a tuning recommendation that is noise.
-
-**Output is unaffected by all four configurations** — byte-identical across base,
-bits16, chunk4096 and window8. That matters for `--dist-activation-bits 16`
-specifically, since it *does* change wire numerics by design; on this prompt it
-did not change the greedy output. It is still not worth enabling: no measured
-gain, and a documented numerical change is a cost with no benefit here.
-
-**Measurement caveat worth carrying forward.** The warm-up spread is ~14 %, which
-is larger than any effect the tuning knobs might have. Single-run comparisons
-below ~15 % are not resolvable on this pair; anything claiming a smaller win needs
-repeats, and the first run after an idle period should be discarded or repeated.
-
-**Decode is met but thin.** 10.21–10.35 t/s against a ≥ 10 t/s bar is a 2–3 %
-margin, and decode falls with depth (the plan's own single-Mac figures drop from
-8.00 t/s at 262K to 4.63–5.02 at 512K). This measurement is at 32K, so the bar is
-met *at the scale the criterion states* — but it should not be read as headroom at
-262K or 524K, where criterion 4's runs will land.
-
-**What actually fixed it.** Not tuning: the routing. The ported GLM-specific Q4_K
-kernels were the default and are 2.7× slower per layer (§13); promoting the generic
-dispatch took the same configuration from ~95 t/s to 389 t/s at 32K. The 32K
-prompt then removed the fill/drain effect that made the 1091-token number look
-worse still.
-
----
-
-## 15. Load balance: the lever is real, and the first test of it was invalidated by a NIC fault (2026-09-20)
-
-**Per-stage telemetry, ctx 32768, 28 657-token prompt** (`--debug`, coordinator's
-view of the worker; the worker's own lines are not emitted, so the Mac's stage is
-derived). Seven prefill chunks of 4096 (one 4081):
-
-```
-request=1 hop=0 layers=24:44 pos=0     tokens=4096 eval=5189.744ms input=256.02MiB
-request=2 hop=0 layers=24:44 pos=4096  tokens=4096 eval=5466.542ms input=256.02MiB
-...                                                       (chunks 3-6: 5498-5551ms)
-request=7 hop=0 layers=24:44 pos=24576 tokens=4081 eval=5603.423ms input=255.08MiB
-request=8 hop=0 layers=24:44 pos=28657 tokens=1    eval=59.221ms  input=0.06MiB   <- decode
-```
-
-| stage | layers | per chunk | per layer |
-| --- | ---: | ---: | ---: |
-| Spark (CUDA worker) | 21 | ~5.50 s | ~0.262 s |
-| Mac (implied, coordinator) | 24 | ~9.75 s | ~0.406 s |
-
-Total 28657 / 389.05 = 73.7 s for 7 chunks; the worker accounts for 43.4 s of
-evals, so the coordinator's stage is the slower one and prefill is bound by it.
-
-**Two consequences.**
-
-1. **The wire is not a factor, which independently explains §14's null result.**
-   Each chunk carries 256.02 MiB of activations (~0.23 s at 10GbE) against a
-   5.5 s stage — about 2 %. So `--dist-activation-bits 16` *could not* have shown a
-   measurable gain, and the telemetry says so independently of the run that
-   measured nothing.
-2. **Rebalancing should pay ~17–25 %** — in the direction of moving layers *from*
-   the Mac *to* the Spark (21/25 and 18/28 were the predicted ~8 % / ~17 % / ~25 %
-   steps), and that is also the memory-safe direction for the Mac.
-
-**What actually stopped the run was the network, not the memory — and my first
-account of this was wrong.** I originally attributed it to the 25-layer memory
-footprint exhausting the box, and said so. The evidence contradicts that, and the
-correction matters because it changes both the cause and the conclusion.
-
-The previous boot's kernel journal (recovered after the reset; the application log
-was in tmpfs and was lost) says:
-
-```
-13:08:05 kernel: r8127: enP7s7: link down
-13:08:10 kernel: r8127: enP7s7: link up
-13:08:15 r8127: enP7s7: link down   / systemd-networkd: enP7s7: Lost carrier
-13:08:19 r8127: enP7s7: link up     / Gained carrier      (5 cycles, ~32 s)
-13:08:33 r8127: enP7s7: link down
-13:08:37 r8127: enP7s7: link up     <- last link event of the boot
-```
-
-- **No OOM kill was ever invoked that boot** (`oom mentions: 0`).
-- **The box was never wedged.** It stayed alive and healthy throughout: cron ran at
-  13:15:01 and 13:17:01, `systemd-resolved` logged continuously, the thermal guard
-  kept reporting `board=50C gpu=48, 2093MHz, 7.80W, 0% slowdown` — idle and cool,
-  which also rules out a thermal trip and a compute crash.
-- What broke was the **direct 10GbE link**: `enP7s7`, driver `r8127`, carrying
-  `192.168.2.2/24`, flapped five times in ~32 seconds starting at **13:08:05**. It
-  recovered at 13:08:37, but the host's network state did not — NetworkManager went
-  to `CONNECTED_SITE` at 13:11:33 and DNS to 192.168.0.1 degraded on a loop — so the
-  box stayed off the network until the reset. `ping` failing while the LAN gateway
-  answered in 0.86 ms is exactly what a link-layer fault at this end looks like; I
-  read it as "the box is gone" when it was "the box is up and off the network".
-
-**So the rebalance failure is explained without invoking memory at all.** The b21
-worker started at 13:08:04 (the last successful ssh login logged), inside the flap
-window, and the coordinator never saw its slice — `distributed route incomplete:
-missing layer 21` is what a worker that cannot hold a link to the coordinator
-produces. The 25-layer memory question was never actually exercised.
-
-**The bound I stated is withdrawn.** "The Spark cannot hold more than ~22 layers,
-so the balance lever is closed" does not follow from this evidence and is not
-established — the experiment that would have tested it was invalidated by the NIC.
-The lever is therefore **still open**, and the prediction above (Mac→Spark
-rebalancing worth ~17–25 %, since the Mac's 0.406 s/layer against the Spark's
-0.262 binds prefill) has not been tested. It should be re-run now that the link is
-healthy — with the memory budget checked *before* the run, which is the part of the
-original caution that still stands.
-
-**Re-run, and the lever is confirmed: +13.2 %.** With the NIC fault ruled out (link
-events constant at 1 across every run) and the Spark's memory watched live through
-each run, the same split comparisons now complete:
-
-| config | Mac layers | Spark layers | prefill | min free RAM on the Spark |
-| --- | ---: | ---: | ---: | ---: |
-| base | 24 | 22 | **389.16 t/s** | 24 GiB |
-| **21 / 25** | 21 | **25** | **440.42 t/s** | 12 GiB |
-| base (control, run last) | 24 | 22 | **389.16 t/s** | 24 GiB |
-
-**+13.2 %** — the telemetry predicted ~13 % from `Mac 21 × 0.406 s = 8.53 s/chunk`
-against base's 9.75, and that is what it delivers. So prefill on this pair is
-**440 t/s**, 2.9× criterion 3's 150 t/s bar, by moving three layers from the Mac to
-the Spark.
-
-**This also refines §14's caveat, which was too pessimistic.** The two base runs are
-identical to **0.01 %** (389.16 both). The ~14 % spread seen earlier was the
-cold-first-run effect specifically, not general run-to-run noise: a warm baseline
-reproduces that tightly. So small differences *are* resolvable here — which makes
-the tuning-flags null result *stronger*, not weaker: `--dist-activation-bits 16`,
-`--dist-prefill-chunk 4096` and `--dist-prefill-window 8` each landed within 0.1 %
-of the base control, i.e. they were measured at high precision and genuinely do
-nothing.
-
-**Memory is now the binding constraint, and that is what stops the sweep.** At 25
-layers the Spark has **12 GiB** free (24 GiB at 22 layers) — roughly one more layer
-of headroom, not three. The remaining predicted step (19/27, ~487 t/s) would leave
-low single-digit GiB and was deliberately **not** run: the last attempt to grow this
-slice already cost a hard reset, and the gain left on the table (~+5–10 %) does not
-justify repeating that risk. The recommendation is therefore **Mac `0:20` / Spark
-`21:output`** — the measured 440 t/s with 12 GiB to spare — and any further gain has
-to come from making the Mac faster per layer, not from moving layers onto a machine
-that is already at 90 % of its RAM.
-
-**A harness bug of mine aborted the first re-run and is worth recording**, because it
-looked exactly like a system failure: I had added `missing layer` to the early-abort
-pattern, but `waiting for distributed route: distributed route incomplete: missing
-layer N` is a *normal transient* while the worker registers. All three runs
-(including the base configuration that had just worked) were killed by my own script
-before the route completed — the coordinator's log ended with `distributed route
-ready` and the worker's with `coordinator disconnected`. The evidence that cleared
-the system was the instrumentation added after the earlier misdiagnosis: link events
-stayed at 1 (so not the NIC) and the worker had loaded `resident model 86.32 GiB =
-89.39 GiB planned` (so not memory).
-
-**A hardware item worth watching.** `r8127` (Realtek 10GbE) flapping under
-sustained load is a known class of fault — cable, connector, 10GBASE-T thermal
-behaviour or EEE/ASPM. It happened once, at the start of a heavy transfer, and has
-not recurred since the reset (1 link event per boot, the boot-time one;
-`Speed: 10000Mb/s, Duplex: Full, Link detected: yes`, and the count held at 1
-through every run above). If a future run loses the peer, check
-`journalctl -k | grep r8127` **before** assuming a wedge: this incident cost a hard
-reset and a wrong root cause because I diagnosed from reachability instead of from
-the kernel log.
-
----
-
-## 16. The tunnel leaves the operational path (2026-09-20)
-
-`~/ds4-tunnel` existed for one reason, measured on 2026-09-19 and written up in its
-own README: macOS would not let an adhoc/linker-signed binary accept connections on
-a non-loopback address, and the Application Firewall did not change that, so the
-worker's connection had to be carried through `sshd` over loopback.
-
-**That no longer reproduces on macOS 26.7 (build 25G229).** Tested directly rather
-than assumed:
-
-- A `ds4-server` bound to `0.0.0.0` was fetched from the Spark over the direct link:
-  `curl http://192.168.2.1:8099/v1/models` returned the model list, exit 0. On
-  2026-09-19 the same shape of connection was dropped.
-- The **full pipeline with no tunnel anywhere**: worker on the Spark dialling
-  `--coordinator 192.168.2.1 9911` with `--listen 192.168.2.2 55911`, coordinator on
-  the Mac with `--listen 192.168.2.1 9911`. The control connection is a real socket
-  on the link (`ESTAB 192.168.2.2:55652 -> 192.168.2.1:9911`), and a real completion
-  returned exactly `NO TUNNEL OK` (`finish=stop`, 43 tokens), with the coordinator
-  logging `chat ctx=21..69:48 gen=48 THINKING decoding … avg=12.46 t/s`.
-
-So the tunnel is out of the operational path: the GLM 5.3 Flash entry in
-`~/bin/llm_config.json` and the example in `docs/DISTRIBUTED.md` now use the link
-addresses directly, and the tunnel's README leads with a NOT REQUIRED status.
-
-**Kept as a fallback, not deleted.** The blocking behaviour was real and measured,
-so it is OS-version dependent and can return — the README says exactly what to
-re-enable and which loopback form to use if the Spark can no longer reach the Mac's
-listener. Removing the mechanism outright would trade a one-file fallback for a
-debugging session the next time macOS changes its mind.
-
-**Also worth noting for the address question:** the tunnel README already recorded
-that the tunnel must use the literal IPv4 of the direct link and never a hostname,
-because an mDNS resolution failure killed an early session-scoped tunnel mid-ingest.
-That is independent corroboration of the later finding that the name `spike` resolves
-to the Mac's own LAN address and must not be used for this link.
-
----
-
-## 17. Both server configs, verified by running them (2026-09-20)
-
-`~/bin/llm_config.json` is per-host and outside the repository, so both entries
-described here were started and exercised rather than written from memory.
-
-**Mac — GLM 5.3 Flash Q4_K as the pair's coordinator** (`--layers 0:23`, ctx 524288,
-HTTP on 8081). Verified with a real completion through the Spark worker returning
-exactly `PIPELINE OK`, then again after dropping the tunnel with `NO TUNNEL OK`.
-The split is the plan-verified one because that is the combination with **measured
-memory at 512K** (~92 GiB resident on the Spark); the faster `0:20` / `21:output`
-rebalance was measured only at ctx 32768 with ~12 GiB free, so it is documented as a
-short-context option rather than shipped as the default.
-
-**Spark — GLM 5.3 Flash Q2 standalone** (`--ctx 262144`, HTTP on 8081). Q4_K cannot
-be a standalone entry on this machine — 178 GiB against 121 GiB — so the Spark's GLM
-entry is the Q2 model, which fits: `resident model 89.87 GiB + KV 2.92 + buffers
-3.16 = 95.96 GiB planned`. Verified with a completion returning exactly
-`SPARK Q2 OK` (`finish=stop`, 17 tokens). Context is 262144 deliberately, not 512K:
-a whole-model 512K run on this box previously wedged it (§4.1b), so the entry stays
-well below that.
-
-**The Spark's config carries the worker entry, at the owner's direction.** I first
-left it out, on the reasoning that both files hold *servers* and a worker binds no
-HTTP port, so the manager could not health-check it. The owner asked for it there —
-the Spark's role in this pipeline *is* the worker, and having it in the config means
-the pair can be started from two config entries instead of from a README. Both
-commands were then run **as read from the config files themselves**, not retyped:
-HTTP came up and a completion returned exactly `CONFIG OK`, with the worker logging
-`connected to coordinator 192.168.2.1:9911` and the coordinator `gen=3 finish=stop`.
-The entry is named "(pipeline worker)" so it is not mistaken for a server.
-
-The Mac's coordinator must still be started *after* the worker is up.
-
----
-
-## 18. GLM 5.3 Flash was advertised under GLM 5.2 names (2026-09-20)
-
-The owner noticed the served model list showed `glm 5.2`, `glm 5.2 chat` and
-`glm 5.2 reasoner` rather than anything named for 5.3. Cause found, not guessed:
-the GLM branch of `send_models()` in `ds4_server.c` **hardcoded three 5.2-era
-strings** and keyed on the *family* (`ds4_engine_is_glm_dsa`), which covers both
-5.2 and 5.3 — so a 5.3 model advertised 5.2 ids. The DeepSeek-4.1 branch directly
-above it derives its id instead, which is why that family never had the problem.
-
-**The model itself was never wrong**, and it is worth being precise about how that
-was established rather than assumed: `name=GLM 5.3 Flash` in the same listing comes
-from the GGUF, and the coordinator maps 24 of a **46-layer** model at 88.60 GiB — a
-79-layer GLM 5.2 shape cannot do that — so the 5.3 shape had loaded and inference was
-unaffected. The bug was three strings.
-
-**Fix:** derive the base id from `server_model_id_from_engine()` — which already
-distinguishes the variants — and append `-chat` / `-reasoner`, so 5.2 keeps its ids,
-5.3 gets its own, and the next variant needs no edit here. `glm-5.3-flash*` were
-already recognised on *input* (`server_model_alias_known`, with a unit test asserting
-it), so no aliasing work was needed — only the advertisement was stale.
-
-**Verified live, not just compiled:** `/v1/models` now returns `glm-5.3-flash`,
-`glm-5.3-flash-chat`, `glm-5.3-flash-reasoner` (all `name=GLM 5.3 Flash`), and a real
-request with `model=glm-5.3-flash` through the pair returned exactly `ALIAS OK`
-(`finish=stop`). An earlier attempt to check this by timing response codes was
-inconclusive — every request returned no HTTP code because the worker was down — so
-it was redone with the pair actually up rather than reported as evidence.
-
