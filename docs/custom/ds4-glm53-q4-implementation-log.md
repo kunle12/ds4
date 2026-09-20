@@ -1302,8 +1302,14 @@ entry is the Q2 model, which fits: `resident model 89.87 GiB + KV 2.92 + buffers
 a whole-model 512K run on this box previously wedged it (§4.1b), so the entry stays
 well below that.
 
-**Neither config carries the worker command.** Both files hold *servers* — the Mac's
-existing entries and the Spark's llama.cpp entries are all HTTP endpoints — and a
-pipeline worker binds no HTTP port, so putting it there would present an instance the
-manager cannot health-check. The worker command lives in `docs/DISTRIBUTED.md` and in
-the tunnel README instead, and must be started before the Mac's coordinator.
+**The Spark's config carries the worker entry, at the owner's direction.** I first
+left it out, on the reasoning that both files hold *servers* and a worker binds no
+HTTP port, so the manager could not health-check it. The owner asked for it there —
+the Spark's role in this pipeline *is* the worker, and having it in the config means
+the pair can be started from two config entries instead of from a README. Both
+commands were then run **as read from the config files themselves**, not retyped:
+HTTP came up and a completion returned exactly `CONFIG OK`, with the worker logging
+`connected to coordinator 192.168.2.1:9911` and the coordinator `gen=3 finish=stop`.
+The entry is named "(pipeline worker)" so it is not mistaken for a server.
+
+The Mac's coordinator must still be started *after* the worker is up.
