@@ -9,7 +9,7 @@ entry.
 workstreams), `ds4-technical-analysis.md` (engine), `ds4-v41-split-design.md`
 (the analogous V4.1 port study).
 
-**Contents.** §1 status · §2 source changes · §3 chronological log (Phases A–Y) ·
+**Contents.** §1 status · §2 source changes · §3 chronological log (Phases A–Z) ·
 §4 measurements · §5 defects and disposition · §6 corrections · §7 artifacts and host
 configuration · §8 open decisions · §9 next steps and open workstreams · §10 quick
 acceptance commands · §11 snapshot round-trip.
@@ -41,6 +41,7 @@ at 500K depth. What is outstanding is verification breadth, not capability.
 | GLM 5.3 layer-slice correctness (wire width) | **done, validated bit-exact** (§2 #1–3, Phase B) |
 | Cross-machine Q2 pipeline | **working and measured** — 346.41 t/s prefill / 9.26 t/s decode at 403K (§4.1, §4.1b) |
 | **Q4_K on the pair** | **working, measured, and the default** — 389 t/s prefill / 10.3 t/s decode (§4.8). Phase S found the GLM-specific Q4_K kernels 2.7× slower than the pre-existing generic ones, so a homogeneous Q4_K trio routes to the generic dispatch and the ported kernels became the fallback |
+| Where the limit is | **prefill is coordinator-GPU-bound** — the Mac's GPU runs at 99-100 % while the worker waits ~40 % of the time (blocked, not spare); **decode is not GPU-bound on either machine** (~62-71 %, never >=90 %), it is weight-bandwidth-bound at batch 1 (Phase Z) |
 | Q4_K on the Mac alone | **working and measured** — SSD streaming, 82.47 t/s prefill at 262K (§4.2) |
 | Criterion 3 (≥150 t/s prefill, ≥10 t/s decode at 32K) | **met** — 389.0 t/s and 10.2–10.35 t/s (§4.8, Phase T); decode's margin is 2–3 % and is *not* headroom at 262K |
 | Criteria 1, 2 (oracle, boundaries) | **not run** — WS 6, 7; see §9 |
@@ -923,6 +924,40 @@ alternating 96/0 across the session) is that same fact: the worker's 21 layers a
 need ~9.7 s, so the Spark waits. It is why the `0:20` / `21:output` rebalance is
 worth 13 % on prefill and would do much less for decode.
 
+### Phase Z — Which stage is actually saturated (2026-09-20)
+
+Direct measurement of both GPUs across one cold prefill and one decode, to settle
+whether the worker's idle-looking GPU is spare capacity or blocked time. The Mac
+counter is the AGX node's own `Device Utilization %`, targeted explicitly — a bare
+grep over the accelerator tree can match a different node (an idle read returned
+99 that way). The Spark counter is `nvidia-smi utilization.gpu`.
+
+| phase | Mac GPU | Spark GPU | shape |
+| --- | --- | --- | --- |
+| cold prefill, 39 862 tk, 398.7 t/s | **99-100 % sustained** (90.1 % mean incl. the idle tail) | **~57 % duty** — `96 96 96 0 0` repeating (49.2 % mean incl. tails) | one stage saturated, the other waiting |
+| decode, 68 tokens, 12.45 t/s | **~71 %**, never >= 90 % | **~62 %**, never >= 90 % | neither saturated |
+
+**Prefill is coordinator-GPU-bound.** The Mac is pegged while the Spark alternates
+96 % busy with 4-5 s idle. That idle half is *blocked* time, not spare capacity:
+the worker's 21 layers at 0.262 s/layer need 5.5 s per chunk against the
+coordinator's 24 at 0.406 s needing 9.74 s, so the worker finishes and waits. That
+predicts 56.5 % duty; measured ~57 %. There is therefore no headroom to harvest on
+the Spark — the levers are the split rebalance (Phase U: +13 %, bounded by the
+Spark's memory) or a faster coordinator GPU.
+
+**Decode is not GPU-bound on either machine.** Neither exceeds ~75 %, because at
+batch 1 a step is dominated by reading that layer's Q4_K weights and the SMs wait
+on memory. This is why the split barely helps decode (1.04-1.6x, §4.9) while it
+transforms prefill: prefill parallelises across stages, a decode step cannot.
+
+**Consequence for reading §4.9.** The pair's ~4.3x prefill advantage is *not* two
+GPUs computing in parallel — the Mac alone sets the rate. It is the Mac running 24
+*resident* layers instead of 45 *streamed* ones: at 82.47 t/s over 45 layers a
+streamed layer costs ~1.10 s against 0.406 s resident, i.e. 2.71x, times 45/24 =
+1.875x for the layer count, giving ~5.1x before pipeline overheads; measured
+4.3-4.8x across depths. Resident-versus-streamed, not parallel-versus-serial, is
+where the prefill win actually comes from.
+
 ## 4. Measurements
 
 ### 4.1 Q2 pipeline, Mac coordinator (0:23) + Spark worker (24:output), over the tunnel
@@ -1198,6 +1233,9 @@ should not be read as an advantage - and by **~1.5-1.6x at 479K**. The reason is
 512K, while the pair falls ~11 % (8.30 -> 7.395) because all weights are resident.
 The pair's decode case therefore strengthens exactly where the owner works, and is
 near-absent at 32K. Prefill is ~4.0-4.6x at every depth.
+
+Which stage is saturated, and why the two columns behave differently, is
+measured in Phase Z.
 
 `[INFERENCE]` in §4.6 estimated pair decode at ~180-220 t/s prefill and ~6.5 t/s
 decode at depth. Prefill exceeded that by ~1.8x; decode measured 7.395 against the
