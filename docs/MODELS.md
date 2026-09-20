@@ -149,7 +149,7 @@ pass it at runtime with `--vision`.
 | Target | Approximate file size | Use |
 | --- | ---: | --- |
 | `glm53-q2` | 90 GiB | One 128 GB Mac or DGX Spark; ROCm also supported |
-| `glm53-q4` | 178 GiB | Larger Mac, two 128 GB Macs, or SSD streaming |
+| `glm53-q4` | 178 GiB | Larger Mac, two 128 GB Macs, **Mac+Spark pipeline split**, or SSD streaming |
 | `glm53-fp8` | 305 GiB | Packaged native weights only; inference not implemented |
 
 ```sh

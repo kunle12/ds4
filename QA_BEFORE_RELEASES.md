@@ -589,8 +589,10 @@ block. A GLM 5.2 pass does not cover these paths.
 - On one DGX Spark, run Q2 through CUDA and repeat the primitive, official
   continuation, 4,096-4,100 boundary, continued-prefill, snapshot, MTP, server,
   and coding-agent gates. Validate independently on `.180` and `.181`; they are
-  separate single-host runs, not CUDA TP. Q4 and Spark-to-Spark RDMA are not
-  supported in this pass. The accepted `.180` 100-case reference is average
+  separate single-host runs, not CUDA TP. Q4 does not fit on one Spark, and
+  Spark-to-Spark RDMA remains unsupported in this pass; the supported Q4_K route is
+  the Mac+Spark pipeline split, gated under section 10. The accepted `.180` 100-case
+  reference is average
   NLL `0.461783551`, first-token agreement `90/100`, and average greedy prefix
   `7.49`.
 - For the default compact CUDA graph, dump the complete first-token logits at
@@ -1025,6 +1027,15 @@ loading code changes.
 - Save and restore a distributed KV snapshot if that code changed.
 - If CUDA distributed is relevant, test across the CUDA hosts and record
   generation speed, not just "it works".
+- For GLM 5.3 Flash Q4_K across a Mac and a Spark, run the pipeline split
+  (`0:23` / `24:output`) with the coordinator serving HTTP and confirm a real
+  completion through it before recording numbers. At ctx 524288 this holds ~92 GiB
+  resident on the Spark. The `0:20` / `21:output` rebalance is faster (440 vs
+  389 t/s prefill, because the Mac's per-layer cost is the slower stage) but leaves
+  only ~12 GiB free, so run it at short context only. Afterwards check
+  `journalctl -k | grep "r8127: enP7s7: link down"` — this NIC flaps intermittently
+  on the Spark, and a flap aborts the run and can leave the host off the network
+  until the interface state is re-established.
 
 ## 11. Disk KV Cache
 
@@ -1413,6 +1424,7 @@ context sweeps and memory limits.
 | Two M5 Max, Metal RDMA TP | GLM 5.2 IQ2_XXS, 4096-token prefill, 256 teacher-forced decode tokens | about 214 t/s | about 16.7 t/s |
 | M5 Max, Metal | GLM 5.3 full Q2 SSD, 16 GiB expert budget, section 7 commands | 12.59 t/s median | 6.14 t/s median |
 | DGX Spark, CUDA | GLM 5.3 Flash Q2, 2048-token prefill, 16 decode tokens | 531.39 t/s | 14.35 t/s |
+| Mac coordinator + DGX Spark worker, pipeline | GLM 5.3 Flash **Q4_K**, 28657-token prompt, ctx 32768 | 389.16 t/s (440.42 with `0:20`/`21:output`) | 10.3 t/s |
 | Strix Halo, ROCm | Flash 0731 IQ2, temperature-1 128-token code prompt | - | 16.26 ordinary; 12.28 opportunistic; 13.52 exact t/s |
 | 8x L40S, CUDA TP | Flash Q4, 2048-token prefill benchmark | 1524.84 t/s | 46.93 t/s |
 | 8x L40S, CUDA TP | Flash Q4, 16-row decode oracle | - | 126.0 aggregate t/s |

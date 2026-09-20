@@ -90,8 +90,14 @@ Q2 is the resident target for one Spark:
 ./ds4 --cuda -m gguf/GLM-5.3-Flash-Q2.gguf --ctx 16384
 ```
 
-Q4 does not fit resident. GLM Spark-to-Spark tensor parallelism is not
-implemented; the two-Mac RDMA instructions do not apply to GLM on CUDA.
+Q4 does not fit resident on one Spark, and GLM Spark-to-Spark tensor parallelism is
+not implemented (the two-Mac RDMA instructions do not apply to GLM on CUDA). The
+supported way to run GLM 5.3 Flash at Q4_K is the **pipeline split** against a
+128 GB Mac — see the Q4_K pipeline example in [DISTRIBUTED.md](DISTRIBUTED.md).
+Measured on the pair: **389 t/s prefill / 10.3 t/s decode** at ctx 32768 with the Mac
+on `0:23` and the Spark on `24:output`, and **440 t/s prefill** rebalanced to `0:20` /
+`21:output` — though that leaves only ~12 GiB free on the Spark, so it is a
+short-context option. At ctx 524288 the `0:23` split holds ~92 GiB resident here.
 
 ## Vision and speculative decoding
 

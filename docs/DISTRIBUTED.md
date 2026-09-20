@@ -161,6 +161,37 @@ generation stream cannot use that overlap: each token must finish the route
 before the next one is sampled. Use pipeline mode primarily for capacity and
 long-prefill throughput, not as a guaranteed decode speedup.
 
+### GLM 5.3 Flash Q4_K across a Mac and a Spark
+
+The same model file on both machines; the Mac coordinates and the Spark works.
+Q4_K does not fit on the Spark alone, so this split is what makes it usable there.
+Measured at ctx 32768: **389 t/s prefill / 10.3 t/s decode** on `0:23` / `24:output`.
+
+```sh
+# Spark — worker. Dials its own loopback; the tunnel carries it to the Mac.
+~/bin/ds4 --cuda -m ~/mlmodels/glm/GLM-5.3-Flash-Q4_K.gguf \
+  --role worker --layers 24:output --coordinator 127.0.0.1 9911 \
+  --listen 127.0.0.1 55911 --ctx 524288
+
+# Mac — coordinator, serving HTTP on 8081.
+~/bin/ds4-server -m ~/mlmodels/glm/GLM-5.3-Flash-Q4_K.gguf \
+  --role coordinator --layers 0:23 --listen 127.0.0.1 9911 \
+  --ctx 524288 --host 0.0.0.0 --port 8081
+```
+
+Both hosts use loopback addresses because macOS does not let an adhoc-signed binary
+accept connections on a non-loopback address, and the Application Firewall does not
+change that. `~/ds4-tunnel` keeps the two forwards alive
+(`-R 9911:127.0.0.1:9911` for the worker's control connection,
+`-L 55911:127.0.0.1:55911` for the coordinator's data connection, which snapshots
+also use). Use the **literal IPv4** of the direct link, never a hostname — an mDNS
+resolution failure killed the first session-scoped tunnel mid-ingest.
+
+At ctx 524288 the worker holds ~92 GiB resident. Rebalancing three layers to the
+Spark (`0:20` / `21:output`) measures **440 t/s prefill** — ~13 % faster, because the
+Mac's per-layer cost is the slower stage — but leaves only ~12 GiB free on the
+Spark, so treat it as a short-context option rather than the default.
+
 ### Full PRO Q4
 
 For two 512 GB Mac Studios, use the split artifacts:
