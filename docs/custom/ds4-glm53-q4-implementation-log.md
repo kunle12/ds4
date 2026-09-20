@@ -950,6 +950,21 @@ batch 1 a step is dominated by reading that layer's Q4_K weights and the SMs wai
 on memory. This is why the split barely helps decode (1.04-1.6x, §4.9) while it
 transforms prefill: prefill parallelises across stages, a decode step cannot.
 
+**Traffic direction, measured** (Mac `en0`, `netstat -ib`; note `$7` is Ibytes =
+received and `$10` is Obytes = sent, a distinction an earlier ad-hoc probe of mine
+got backwards). Across a cold 8 274-token prefill at 326.5 t/s, the Mac sent at
+174.85 MB/s mean over active intervals (peaks 260.31, 147.06, 117.20 MB/s) and
+received **0.20 MB/s** - **871x one-way**. The bursts are the chunk transfers:
+8 274 tokens at ~64 KiB/token is ~525 MB, and the three bursts sum to ~524 MB, i.e.
+one ~256 MiB burst per 4096-token chunk, which matches Phase U's "256 MiB against
+5.5 s". So the coordinator pushes activations *to* the worker and gets back
+essentially only the sampled token, consistent with the worker holding the output
+head (`--layers 24:output`). ~64 KiB/token is 4x a 4096-wide f32 hidden state, so
+the hop carries more than the hidden state alone - GLM 5.3's KDA and pool-4
+indexer state are the likely remainder, and `--dist-activation-bits 16` halving the
+payload would be consistent with that `[INFERENCE]`; the tensor list was not
+inspected. Peak 260 MB/s is ~20 % of the 10GbE link, average ~2 %.
+
 **Consequence for reading §4.9.** The pair's ~4.3x prefill advantage is *not* two
 GPUs computing in parallel — the Mac alone sets the rate. It is the Mac running 24
 *resident* layers instead of 45 *streamed* ones: at 82.47 t/s over 45 layers a
