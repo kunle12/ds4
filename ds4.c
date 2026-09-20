@@ -46082,18 +46082,16 @@ static bool glm_graph_layer_uses_generic_routed_moe(
      * always been served by the generic routed-MoE dispatch. */
     if (l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS) return true;
 
-    /* SPIKE: a homogeneous Q4_K expert trio is rejected by the GLM-specific
-     * CUDA implementation ("glm routed moe: unsupported types 12/12/12"),
-     * while the generic dispatch carries Q4_K kernels and already serves this
-     * model's expert shapes. Gate it behind an env var so the experiment can be
-     * confined to one host and the validated Metal path is untouched. Remove,
-     * or make unconditional, once the result is measured. */
-    static int q4k_spike = -1;
-    if (q4k_spike < 0) {
-        q4k_spike = getenv("DS4_GLM_GENERIC_MOE_Q4K") != NULL ? 1 : 0;
-    }
-    if (q4k_spike &&
-        l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+    /* A homogeneous Q4_K trio is served there too. The GLM-specific dispatch was
+     * ported to accept Q4_K (plan WS 1-4) and does produce identical output, but
+     * measured on the target pair its kernels prefill at 95.3 t/s against the
+     * generic dispatch's 258.9 t/s - 2.7x - because the generic path uses
+     * tensor-core tile16 Q4_K kernels and the ported ones do not. So the generic
+     * dispatch is the default for this type, and `DS4_GLM_GENERIC_MOE_Q4K`, which
+     * used to gate this while the port was being written, is gone. The
+     * GLM-specific Q4_K kernels remain reachable through `DS4_CUDA_GLM_MOE_TYPES`
+     * and are still covered by `make test-glm53-moe-q4k`. */
+    if (l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_down_exps->type == DS4_TENSOR_Q4_K) {
         return true;

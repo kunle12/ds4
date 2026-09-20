@@ -55,7 +55,7 @@ and — as of this writing — the Q2 pair parked in the working configuration t
 | 3 | `ds4.c:73521` (`ds4_session_eval_output_head_from_hc`) | write into `gg->hc_cur` for glm53 | the head collapses the HC block; writing `gg->cur` left it stale | built both |
 | 4 | `ds4_metal.m:4754` + `:4821` | new `ds4_metal_executable_dir()`; search `<exe_dir>/metal/…` in addition to `metal/…` and `./metal/…` | kernel sources were CWD-relative only, so an installed binary (`~/bin/ds4-server` + `~/bin/metal`) only worked if started from a directory containing `metal/` | built, verified from `/tmp` |
 | 5 | `ds4.c:61000` (`glm_layer_payload_tensor_bytes`, KDA branch) | the branch no longer rejects the payload header's **uniform** `compact_live`/index counts; it returns the conv + recurrent state span and asserts it is non-zero | the guard made any slice containing a KDA layer unsizeable as soon as a context existed, so the first distributed checkpoint failed with `distributed KV shard tensor size overflow` | snapshot save **and** load verified end to end (§11) |
-| 6 | `ds4.c:46078` (`glm_graph_layer_uses_generic_routed_moe`) | **experiment, inert unless `DS4_GLM_GENERIC_MOE_Q4K` is set**: a homogeneous Q4_K expert trio may be routed through the generic MoE dispatch | a spike shortcut to exercise Q4_K on CUDA before the kernel port exists; its own comment says remove or make unconditional once the result is measured. **Not part of the design** — plan WS 1–4 supersede it | built on both backends; not a correctness path |
+| 6 | `ds4.c:46076` (`glm_graph_layer_uses_generic_routed_moe`) | the Q4_K branch is now **unconditional**: a homogeneous Q4_K expert trio always routes to the generic dispatch. ~~`DS4_GLM_GENERIC_MOE_Q4K`, added to gate it while the port was being written, **removed 2026-09-20**~~ | a spike shortcut to exercise Q4_K on CUDA before the kernel port exists; its own comment said remove or make unconditional once the result is measured. Both paths were then measured against each other on the pair — speed and output — and the shortcut turned out to be **2.7× faster** (258.9 vs 95.3 t/s prefill, identical output), so it was promoted rather than dropped; see §13 | Q4_K now defaults to the generic dispatch; the GLM-specific Q4_K kernels stay reachable via `DS4_CUDA_GLM_MOE_TYPES` and are still covered by `make test-glm53-moe-q4k` |
 
 Changes 1–3 are the fix that makes GLM 5.3 pipeline mode work at all; change 4 is
 required for the `~/bin` deployment convention; change 5 unblocks distributed
@@ -923,7 +923,7 @@ no-op after a hit, not the defect — the defect's message is
 
 ---
 
-## Q2 standalone regression check (baseline comparison)
+## 12. Q2 standalone regression check (baseline comparison)
 
 The question this answers: did any of the GLM Q4_K work break the **existing** Q2
 paths on a single machine? Q2 is the shipped sparse recipe and shares a binary
@@ -977,3 +977,79 @@ DSML4.1 syntax in `ds4_agent.c`, the model id in `ds4_server.c`, `ds4_tp.c`) is
 byte-identical to baseline, and a V4.1 Q2 model routes by the same type-based
 rule to the same untouched dispatcher. That is inference from identical inputs,
 not a measurement — if a V4.1 Q2 GGUF appears, repeat the check above against it.
+
+---
+
+## 13. Which Q4_K dispatch is the default, and why (2026-09-20)
+
+**The short version: the ported GLM-specific Q4_K kernels are correct but slow,
+and the pre-existing generic dispatch is 2.7× faster at prefill. Q4_K now routes
+there by default, and criterion 3's prefill bar is met for the first time.**
+
+**Why both paths had to be measured before removing the spike.** Plan §8 said to
+"drop it when [WS 1–2] land, or promote it deliberately — do not leave two
+dispatch paths unexamined", and §8's own note had already argued *against*
+destroying the comparison early, because the spike was "the only artefact of the
+Q4_K-on-CUDA comparison". So the gate came out only after the two were run against
+each other. That was the right order, because the result contradicted the
+workstreams' premise.
+
+**The measurement.** Same pair, same 1091-token prompt, greedy `-n 64`, the only
+difference being which dispatch each host's layers take. The GLM dispatch prints a
+per-call trace, so the trace doubles as the discriminator that the intended path
+was really taken — 0 lines means the generic dispatch ran, and a non-zero count
+means the GLM one did. That matters: an earlier comparison in this project was
+void precisely because a switch silently failed to apply.
+
+| config | Mac | Spark | Spark trace | prefill | decode | 64-token output |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| A | GLM-specific (Metal) | GLM-specific (CUDA) | 1344 | **95.25 t/s** | 11.18 t/s | reference |
+| B | GLM-specific (Metal) | **generic** (CUDA) | **0** | **257.42 t/s** | 11.26 t/s | identical |
+| D | **generic** (Metal) | **generic** (CUDA) | **0** | **258.92 t/s** | 11.37 t/s | identical |
+
+All three outputs are **byte-identical over 64 greedy tokens** (300 bytes each).
+D is the configuration an unconditional rule produces, which is why it was run: the
+predicate lives in shared `ds4.c`, so promoting the spike also moves the **Metal**
+side, and that side is what this project spent all its time validating against.
+
+**Why the generic path wins, mechanically.** Not tuning luck — tensor cores. The
+generic dispatch's Q4_K path selects `moe_gate_up_mid_q4K_tile16_mma_kernel<512>`
+and `moe_down_q4K_tile16_mma_kernel<512>` (`ds4_cuda.cu` ~25236 / ~25711, gated by
+`use_q4_mma_tiles16`). The WS 2/3 port instantiated `glm_routed_moe_*_tile8_*`
+kernels, which do not use MMA. On a GB10 that is the whole difference.
+
+**What changed.** `glm_graph_layer_uses_generic_routed_moe` now returns true for a
+homogeneous Q4_K trio unconditionally; the `DS4_GLM_GENERIC_MOE_Q4K` gate is gone.
+The GLM-specific Q4_K kernels remain reachable through `DS4_CUDA_GLM_MOE_TYPES`
+and are still covered directly by `make test-glm53-moe-q4k`, so the port is not
+dead code — it is a reference implementation and a fallback, not the default.
+
+**Verified on the promoted default, with no routing variable set anywhere:**
+
+| check | result |
+| --- | --- |
+| Spark GLM-dispatch trace | **0** — the generic dispatch is now the default |
+| Mac startup banner | names no routing switch (proves nothing was set) |
+| prefill / decode | **257.71 t/s** / 11.34 t/s (was 95.25 / 11.18) |
+| 64-token output | byte-identical to run A |
+| `make test-glm53-moe-q4k` | PASS, `worst rel = 0.000e+00`, exit 0 |
+
+**Consequences, stated plainly.**
+
+1. **Criterion 3's prefill bar is met.** It required ≥ 150 t/s at 32K on the pair;
+   the ported path measured 100.57 t/s and could not reach it, and the promoted
+   default measures 257.71 t/s at ctx 8192. The 32K-context confirmation is the
+   remaining formality.
+2. **WS 2/3's premise was wrong, and the log should say so rather than bury it.**
+   Those workstreams existed to give the GLM-specific dispatch Q4_K support so it
+   could supersede the spike. The kernels are correct and now covered by a parity
+   test, but the dispatch was never the bottleneck the plan treated it as: a
+   cheaper path already existed and is faster. The plan's judgement that the spike
+   was a stopgap to be superseded was reasonable on the evidence available, and
+   measuring both is what settled it.
+3. **The next lever is load balance, not the Mac.** B (257.42) and D (258.92) are
+   within noise of each other, so the Mac's routing choice does not move
+   throughput at all — the Spark's stage is the critical path. Prefill on a
+   pipeline is `max(stage)`, and the split currently gives the Mac 24 layers and
+   the Spark 22; giving the Spark fewer should raise the maximum. That is
+   measurable with the existing harness and is the obvious next experiment.

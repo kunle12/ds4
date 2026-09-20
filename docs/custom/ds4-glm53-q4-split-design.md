@@ -430,11 +430,18 @@ Layered, cheapest first; each layer must pass before the next is trusted.
 * No new user-facing flags; the type support is a capability of the CUDA GLM
   path. `DS4_CUDA_GLM_MOE_TYPES` is diagnostic, documented with the other
   env vars.
-* **`DS4_GLM_GENERIC_MOE_Q4K` is an experiment, not part of this design.** It
-  routes a homogeneous Q4_K expert trio through the generic MoE dispatch and is
-  inert unless the variable is set. It exists to exercise Q4_K on CUDA before the
-  kernel port lands; WS 1–2 supersede it. Drop it when they land, or promote it
-  deliberately — do not leave two dispatch paths unexamined.
+* ~~**`DS4_GLM_GENERIC_MOE_Q4K` is an experiment, not part of this design.**~~
+  **Removed 2026-09-20, and promoted rather than dropped.** The two dispatch paths
+  were measured against each other on the pair before the gate came out — speed
+  and output — which is what "do not leave two dispatch paths unexamined" was
+  asking for, and the answer was not the one the workstreams assumed: the generic
+  dispatch prefills at **258.9 t/s** against the ported GLM-specific kernels'
+  **95.3 t/s**, 2.7×, with **byte-identical** output over 64 greedy tokens. So a
+  homogeneous Q4_K trio now routes to the generic dispatch unconditionally, and
+  the ported GLM-specific Q4_K kernels are a reachable-by-hatch fallback covered
+  by `make test-glm53-moe-q4k`. The reason is mechanism: the generic path uses
+  tensor-core tile16 Q4_K kernels, the ported ones do not. This is the difference
+  between criterion 3 passing and failing (implementation log §13).
 * Update, in the same change set: `docs/DGX_SPARK.md` §GLM 5.3 (state that Q4 is
   the pipeline target and needs both machines), `MODELS.md` (the two-machine Q4
   row), `docs/DISTRIBUTED.md` (a Q4 pipeline example), and
