@@ -9,7 +9,7 @@ entry.
 workstreams), `ds4-technical-analysis.md` (engine), `ds4-v41-split-design.md`
 (the analogous V4.1 port study).
 
-**Contents.** §1 status · §2 source changes · §3 chronological log (Phases A–AA) ·
+**Contents.** §1 status · §2 source changes · §3 chronological log (Phases A–AB) ·
 §4 measurements · §5 defects and disposition · §6 corrections · §7 artifacts and host
 configuration · §8 open decisions · §9 next steps and open workstreams · §10 quick
 acceptance commands · §11 snapshot round-trip.
@@ -31,16 +31,20 @@ points at hold the evidence. Where a number appears here it is the latest measur
 one, and earlier revisions of this table are superseded rather than preserved.*
 
 **Where it stands.** Q4_K runs on the pair at **389 t/s prefill / 10.3 t/s decode**
-(ctx 32768, 28 657-token prompt), or **440 t/s** with the split rebalanced — against
-a ≥150 t/s criterion. A depth sweep against the single-machine path (§4.9) puts
-prefill at **4.0-4.6x** and decode at **1.04-1.6x**, the decode lead appearing only
-at 500K depth. What is outstanding is verification breadth, not capability.
+(ctx 32768, 28 657-token prompt) — against a ≥150 t/s criterion. A depth sweep
+against the single-machine path (§4.9) puts prefill at **4.0-4.6x** and decode at
+**1.04-1.6x**. Phase AB then measured the split itself and found the recommended
+configuration below: **+16.5 % prefill at 286 K over the split the owner ran, for
+decode unchanged.**
+*Last updated 2026-09-20. This table is the entry point; the phases and sections it
+points at hold the evidence.*
 
 | Area | State |
 | --- | --- |
 | GLM 5.3 layer-slice correctness (wire width) | **done, validated bit-exact** (§2 #1–3, Phase B) |
 | Cross-machine Q2 pipeline | **working and measured** — 346.41 t/s prefill / 9.26 t/s decode at 403K (§4.1, §4.1b) |
 | **Q4_K on the pair** | **working, measured, and the default** — 389 t/s prefill / 10.3 t/s decode (§4.8). Phase S found the GLM-specific Q4_K kernels 2.7× slower than the pre-existing generic ones, so a homogeneous Q4_K trio routes to the generic dispatch and the ported kernels became the fallback |
+| **Recommended split** | **Mac `0:20` / Spark `21:output`** — Mac 21 layers, Spark 24 + head, Spark's guard reserve at 14 GiB. +16.5 % prefill at 286 K over `0:23`, decode unchanged; Spark at 96 % duty with no throttling (Phase AB) |
 | Where the limit is | **prefill is coordinator-GPU-bound** — the Mac's GPU runs at 99-100 % while the worker waits ~40 % of the time (blocked, not spare); **decode is not GPU-bound on either machine** (~62-71 %, never >=90 %), it is weight-bandwidth-bound at batch 1 (Phase Z) |
 | Q4_K on the Mac alone | **working and measured** — SSD streaming, 82.47 t/s prefill at 262K (§4.2) |
 | Criterion 3 (≥150 t/s prefill, ≥10 t/s decode at 32K) | **met** — 389.0 t/s and 10.2–10.35 t/s (§4.8, Phase T); decode's margin is 2–3 % and is *not* headroom at 262K |
@@ -1065,6 +1069,92 @@ one.
 
 What Phase Z keeps: prefill is coordinator-bound, the worker's idle time is blocked
 rather than spare, and decode saturates neither GPU.
+
+### Phase AB — Split sweep: where the pipeline actually wants its layers (2026-09-20)
+
+The owner stopped the inference instance and asked for the highest end-to-end
+result, with the Spark carrying the compute-bound layers and the Mac the
+bandwidth-bound decode. Both machines were free, so both were driven directly and
+both logs captured (the owner's instance wrote to a terminal, which is why earlier
+work could only measure at the HTTP boundary).
+
+**Method.** One cold streaming call per configuration: TTFT is the prefill and the
+inter-token gaps are the decode, from the same request. The prompt is nonce-prefixed
+so the session cache cannot serve it (Phase Y). Each run also yields the engine's
+own per-chunk telemetry in the coordinator log, which excludes pipeline fill and is
+the cleaner prefill figure. The sweep is at 39,865 tokens; the two leading
+configurations were re-run at 286,646 tokens - the same depth as §4.9, so the
+standalone comparison stays valid.
+
+**Memory bandwidth, measured** (streaming read, best of five, 8 GiB buffers; this
+is a CPU-side proxy, so both numbers sit below spec - the ratio is the point):
+
+| host | read-only | copy |
+| --- | ---: | ---: |
+| Mac M4 Max | **295.1 GB/s** | 369.0 GB/s |
+| Spark GB10 | **100.7 GB/s** | 123.2 GB/s |
+
+The Mac streams memory 2.9x faster than the Spark. That is the mechanism behind the
+decode slope below.
+
+**The frontier** (coordinator holds `0:N`, ctx 524288):
+
+| split | Mac layers | Spark layers | prefill | decode | Mac plan | Spark plan |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `0:20` | 21 | 24 + head | **455.2 t/s** | 103.0 ms | 82.22 GiB | 104.73 GiB (reserve 14) |
+| `0:23` *(was current)* | 24 | 21 + head | 398.8 t/s | 98.5 ms | 94.88 GiB | 92.07 GiB |
+| `0:26` | 27 | 18 + head | 366.9 t/s | 95.2 ms | 107.15 GiB | 79.80 GiB |
+| `0:27` | 28 | 17 + head | 344.9 t/s | **93.9 ms** | 111.64 GiB | 75.31 GiB |
+
+Both slopes are linear across the whole range - `0:27`'s decode landed on the fit to
+0.0 ms:
+
+- **decode: -1.30 ms per layer moved to the Mac** (its bandwidth)
+- **prefill: -15.8 t/s per layer moved to the Mac** (the Spark's compute)
+
+**Why the two sensitivities differ by ~4x, and why that decides the split.**
+Prefill costs `max(Mac stage, Spark stage)`, so moving a layer off the slow stage
+buys the whole difference between the stages - a large effect. Decode costs
+`Mac + Spark` in series, so moving a layer merely swaps one stage's cost for the
+other's, and only the per-layer *difference* (1.30 ms) appears. The split is thus
+~4x more sensitive for prefill than for decode, and should be set for prefill: the
+decode penalty is small, the prefill gain is large.
+
+**Validated at the operating depth** (286 646 tokens - the same prompt and cap as
+§4.9, so the standalone comparison still holds):
+
+| split | prefill | ingest for 286 646 tk | decode |
+| --- | ---: | ---: | ---: |
+| `0:20` | **415.0 t/s** | **11.5 min** | **121.1 ms** |
+| `0:23` *(was current)* | 356.3 t/s | 13.4 min | 120.5 ms |
+
+**At depth the Spark-heavy split is a straight win: +16.5 % prefill for decode
+unchanged** (0.6 ms, inside the run's own gap spread of 116.1-125.8 ms). The 4.6 %
+decode penalty measured at 40 000 tokens disappears here, because the
+depth-dependent attention term grows with context and dilutes the per-layer
+difference between the machines. The consequence is the useful one: **the deeper
+the context, the better the Spark-heavy split looks**, and this workload is deep.
+Prefill also stays depth-robust - 415 t/s at 286 K against 455 t/s at 40 K.
+
+**Thermal: the Spark takes 96 % duty without throttling.** At `0:20` the Spark is
+the binding stage and runs 96 % GPU duty against ~57 % at `0:23`. Its board zone
+peaks at **83.5 °C** versus 83.9 °C measured at 57 % duty, with `hw_thermal_slowdown`
+and `sw_power_cap` both Not Active and the SM clock at 2093 MHz, the top of its lock.
+Loading the Spark harder is thermally free on this unit - Phase Y's 83.9 °C was not
+a duty-limited ceiling.
+
+**Operational lessons that cost real time here:**
+
+- macOS has no `setsid`; using it silently loses the launched process. `nohup ... &`
+  is enough.
+- `ssh` inside a *backgrounded* job hangs because it inherits the job's stdin pipe.
+  Use `ssh -n`. This is what stalled several harness scripts at their first remote
+  call, leaving the coordinator unlaunched.
+- Readiness must be the served payload, not the port: the port answers before the
+  model is loaded, and a supervisor's log match can hit a *previous* run's line
+  under the same process name.
+- `hub start` is the reliable way to launch the coordinator on the Mac; a bare
+  `nohup ... &` from a backgrounded script does not survive.
 
 ## 4. Measurements
 
