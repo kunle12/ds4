@@ -614,7 +614,7 @@ tunnel job (now optional), and `~/ds4-deploy.sh`. All are backed up on the Mac.
 
 | Path | What |
 | --- | --- |
-| `~/dev/ds4/` | rsync'd tree, content-matched to the Mac (`~/ds4-deploy.sh check` reports parity) |
+| `~/dev/ds4/` | a real checkout of upstream `main` at `8db1d1d` (the fork point), with the local work applied as uncommitted changes — 12 modified files plus `docs/custom/`, `docs/NETWORK_SETUP.md` and the WS-5 test. `~/ds4-deploy.sh` keeps its *content* matched to the Mac's tree rather than its git state; `ds4.c` md5 is identical on both hosts (`0ce1a1b7…`) |
 | `~/bin/` | the same five binaries, built with `make -j20 cuda-spark` (`sm_121`) |
 | `~/mlmodels/glm/` | Q2 + Q4_K GGUFs and the vision encoder |
 | `~/thermal-protect/` | protection kit source |
