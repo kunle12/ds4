@@ -9,7 +9,7 @@ entry.
 workstreams), `ds4-technical-analysis.md` (engine), `ds4-v41-split-design.md`
 (the analogous V4.1 port study).
 
-**Contents.** §1 status · §2 source changes · §3 chronological log (Phases A–Z) ·
+**Contents.** §1 status · §2 source changes · §3 chronological log (Phases A–AA) ·
 §4 measurements · §5 defects and disposition · §6 corrections · §7 artifacts and host
 configuration · §8 open decisions · §9 next steps and open workstreams · §10 quick
 acceptance commands · §11 snapshot round-trip.
@@ -986,7 +986,8 @@ rebalance in §4.8 is already qualified as short-context only. Two layers gives
 Mac 22 / Spark 23: 22 x 0.406 = 8.93 s against today's 24 x 0.406 = 9.74 s, about
 **+9 %** prefill.
 
-**The balance point is unreachable at any context.** Equating 0.406m with 0.262s
+**The balance point is unreachable at any context.** *(Superseded - see Phase AA:
+this treated the Spark's guard budget as a hardware property. It is a setting.)* Equating 0.406m with 0.262s
 over 45 layers puts the optimum near Mac 18 / Spark 27, needing ~110.8 GiB of
 weights on the Spark against the 97.88 GiB available. The Spark cannot carry enough
 to stop being the idle stage, so the Mac stays binding and the gain available from
@@ -1014,6 +1015,56 @@ streamed layer costs ~1.10 s against 0.406 s resident, i.e. 2.71x, times 45/24 =
 1.875x for the layer count, giving ~5.1x before pipeline overheads; measured
 4.3-4.8x across depths. Resident-versus-streamed, not parallel-versus-serial, is
 where the prefill win actually comes from.
+
+### Phase AA — Correction: the Spark's guard budget is a setting, not a limit (2026-09-20)
+
+Phase Z's claim that "the balance point is unreachable at any context" was **wrong**,
+and so was its arithmetic: it treated the Spark's 103.63 GiB guard budget as a
+hardware property. It is not. The owner challenged it on the grounds that both
+machines are sold as 128 GB, and they are right.
+
+Where the budgets come from (`ds4.c`):
+
+- `glm_graph_memory_guard_budget()` sets the base to `hw.memsize` on Apple, else to
+  `ds4_gpu_recommended_working_set_size()`, which on CUDA returns
+  `cudaMemGetInfo` total x device count.
+- `budget = min(0.99 x base, base - reserve)`, with reserve 18 GiB for GLM 5.3 on a
+  108-160 GiB host (`glm_graph_memory_guard_default_reserve_gib`).
+- On Apple an explicit `iogpu.wired_limit_mb` overrides both: `wired_limit - 2 GiB`.
+
+| | Mac | Spark |
+| --- | ---: | ---: |
+| OS-visible total | 128.00 GiB (`hw.memsize` 137438953472) | 121.61 GiB (`MemTotal` 127533280 kB) |
+| guard base | 128.00 GiB | 121.61 GiB |
+| default budget (base - 18) | 110.00 GiB | 103.61 GiB |
+| override in effect | `iogpu.wired_limit_mb=120000` | none |
+| **effective budget** | **115.19 GiB** (117.19 - 2) | **103.63 GiB** |
+
+So the 11.56 GiB gap decomposes as **6.37 GiB of hardware** — the GB10 does not
+expose ~6.4 GiB of its 128 GB to Linux — plus **5.19 GiB of tuning**, the Mac's
+raised wired limit. On identical settings the machines are ~6.4 GiB apart, not 11.6.
+
+Two consequences, both against what Phase Z said:
+
+1. **The reserve is runtime-tunable on both platforms**
+   (`DS4_GLM_MEMORY_GUARD_RESERVE_GB`, `DS4_GLM_MEMORY_GUARD_FRACTION`), and the
+   Mac's own advantage comes from exactly such an override. The Spark can be given
+   back the 5 GiB and more.
+2. **The Spark-as-coordinator can hold more layers than Phase Z allowed.** Its
+   earlier figure used a flat ~4 GiB/layer over the current 21-layer slice, but the
+   *prefix* it would take includes blk.0-2 at 0.408 GiB each. At the default reserve
+   that lands at ~24 layers — i.e. the split the `0:20` rebalance already measured at
+   **+13 % prefill**. Lowering the reserve toward 10-12 GiB reaches ~26-27, which is
+   where the compute balance is estimated to sit.
+
+Whether the balance is real cannot be settled by arithmetic: the per-layer rates
+(0.406 s Mac, 0.262 s Spark) are averages over *different layer mixes*, the Mac's
+including the three dense blocks, so the comparison is confounded, exactly as Phase Z
+already notes. It needs a measurement — the role swap is the experiment that produces
+one.
+
+What Phase Z keeps: prefill is coordinator-bound, the worker's idle time is blocked
+rather than spare, and decode saturates neither GPU.
 
 ## 4. Measurements
 
