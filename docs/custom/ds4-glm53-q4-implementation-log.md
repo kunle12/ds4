@@ -1313,3 +1313,34 @@ HTTP came up and a completion returned exactly `CONFIG OK`, with the worker logg
 The entry is named "(pipeline worker)" so it is not mistaken for a server.
 
 The Mac's coordinator must still be started *after* the worker is up.
+
+---
+
+## 18. GLM 5.3 Flash was advertised under GLM 5.2 names (2026-09-20)
+
+The owner noticed the served model list showed `glm 5.2`, `glm 5.2 chat` and
+`glm 5.2 reasoner` rather than anything named for 5.3. Cause found, not guessed:
+the GLM branch of `send_models()` in `ds4_server.c` **hardcoded three 5.2-era
+strings** and keyed on the *family* (`ds4_engine_is_glm_dsa`), which covers both
+5.2 and 5.3 — so a 5.3 model advertised 5.2 ids. The DeepSeek-4.1 branch directly
+above it derives its id instead, which is why that family never had the problem.
+
+**The model itself was never wrong**, and it is worth being precise about how that
+was established rather than assumed: `name=GLM 5.3 Flash` in the same listing comes
+from the GGUF, and the coordinator maps 24 of a **46-layer** model at 88.60 GiB — a
+79-layer GLM 5.2 shape cannot do that — so the 5.3 shape had loaded and inference was
+unaffected. The bug was three strings.
+
+**Fix:** derive the base id from `server_model_id_from_engine()` — which already
+distinguishes the variants — and append `-chat` / `-reasoner`, so 5.2 keeps its ids,
+5.3 gets its own, and the next variant needs no edit here. `glm-5.3-flash*` were
+already recognised on *input* (`server_model_alias_known`, with a unit test asserting
+it), so no aliasing work was needed — only the advertisement was stale.
+
+**Verified live, not just compiled:** `/v1/models` now returns `glm-5.3-flash`,
+`glm-5.3-flash-chat`, `glm-5.3-flash-reasoner` (all `name=GLM 5.3 Flash`), and a real
+request with `model=glm-5.3-flash` through the pair returned exactly `ALIAS OK`
+(`finish=stop`). An earlier attempt to check this by timing response codes was
+inconclusive — every request returned no HTTP code because the worker was down — so
+it was redone with the pair actually up rather than reported as evidence.
+

@@ -14949,11 +14949,20 @@ static bool send_models(server *s, int fd) {
         buf_putc(&b, ',');
         append_model_json(&b, s, "qwen3.8-flash-next-reasoner");
     } else if (ds4_engine_is_glm_dsa(s->engine)) {
-        append_model_json(&b, s, "glm-5.2");
+        /* Derive these rather than hardcoding them. This branch matches the whole GLM
+         * DSA family, so the 5.2-era literals that used to be here advertised a 5.3
+         * model under 5.2 names; server_model_id_from_engine already distinguishes
+         * the variants, so GLM 5.2 keeps its ids and 5.3 gets its own. */
+        const char *base = server_model_id_from_engine(s->engine);
+        char chat[128];
+        char reasoner[128];
+        snprintf(chat, sizeof chat, "%s-chat", base);
+        snprintf(reasoner, sizeof reasoner, "%s-reasoner", base);
+        append_model_json(&b, s, base);
         buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-chat");
+        append_model_json(&b, s, chat);
         buf_putc(&b, ',');
-        append_model_json(&b, s, "glm-5.2-reasoner");
+        append_model_json(&b, s, reasoner);
     } else {
         append_model_json(&b, s, "deepseek-v4-flash");
         buf_putc(&b, ',');
