@@ -1278,3 +1278,32 @@ that the tunnel must use the literal IPv4 of the direct link and never a hostnam
 because an mDNS resolution failure killed an early session-scoped tunnel mid-ingest.
 That is independent corroboration of the later finding that the name `spike` resolves
 to the Mac's own LAN address and must not be used for this link.
+
+---
+
+## 17. Both server configs, verified by running them (2026-09-20)
+
+`~/bin/llm_config.json` is per-host and outside the repository, so both entries
+described here were started and exercised rather than written from memory.
+
+**Mac — GLM 5.3 Flash Q4_K as the pair's coordinator** (`--layers 0:23`, ctx 524288,
+HTTP on 8081). Verified with a real completion through the Spark worker returning
+exactly `PIPELINE OK`, then again after dropping the tunnel with `NO TUNNEL OK`.
+The split is the plan-verified one because that is the combination with **measured
+memory at 512K** (~92 GiB resident on the Spark); the faster `0:20` / `21:output`
+rebalance was measured only at ctx 32768 with ~12 GiB free, so it is documented as a
+short-context option rather than shipped as the default.
+
+**Spark — GLM 5.3 Flash Q2 standalone** (`--ctx 262144`, HTTP on 8081). Q4_K cannot
+be a standalone entry on this machine — 178 GiB against 121 GiB — so the Spark's GLM
+entry is the Q2 model, which fits: `resident model 89.87 GiB + KV 2.92 + buffers
+3.16 = 95.96 GiB planned`. Verified with a completion returning exactly
+`SPARK Q2 OK` (`finish=stop`, 17 tokens). Context is 262144 deliberately, not 512K:
+a whole-model 512K run on this box previously wedged it (§4.1b), so the entry stays
+well below that.
+
+**Neither config carries the worker command.** Both files hold *servers* — the Mac's
+existing entries and the Spark's llama.cpp entries are all HTTP endpoints — and a
+pipeline worker binds no HTTP port, so putting it there would present an instance the
+manager cannot health-check. The worker command lives in `docs/DISTRIBUTED.md` and in
+the tunnel README instead, and must be started before the Mac's coordinator.
