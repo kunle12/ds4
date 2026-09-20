@@ -1053,3 +1053,55 @@ dead code — it is a reference implementation and a fallback, not the default.
    pipeline is `max(stage)`, and the split currently gives the Mac 24 layers and
    the Spark 22; giving the Spark fewer should raise the maximum. That is
    measurable with the existing harness and is the obvious next experiment.
+
+---
+
+## 14. Criterion 3 measured at its stated scale (2026-09-20)
+
+Criterion 3 asks for "**≥ 150 t/s prefill and ≥ 10 t/s decode at 32K on the
+pair**". Everything measured up to this point was a 1091-token prompt at ctx
+8192, where pipeline fill/drain dominates the average and the number understates
+what the pair does on a real ingest. This is the measurement the criterion
+actually asks for: **ctx 32768, a 28 657-token prompt**, greedy `-n 16`.
+
+| run | order | flags | prefill | decode |
+| --- | --- | --- | ---: | ---: |
+| base | 1st (cold) | — | 340.49 t/s | 10.13 t/s |
+| bits16 | 2nd | `--dist-activation-bits 16` | 389.03 t/s | 10.21 t/s |
+| chunk4096 | 3rd | `--dist-prefill-chunk 4096` | 389.21 t/s | 10.29 t/s |
+| window8 | 4th | `--dist-prefill-window 8` | 389.28 t/s | 10.35 t/s |
+| **base (control)** | **5th** | **—** | **389.04 t/s** | 10.21 t/s |
+
+**Criterion 3 is met, with margin: 389.0 t/s against a 150 t/s bar (2.6×).**
+
+**The three tuning flags do nothing, and the control is what proves it.** The
+first four runs make it look as though `--dist-activation-bits 16` and the two
+chunking flags each buy ~14 %. They do not: base run **last, with no flags at
+all**, lands at 389.04 t/s — indistinguishable from the three "tuned" runs. The
+spread is run order: the first run after an idle period is ~14 % slower (cold
+caches, clocks still ramping) and everything thereafter converges to 389.0 ± 0.3
+t/s. Without that fifth run I would have reported three gains that do not exist,
+and the plan would have carried a tuning recommendation that is noise.
+
+**Output is unaffected by all four configurations** — byte-identical across base,
+bits16, chunk4096 and window8. That matters for `--dist-activation-bits 16`
+specifically, since it *does* change wire numerics by design; on this prompt it
+did not change the greedy output. It is still not worth enabling: no measured
+gain, and a documented numerical change is a cost with no benefit here.
+
+**Measurement caveat worth carrying forward.** The warm-up spread is ~14 %, which
+is larger than any effect the tuning knobs might have. Single-run comparisons
+below ~15 % are not resolvable on this pair; anything claiming a smaller win needs
+repeats, and the first run after an idle period should be discarded or repeated.
+
+**Decode is met but thin.** 10.21–10.35 t/s against a ≥ 10 t/s bar is a 2–3 %
+margin, and decode falls with depth (the plan's own single-Mac figures drop from
+8.00 t/s at 262K to 4.63–5.02 at 512K). This measurement is at 32K, so the bar is
+met *at the scale the criterion states* — but it should not be read as headroom at
+262K or 524K, where criterion 4's runs will land.
+
+**What actually fixed it.** Not tuning: the routing. The ported GLM-specific Q4_K
+kernels were the default and are 2.7× slower per layer (§13); promoting the generic
+dispatch took the same configuration from ~95 t/s to 389 t/s at 32K. The 32K
+prompt then removed the fill/drain effect that made the 1091-token number look
+worse still.

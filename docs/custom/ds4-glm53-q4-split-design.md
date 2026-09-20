@@ -83,7 +83,13 @@ Acceptance (all must hold on the target hardware):
    `QA_BEFORE_RELEASES.md` §6 requires.
 3. **Throughput.** ≥ 150 t/s prefill and ≥ 10 t/s decode at 32K on the pair
    (today: 380.6 / 12.5 t/s for **Q2** on the pair; 82.5 / 8.0 t/s for **Q4** on
-   one Mac).
+   one Mac). **Met 2026-09-20** for Q4_K: at ctx 32768 with a 28 657-token prompt
+   the pair prefills at **389.0 t/s** (2.6× the bar) and decodes at 10.2–10.35 t/s.
+   The prefill bar was missed for as long as the GLM-specific Q4_K kernels held the
+   default — they prefill at 2.7× less (log §13) — and the fix was routing, not
+   tuning: `--dist-activation-bits 16`, `--dist-prefill-chunk` and
+   `--dist-prefill-window` change nothing measurable (log §14). Decode is met with
+   a 2–3 % margin at this scale and should not be read as headroom at 262K/524K.
 4. **Capacity.** 262 144-token cold ingest completes in one session; 524 288
    context allocates and runs.
 5. **Thermal.** Board (`acpitz`) stays ≤ 88 °C for the whole ingest with the
