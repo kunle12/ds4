@@ -1136,12 +1136,20 @@ difference between the machines. The consequence is the useful one: **the deeper
 the context, the better the Spark-heavy split looks**, and this workload is deep.
 Prefill also stays depth-robust - 415 t/s at 286 K against 455 t/s at 40 K.
 
-**Thermal: the Spark takes 96 % duty without throttling.** At `0:20` the Spark is
-the binding stage and runs 96 % GPU duty against ~57 % at `0:23`. Its board zone
-peaks at **83.5 °C** versus 83.9 °C measured at 57 % duty, with `hw_thermal_slowdown`
-and `sw_power_cap` both Not Active and the SM clock at 2093 MHz, the top of its lock.
-Loading the Spark harder is thermally free on this unit - Phase Y's 83.9 °C was not
-a duty-limited ceiling.
+**`0:20` is very close to the prefill balance point.** The Spark's duty rises from
+~57 % at `0:23` to **~74 %** at `0:20` - four samples of `96 96 96 7`, i.e. busy
+three quarters of the time, which is what the stage model predicts (24 worker layers
+at ~0.375 s against 21 coordinator layers at ~0.429 s, from 4096 / 455.2 = 9.0 s per
+chunk). The coordinator is still the binding stage, so this is a prefill optimum
+reached from a memory ceiling rather than from the balance being crossed: going
+further would need a Spark guard reserve below 12 GiB, which leaves under 1 GiB of
+margin and is not worth attempting.
+
+**Thermal: the Spark's duty nearly doubles and it does not throttle.** The board zone
+peaks at **83.5 °C** at ~74 % duty versus 83.9 °C measured at ~57 % (Phase Y), with
+`hw_thermal_slowdown` and `sw_power_cap` both Not Active and the SM clock at
+2093 MHz, the top of its lock. Loading the Spark harder is thermally free on this
+unit - Phase Y's 83.9 °C was not a duty-limited ceiling.
 
 **Operational lessons that cost real time here:**
 
