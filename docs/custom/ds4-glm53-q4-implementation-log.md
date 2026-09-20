@@ -1108,7 +1108,7 @@ worse still.
 
 ---
 
-## 15. Load balance: the lever is real, and the Spark cannot take it (2026-09-20)
+## 15. Load balance: the lever is real, and the first test of it was invalidated by a NIC fault (2026-09-20)
 
 **Per-stage telemetry, ctx 32768, 28 657-token prompt** (`--debug`, coordinator's
 view of the worker; the worker's own lines are not emitted, so the Mac's stage is
@@ -1141,30 +1141,56 @@ evals, so the coordinator's stage is the slower one and prefill is bound by it.
    the Mac *to* the Spark (21/25 and 18/28 were the predicted ~8 % / ~17 % / ~25 %
    steps), and that is also the memory-safe direction for the Mac.
 
-**The attempt wedged the Spark.** The first rebalance run (`--layers 0:20` on the
-Mac, `18:output` → 25 layers on the Spark) failed with `distributed route
-incomplete: missing layer 21`, and the host then became unreachable entirely:
-100 % packet loss, no SSH, no ARP entry, while the LAN gateway still answered in
-0.86 ms — so the path was fine and the box itself was gone. 25 layers is ~98 GiB
-of the 190 GiB model before KV and prefill transients, against the worker's
-measured 86.32 GiB at 22 layers (plan §1) on a 128 GB unified-memory machine.
-**This was my experiment, and the plan had already warned about exactly this
-failure mode** (the whole-model 512K wedge, §4.1b; the hard-lock and the accepted
-cap-plus-guard workaround, §10.3). It needs a physical power cycle; it cannot be
-recovered remotely. Whether the cause was memory exhaustion or the hard lock
-itself cannot be confirmed until the box is back and `/tmp/bal-b21.log` is readable
-— it should be read first, for an OOM line.
+**What actually stopped the run was the network, not the memory — and my first
+account of this was wrong.** I originally attributed it to the 25-layer memory
+footprint exhausting the box, and said so. The evidence contradicts that, and the
+correction matters because it changes both the cause and the conclusion.
 
-**The bound, and what it means for the goal.** The Spark's slice cannot grow beyond
-roughly its current 22 layers, so the balance lever is **closed in the only
-direction that would help**. Combined with the telemetry, that means prefill is
-effectively capped by the **Mac's** per-layer cost (~0.406 s/layer against the
-Spark's 0.262): ~389 t/s at 4096-token chunks is close to what this split can do
-without changing how fast the Mac evaluates a layer. That is a Metal-kernel
-question — a separate workstream, not a flag — and the routing fix already banked
-the 2.7× that was available cheaply.
+The previous boot's kernel journal (recovered after the reset; the application log
+was in tmpfs and was lost) says:
 
-**Lesson to carry.** The plan's own risk table listed the wedge as a known hazard,
-and it was treated as an endurance-run risk (§6.6) rather than as a bound on the
-*design space*. Rebalancing layers upward on the Spark should have been gated by an
-explicit memory budget before it was run.
+```
+13:08:05 kernel: r8127: enP7s7: link down
+13:08:10 kernel: r8127: enP7s7: link up
+13:08:15 r8127: enP7s7: link down   / systemd-networkd: enP7s7: Lost carrier
+13:08:19 r8127: enP7s7: link up     / Gained carrier      (5 cycles, ~32 s)
+13:08:33 r8127: enP7s7: link down
+13:08:37 r8127: enP7s7: link up     <- last link event of the boot
+```
+
+- **No OOM kill was ever invoked that boot** (`oom mentions: 0`).
+- **The box was never wedged.** It stayed alive and healthy throughout: cron ran at
+  13:15:01 and 13:17:01, `systemd-resolved` logged continuously, the thermal guard
+  kept reporting `board=50C gpu=48, 2093MHz, 7.80W, 0% slowdown` — idle and cool,
+  which also rules out a thermal trip and a compute crash.
+- What broke was the **direct 10GbE link**: `enP7s7`, driver `r8127`, carrying
+  `192.168.2.2/24`, flapped five times in ~32 seconds starting at **13:08:05**. It
+  recovered at 13:08:37, but the host's network state did not — NetworkManager went
+  to `CONNECTED_SITE` at 13:11:33 and DNS to 192.168.0.1 degraded on a loop — so the
+  box stayed off the network until the reset. `ping` failing while the LAN gateway
+  answered in 0.86 ms is exactly what a link-layer fault at this end looks like; I
+  read it as "the box is gone" when it was "the box is up and off the network".
+
+**So the rebalance failure is explained without invoking memory at all.** The b21
+worker started at 13:08:04 (the last successful ssh login logged), inside the flap
+window, and the coordinator never saw its slice — `distributed route incomplete:
+missing layer 21` is what a worker that cannot hold a link to the coordinator
+produces. The 25-layer memory question was never actually exercised.
+
+**The bound I stated is withdrawn.** "The Spark cannot hold more than ~22 layers,
+so the balance lever is closed" does not follow from this evidence and is not
+established — the experiment that would have tested it was invalidated by the NIC.
+The lever is therefore **still open**, and the prediction above (Mac→Spark
+rebalancing worth ~17–25 %, since the Mac's 0.406 s/layer against the Spark's
+0.262 binds prefill) has not been tested. It should be re-run now that the link is
+healthy — with the memory budget checked *before* the run, which is the part of the
+original caution that still stands.
+
+**A hardware item worth watching.** `r8127` (Realtek 10GbE) flapping under
+sustained load is a known class of fault — cable, connector, 10GBASE-T thermal
+behaviour or EEE/ASPM. It happened once, at the start of a heavy transfer, and has
+not recurred since the reset (`1` link event this boot, the boot-time one;
+`Speed: 10000Mb/s, Duplex: Full, Link detected: yes`). If a future run loses the
+peer again, check `journalctl -k | grep r8127` **before** assuming a wedge: this
+incident cost a hard reset and a wrong root cause because I diagnosed from
+reachability instead of from the kernel log.
