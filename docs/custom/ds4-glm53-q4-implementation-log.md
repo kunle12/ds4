@@ -1240,3 +1240,41 @@ through every run above). If a future run loses the peer, check
 `journalctl -k | grep r8127` **before** assuming a wedge: this incident cost a hard
 reset and a wrong root cause because I diagnosed from reachability instead of from
 the kernel log.
+
+---
+
+## 16. The tunnel leaves the operational path (2026-09-20)
+
+`~/ds4-tunnel` existed for one reason, measured on 2026-09-19 and written up in its
+own README: macOS would not let an adhoc/linker-signed binary accept connections on
+a non-loopback address, and the Application Firewall did not change that, so the
+worker's connection had to be carried through `sshd` over loopback.
+
+**That no longer reproduces on macOS 26.7 (build 25G229).** Tested directly rather
+than assumed:
+
+- A `ds4-server` bound to `0.0.0.0` was fetched from the Spark over the direct link:
+  `curl http://192.168.2.1:8099/v1/models` returned the model list, exit 0. On
+  2026-09-19 the same shape of connection was dropped.
+- The **full pipeline with no tunnel anywhere**: worker on the Spark dialling
+  `--coordinator 192.168.2.1 9911` with `--listen 192.168.2.2 55911`, coordinator on
+  the Mac with `--listen 192.168.2.1 9911`. The control connection is a real socket
+  on the link (`ESTAB 192.168.2.2:55652 -> 192.168.2.1:9911`), and a real completion
+  returned exactly `NO TUNNEL OK` (`finish=stop`, 43 tokens), with the coordinator
+  logging `chat ctx=21..69:48 gen=48 THINKING decoding … avg=12.46 t/s`.
+
+So the tunnel is out of the operational path: the GLM 5.3 Flash entry in
+`~/bin/llm_config.json` and the example in `docs/DISTRIBUTED.md` now use the link
+addresses directly, and the tunnel's README leads with a NOT REQUIRED status.
+
+**Kept as a fallback, not deleted.** The blocking behaviour was real and measured,
+so it is OS-version dependent and can return — the README says exactly what to
+re-enable and which loopback form to use if the Spark can no longer reach the Mac's
+listener. Removing the mechanism outright would trade a one-file fallback for a
+debugging session the next time macOS changes its mind.
+
+**Also worth noting for the address question:** the tunnel README already recorded
+that the tunnel must use the literal IPv4 of the direct link and never a hostname,
+because an mDNS resolution failure killed an early session-scoped tunnel mid-ingest.
+That is independent corroboration of the later finding that the name `spike` resolves
+to the Mac's own LAN address and must not be used for this link.

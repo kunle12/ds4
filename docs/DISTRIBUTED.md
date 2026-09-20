@@ -167,25 +167,29 @@ The same model file on both machines; the Mac coordinates and the Spark works.
 Q4_K does not fit on the Spark alone, so this split is what makes it usable there.
 Measured at ctx 32768: **389 t/s prefill / 10.3 t/s decode** on `0:23` / `24:output`.
 
+The two hosts talk **directly** over the point-to-point link — no tunnel. The
+coordinator listens on the link address and the worker dials it:
+
 ```sh
-# Spark — worker. Dials its own loopback; the tunnel carries it to the Mac.
+# Spark — worker.
 ~/bin/ds4 --cuda -m ~/mlmodels/glm/GLM-5.3-Flash-Q4_K.gguf \
-  --role worker --layers 24:output --coordinator 127.0.0.1 9911 \
-  --listen 127.0.0.1 55911 --ctx 524288
+  --role worker --layers 24:output --coordinator 192.168.2.1 9911 \
+  --listen 192.168.2.2 55911 --ctx 524288
 
 # Mac — coordinator, serving HTTP on 8081.
 ~/bin/ds4-server -m ~/mlmodels/glm/GLM-5.3-Flash-Q4_K.gguf \
-  --role coordinator --layers 0:23 --listen 127.0.0.1 9911 \
+  --role coordinator --layers 0:23 --listen 192.168.2.1 9911 \
   --ctx 524288 --host 0.0.0.0 --port 8081
 ```
 
-Both hosts use loopback addresses because macOS does not let an adhoc-signed binary
-accept connections on a non-loopback address, and the Application Firewall does not
-change that. `~/ds4-tunnel` keeps the two forwards alive
-(`-R 9911:127.0.0.1:9911` for the worker's control connection,
-`-L 55911:127.0.0.1:55911` for the coordinator's data connection, which snapshots
-also use). Use the **literal IPv4** of the direct link, never a hostname — an mDNS
-resolution failure killed the first session-scoped tunnel mid-ingest.
+Start the worker first. The worker's `--listen` is its data listener, which the
+coordinator dials directly for snapshots. Use the **literal IPv4** of the direct link
+on both sides, never a hostname — an mDNS resolution failure killed an earlier
+session-scoped run mid-ingest.
+
+If a future macOS release refuses non-loopback accepts for a locally built binary
+again — it did on 2026-09-19, which is why `~/ds4-tunnel` exists — fall back to the
+loopback form with the two forwards it provides rather than fighting the OS.
 
 At ctx 524288 the worker holds ~92 GiB resident. Rebalancing three layers to the
 Spark (`0:20` / `21:output`) measures **440 t/s prefill** — ~13 % faster, because the
