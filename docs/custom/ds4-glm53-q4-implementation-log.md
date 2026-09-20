@@ -1105,3 +1105,66 @@ kernels were the default and are 2.7× slower per layer (§13); promoting the ge
 dispatch took the same configuration from ~95 t/s to 389 t/s at 32K. The 32K
 prompt then removed the fill/drain effect that made the 1091-token number look
 worse still.
+
+---
+
+## 15. Load balance: the lever is real, and the Spark cannot take it (2026-09-20)
+
+**Per-stage telemetry, ctx 32768, 28 657-token prompt** (`--debug`, coordinator's
+view of the worker; the worker's own lines are not emitted, so the Mac's stage is
+derived). Seven prefill chunks of 4096 (one 4081):
+
+```
+request=1 hop=0 layers=24:44 pos=0     tokens=4096 eval=5189.744ms input=256.02MiB
+request=2 hop=0 layers=24:44 pos=4096  tokens=4096 eval=5466.542ms input=256.02MiB
+...                                                       (chunks 3-6: 5498-5551ms)
+request=7 hop=0 layers=24:44 pos=24576 tokens=4081 eval=5603.423ms input=255.08MiB
+request=8 hop=0 layers=24:44 pos=28657 tokens=1    eval=59.221ms  input=0.06MiB   <- decode
+```
+
+| stage | layers | per chunk | per layer |
+| --- | ---: | ---: | ---: |
+| Spark (CUDA worker) | 21 | ~5.50 s | ~0.262 s |
+| Mac (implied, coordinator) | 24 | ~9.75 s | ~0.406 s |
+
+Total 28657 / 389.05 = 73.7 s for 7 chunks; the worker accounts for 43.4 s of
+evals, so the coordinator's stage is the slower one and prefill is bound by it.
+
+**Two consequences.**
+
+1. **The wire is not a factor, which independently explains §14's null result.**
+   Each chunk carries 256.02 MiB of activations (~0.23 s at 10GbE) against a
+   5.5 s stage — about 2 %. So `--dist-activation-bits 16` *could not* have shown a
+   measurable gain, and the telemetry says so independently of the run that
+   measured nothing.
+2. **Rebalancing should pay ~17–25 %** — in the direction of moving layers *from*
+   the Mac *to* the Spark (21/25 and 18/28 were the predicted ~8 % / ~17 % / ~25 %
+   steps), and that is also the memory-safe direction for the Mac.
+
+**The attempt wedged the Spark.** The first rebalance run (`--layers 0:20` on the
+Mac, `18:output` → 25 layers on the Spark) failed with `distributed route
+incomplete: missing layer 21`, and the host then became unreachable entirely:
+100 % packet loss, no SSH, no ARP entry, while the LAN gateway still answered in
+0.86 ms — so the path was fine and the box itself was gone. 25 layers is ~98 GiB
+of the 190 GiB model before KV and prefill transients, against the worker's
+measured 86.32 GiB at 22 layers (plan §1) on a 128 GB unified-memory machine.
+**This was my experiment, and the plan had already warned about exactly this
+failure mode** (the whole-model 512K wedge, §4.1b; the hard-lock and the accepted
+cap-plus-guard workaround, §10.3). It needs a physical power cycle; it cannot be
+recovered remotely. Whether the cause was memory exhaustion or the hard lock
+itself cannot be confirmed until the box is back and `/tmp/bal-b21.log` is readable
+— it should be read first, for an OOM line.
+
+**The bound, and what it means for the goal.** The Spark's slice cannot grow beyond
+roughly its current 22 layers, so the balance lever is **closed in the only
+direction that would help**. Combined with the telemetry, that means prefill is
+effectively capped by the **Mac's** per-layer cost (~0.406 s/layer against the
+Spark's 0.262): ~389 t/s at 4096-token chunks is close to what this split can do
+without changing how fast the Mac evaluates a layer. That is a Metal-kernel
+question — a separate workstream, not a flag — and the routing fix already banked
+the 2.7× that was available cheaply.
+
+**Lesson to carry.** The plan's own risk table listed the wedge as a known hazard,
+and it was treated as an endurance-run risk (§6.6) rather than as a bound on the
+*design space*. Rebalancing layers upward on the Spark should have been gated by an
+explicit memory budget before it was run.
