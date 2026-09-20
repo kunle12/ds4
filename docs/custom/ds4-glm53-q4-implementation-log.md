@@ -1186,11 +1186,57 @@ rebalancing worth ~17–25 %, since the Mac's 0.406 s/layer against the Spark's
 healthy — with the memory budget checked *before* the run, which is the part of the
 original caution that still stands.
 
+**Re-run, and the lever is confirmed: +13.2 %.** With the NIC fault ruled out (link
+events constant at 1 across every run) and the Spark's memory watched live through
+each run, the same split comparisons now complete:
+
+| config | Mac layers | Spark layers | prefill | min free RAM on the Spark |
+| --- | ---: | ---: | ---: | ---: |
+| base | 24 | 22 | **389.16 t/s** | 24 GiB |
+| **21 / 25** | 21 | **25** | **440.42 t/s** | 12 GiB |
+| base (control, run last) | 24 | 22 | **389.16 t/s** | 24 GiB |
+
+**+13.2 %** — the telemetry predicted ~13 % from `Mac 21 × 0.406 s = 8.53 s/chunk`
+against base's 9.75, and that is what it delivers. So prefill on this pair is
+**440 t/s**, 2.9× criterion 3's 150 t/s bar, by moving three layers from the Mac to
+the Spark.
+
+**This also refines §14's caveat, which was too pessimistic.** The two base runs are
+identical to **0.01 %** (389.16 both). The ~14 % spread seen earlier was the
+cold-first-run effect specifically, not general run-to-run noise: a warm baseline
+reproduces that tightly. So small differences *are* resolvable here — which makes
+the tuning-flags null result *stronger*, not weaker: `--dist-activation-bits 16`,
+`--dist-prefill-chunk 4096` and `--dist-prefill-window 8` each landed within 0.1 %
+of the base control, i.e. they were measured at high precision and genuinely do
+nothing.
+
+**Memory is now the binding constraint, and that is what stops the sweep.** At 25
+layers the Spark has **12 GiB** free (24 GiB at 22 layers) — roughly one more layer
+of headroom, not three. The remaining predicted step (19/27, ~487 t/s) would leave
+low single-digit GiB and was deliberately **not** run: the last attempt to grow this
+slice already cost a hard reset, and the gain left on the table (~+5–10 %) does not
+justify repeating that risk. The recommendation is therefore **Mac `0:20` / Spark
+`21:output`** — the measured 440 t/s with 12 GiB to spare — and any further gain has
+to come from making the Mac faster per layer, not from moving layers onto a machine
+that is already at 90 % of its RAM.
+
+**A harness bug of mine aborted the first re-run and is worth recording**, because it
+looked exactly like a system failure: I had added `missing layer` to the early-abort
+pattern, but `waiting for distributed route: distributed route incomplete: missing
+layer N` is a *normal transient* while the worker registers. All three runs
+(including the base configuration that had just worked) were killed by my own script
+before the route completed — the coordinator's log ended with `distributed route
+ready` and the worker's with `coordinator disconnected`. The evidence that cleared
+the system was the instrumentation added after the earlier misdiagnosis: link events
+stayed at 1 (so not the NIC) and the worker had loaded `resident model 86.32 GiB =
+89.39 GiB planned` (so not memory).
+
 **A hardware item worth watching.** `r8127` (Realtek 10GbE) flapping under
 sustained load is a known class of fault — cable, connector, 10GBASE-T thermal
 behaviour or EEE/ASPM. It happened once, at the start of a heavy transfer, and has
-not recurred since the reset (`1` link event this boot, the boot-time one;
-`Speed: 10000Mb/s, Duplex: Full, Link detected: yes`). If a future run loses the
-peer again, check `journalctl -k | grep r8127` **before** assuming a wedge: this
-incident cost a hard reset and a wrong root cause because I diagnosed from
-reachability instead of from the kernel log.
+not recurred since the reset (1 link event per boot, the boot-time one;
+`Speed: 10000Mb/s, Duplex: Full, Link detected: yes`, and the count held at 1
+through every run above). If a future run loses the peer, check
+`journalctl -k | grep r8127` **before** assuming a wedge: this incident cost a hard
+reset and a wrong root cause because I diagnosed from reachability instead of from
+the kernel log.

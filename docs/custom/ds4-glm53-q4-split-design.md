@@ -84,7 +84,9 @@ Acceptance (all must hold on the target hardware):
 3. **Throughput.** ≥ 150 t/s prefill and ≥ 10 t/s decode at 32K on the pair
    (today: 380.6 / 12.5 t/s for **Q2** on the pair; 82.5 / 8.0 t/s for **Q4** on
    one Mac). **Met 2026-09-20** for Q4_K: at ctx 32768 with a 28 657-token prompt
-   the pair prefills at **389.0 t/s** (2.6× the bar) and decodes at 10.2–10.35 t/s.
+   the pair prefills at **389.0 t/s** (2.6× the bar) and decodes at 10.2–10.35 t/s —
+   and **440.4 t/s** with the split rebalanced to Mac `0:20` / Spark `21:output`,
+   which moves prefill onto the faster per-layer machine (log §15).
    The prefill bar was missed for as long as the GLM-specific Q4_K kernels held the
    default — they prefill at 2.7× less (log §13) — and the fix was routing, not
    tuning: `--dist-activation-bits 16`, `--dist-prefill-chunk` and
