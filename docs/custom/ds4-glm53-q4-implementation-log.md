@@ -9,7 +9,7 @@ entry.
 workstreams), `ds4-technical-analysis.md` (engine), `ds4-v41-split-design.md`
 (the analogous V4.1 port study).
 
-**Contents.** §1 status · §2 source changes · §3 chronological log (Phases A–X) ·
+**Contents.** §1 status · §2 source changes · §3 chronological log (Phases A–Y) ·
 §4 measurements · §5 defects and disposition · §6 corrections · §7 artifacts and host
 configuration · §8 open decisions · §9 next steps and open workstreams · §10 quick
 acceptance commands · §11 snapshot round-trip.
@@ -32,7 +32,9 @@ one, and earlier revisions of this table are superseded rather than preserved.*
 
 **Where it stands.** Q4_K runs on the pair at **389 t/s prefill / 10.3 t/s decode**
 (ctx 32768, 28 657-token prompt), or **440 t/s** with the split rebalanced — against
-a ≥150 t/s criterion. What is outstanding is verification breadth, not capability.
+a ≥150 t/s criterion. A depth sweep against the single-machine path (§4.9) puts
+prefill at **4.0-4.6x** and decode at **1.04-1.6x**, the decode lead appearing only
+at 500K depth. What is outstanding is verification breadth, not capability.
 
 | Area | State |
 | --- | --- |
@@ -41,7 +43,8 @@ a ≥150 t/s criterion. What is outstanding is verification breadth, not capabil
 | **Q4_K on the pair** | **working, measured, and the default** — 389 t/s prefill / 10.3 t/s decode (§4.8). Phase S found the GLM-specific Q4_K kernels 2.7× slower than the pre-existing generic ones, so a homogeneous Q4_K trio routes to the generic dispatch and the ported kernels became the fallback |
 | Q4_K on the Mac alone | **working and measured** — SSD streaming, 82.47 t/s prefill at 262K (§4.2) |
 | Criterion 3 (≥150 t/s prefill, ≥10 t/s decode at 32K) | **met** — 389.0 t/s and 10.2–10.35 t/s (§4.8, Phase T); decode's margin is 2–3 % and is *not* headroom at 262K |
-| Criteria 1, 2, 4, 5 (oracle, boundaries, capacity, endurance) | **not run** — WS 6, 7, 8; see §9 |
+| Criteria 1, 2 (oracle, boundaries) | **not run** — WS 6, 7; see §9 |
+| Criteria 4, 5 (long-context capacity and endurance) | **measured 2026-09-20** (Phase Y): ~287K and ~479K ingests at ctx 524288, peak board **83.9 °C**, no throttling, no link flaps over 61 samples in 1 h 1 m |
 | Distributed snapshot round-trip (criterion 6) | **save and load verified on a live pair** (§11); fresh-pair and roles-swapped restore still open |
 | Spark thermal protection | **installed, enabled, verified live**; re-arms by itself after a power cycle |
 | Access path | **no tunnel required as of 2026-09-20** — macOS 26.7 accepts non-loopback connections from these binaries (Phase V). `~/ds4-tunnel` is retained as a documented fallback, not a dependency |
@@ -49,15 +52,16 @@ a ≥150 t/s criterion. What is outstanding is verification breadth, not capabil
 | GLM 5.3 Flash served under its own model id | **fixed 2026-09-20** (Phase X) |
 | Binaries on both hosts | **2026-09-20 15:03 (Mac) / 15:09 (Spark)**, redeployed together |
 | Fork and branch | `customisation` on `kunle12/ds4`, pushed, HEAD `dda8d89` |
-| Plan | `ds4-glm53-q4-split-design.md`; WS 1–3 and 9 landed, 4/5/7 partial, 6/8 open (§9) |
+| Plan | `ds4-glm53-q4-split-design.md`; WS 1–3, 8 and 9 landed, 4/5/7 partial, 6 open (§9) |
 
 **Nothing is running** beyond the tunnel daemon (Mac, now optional) and the thermal
 guard (Spark). No `ds4` processes are left on either host.
 
-**Next action:** the verification workstreams the implementation has outrun — WS 6
-(cross-machine oracle), WS 7's boundary gates, WS 8 (262K ingest, 524K alloc, thermal
-endurance) — plus the two measurements left truncated: decode for the `0:20` /
-`21:output` split, and an EEE-on/off load comparison.
+**Next action:** the two verification workstreams the implementation has outrun —
+WS 6 (cross-machine oracle: pipeline against single-host logits) and WS 7's
+boundary gates — plus the measurements still open: decode for the `0:20` /
+`21:output` split, the EEE-on/off ablation, and the greedy-divergence gap. WS 8
+closed on 2026-09-20 (Phase Y).
 
 ---
 
@@ -801,6 +805,124 @@ it was redone with the pair actually up rather than reported as evidence.
 
 ---
 
+### Phase Y — End-to-end acceptance run on the live pair (2026-09-20, from 15:30)
+
+Run against the owner's own server config (`llm_config.json`), i.e. the pair as it
+is actually operated rather than a bench rig: coordinator `0:23` and worker
+`24:output`, both `--ctx 524288`, direct link (`192.168.2.1` <-> `192.168.2.2`),
+no tunnel. Both processes were started by the owner; the coordinator's stdout is
+therefore not captured, so every number here is measured at the HTTP boundary
+(`/v1/completions`, streaming) rather than read from engine telemetry.
+
+**Functional.** `GET /v1/models` advertises `glm-5.3-flash` with
+`context_length: 524288` (Phase X's fix, live). A 24-token greedy completion
+returned through the full pipeline in 2.43 s cold; streaming works and terminates
+with `[DONE]`; a `usage` block is returned with `cached_tokens` accounting.
+
+**Prefill and decode, measured cold** (`cached_tokens: 0`; three-decimals from the
+harness in `/tmp`, throwaway):
+
+| prompt tokens | prefill | decode | note |
+| ---: | ---: | ---: | --- |
+| 39 846 | **386.19 t/s** (103.18 s) | **10.03 t/s** | matches QA §16's 389.16 / 10.3 within 0.8 % / 2.6 % |
+| 286 635 | **356.30 t/s** (804.47 s, 13.4 min) | **8.30 t/s** | cold ingest; depth-robust against the 39 846 result |
+| ~479 000 | **~320.9 t/s** (1493.82 s, 24.9 min) | **7.395 t/s** | cold nonce; the configured context, single streaming call |
+
+**Finding: the coordinator reuses a session's prompt prefix, and a prefill
+measurement must prove it did not.** Resubmitting the identical non-streaming
+prompt returned in **0.191 s** with `cached_tokens` equal to the full 39 846 -
+an apparent 208 617 t/s, which is not a prefill at all. The reuse is not
+universal: the *streaming* request on the same prompt re-prefilled in full
+(99.96 s). Any number quoted from this server needs `cached_tokens` reported
+next to it, and cold measurements need a prompt that shares no prefix with an
+earlier one.
+
+**Finding: killing the HTTP client does not cancel the work.** A client killed
+mid-prefill left both stages busy for ~40 s afterwards - consistent with draining
+the in-flight distributed chunks, then stopping. This matters for agent use: an
+abandoned request is not a freed pair.
+
+**Finding: overlapping requests are measurable but minor.** A cancelled request
+was still draining when the next measurement started, so two requests were briefly
+in flight; the affected prefill came out at 104.56 s against 103.18 s solo, a
+1.4 % shift - smaller than the ~14 % cold-start spread Phase T documents. The
+practice still stands (one request in flight at a time), but overlap is not a
+first-order error at this depth.
+
+**Finding: the Spark is idle ~40 % of a prefill, and that is the load imbalance.**
+A 12-sample duty cycle during the 286 635-token prefill read
+`96 96 96 96 96 0 0 0 0 0 96 96` - roughly 6 s busy then 4 s idle. That is Phase
+U's stage cost seen from outside: the worker's 21 layers at 0.262 s/layer need
+~5.5 s per chunk while the coordinator's 24 layers at 0.406 s/layer need ~9.7 s,
+so the Spark waits for the Mac. It is also why the `0:20` / `21:output` rebalance
+is worth 13 %.
+
+**Thermal and link telemetry over the run** (Spark, sampled every 60 s):
+
+| Quantity | Observed |
+| --- | --- |
+| board/zone peak | **83.9 °C** over 61 samples in 1 h 1 m (capped + guard; the uncapped figure in §4.3 is 90 °C) |
+| GPU power | 45.5-49.4 W peak, idle 8.9 W |
+| throttling | none: `SW Power Cap` not active, **0** `HW Thermal Slowdown` samples, guard never intervened (`cpu_throttle` constant at its pre-run value across all 61 samples) |
+| `r8127` link-down events | **4 before, 4 after** - no flap across 20+ min of sustained prefill (Phase U's EEE change holding under load) |
+| NIC errors | rx 0, tx 1 |
+| Mac swap | 21 MB used of 1024 MB; 4 838 pageouts - no memory pressure at ctx 524288 |
+
+Wire volume during prefill measured 26.9 and 44.8 MB/s in bursts, i.e. single-digit
+percent of the 10GbE link, consistent with §4.5's "not the constraint".
+
+**The 479K row is one streaming call, deliberately.** A streaming call is never
+served from the prefix cache here, so it pays exactly one prefill and yields both
+numbers: TTFT is the prefill and the gaps are decode. `prompt_tokens` is not
+returned on a stream, so the count is derived from the 3.175 chars/token measured
+on this same file at 286 635 tokens (1 521 907 chars), i.e. about 479K; the
+prefill rate is arithmetic on that estimate, not a read-back.
+
+**Sizing matters, and the server enforces it.** The first attempt at this row used
+a 1.676 MiB slice (~546K tokens at this file's ratio) and was rejected with
+`HTTP Error 400: Bad Request` - correct behaviour against the 524 288 context, and
+the reason this stage is sized at 1.47 MiB.
+
+**Functional check of the chat path.** `POST /v1/chat/completions` with a nonce
+instruction returned exactly `'ACK-b31611'`, `finish_reason: stop`, 26 prompt and
+6 completion tokens, `cached_tokens: 0`. `GET /v1/models` serves all three ids the
+engine now advertises: `glm-5.3-flash`, `-chat` and `-reasoner`, each at context
+524 288.
+
+**Standalone comparison** (numbers from §4.2 and §4.6, same model, Q4_K, on this
+Mac with `--ssd-streaming`):
+
+| depth (prompt tokens) | pair prefill | standalone prefill | pair decode | standalone decode | decode ratio |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| ~40 000 | 386.19 (398.78 repeat) | 84.23 at 32K | **10.03** | 8.84 at 32K | 1.13x |
+| ~287 000 | **356.30** | **82.47** (53 min ingest) | **8.30** | **8.00** | 1.04x |
+| ~479 000 | **~320.9** (24.9 min ingest) | ~80, cold 500K ingest ~100 min | **7.395** | **4.63-5.02** | **~1.5-1.6x** |
+
+**Prefill is ~4.0-4.6x the single machine at every depth measured**, and the
+difference is the SSD cache: the pair holds all 177.77 GiB resident across two
+machines, while the single-machine path is bound by whichever experts happen to be
+cached.
+
+**Decode is the interesting half, and it improves with depth.** At 40K the pair
+leads by 1.13x; at 287K the lead is only **1.04x**, close enough to noise that it
+would be wrong to call it an advantage from one run; but at 479K it is **~1.5-1.6x**
+(7.395 against 4.63-5.02). The mechanism is in §4.6: single-machine decode is
+cache-bound and falls ~40 % from 262K to 512K, while the pair falls only ~11 %
+(8.30 -> 7.395). So the pair's decode case strengthens exactly where the owner
+works - 500K sessions - and is nearly absent at 32K. This also contradicts the
+plan's `[INFERENCE]` of ~6.5 t/s for pair decode at depth: the measured value is
+7.395, i.e. the estimate was pessimistic by about 12 % at 479K and by 28 % at 287K.
+
+**Why decode does not scale like prefill, which is worth stating once.** Pipeline
+parallelism overlaps prefill chunks, so throughput adds a second machine's work;
+a decode step cannot overlap, because one token still traverses both stages in
+series - 24 layers on the Mac, then 21 on the Spark. The Spark being idle roughly
+40 % of a prefill (duty cycle `96 96 96 96 96 0 0 0 0 0 96 96`, and 61 samples of
+alternating 96/0 across the session) is that same fact: the worker's 21 layers at
+0.262 s/layer need ~5.5 s per chunk while the coordinator's 24 at 0.406 s/layer
+need ~9.7 s, so the Spark waits. It is why the `0:20` / `21:output` rebalance is
+worth 13 % on prefill and would do much less for decode.
+
 ## 4. Measurements
 
 ### 4.1 Q2 pipeline, Mac coordinator (0:23) + Spark worker (24:output), over the tunnel
@@ -1056,6 +1178,31 @@ corrected measurement.
 
 ---
 
+### 4.9 Pipeline vs single machine across depth (2026-09-20, detail in Phase Y)
+
+Same model, same Q4_K weights, greedy, prefill cold (`cached_tokens: 0`), measured
+at the HTTP boundary. Standalone figures are §4.2/§4.6 on this Mac with
+`--ssd-streaming`; pair figures are the live `0:23` / `24:output` split at
+ctx 524288.
+
+| depth (prompt tokens) | prefill: pair | prefill: standalone | ratio | decode: pair | decode: standalone | ratio |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ~40 000 | 386.19 (398.78 repeat) | 84.23 at 32K | 4.6x | 10.03 | 8.84 at 32K | 1.13x |
+| ~287 000 | 356.30 | 82.47 | 4.3x | 8.30 | 8.00 | 1.04x |
+| ~479 000 | ~320.9 | ~80 | ~4.0x | **7.395** | **4.63-5.02** | **~1.5-1.6x** |
+
+**The decode column is the decision variable, and it depends on depth.** The pair
+leads by 1.13x at 40K, by only 1.04x at 287K - close enough to noise that one run
+should not be read as an advantage - and by **~1.5-1.6x at 479K**. The reason is in
+§4.6: single-machine decode is expert-cache-bound and falls ~40 % from 262K to
+512K, while the pair falls ~11 % (8.30 -> 7.395) because all weights are resident.
+The pair's decode case therefore strengthens exactly where the owner works, and is
+near-absent at 32K. Prefill is ~4.0-4.6x at every depth.
+
+`[INFERENCE]` in §4.6 estimated pair decode at ~180-220 t/s prefill and ~6.5 t/s
+decode at depth. Prefill exceeded that by ~1.8x; decode measured 7.395 against the
+~6.5 estimate (pessimistic by ~12 % at 479K, ~28 % at 287K).
+
 ## 5. Defects found, and their disposition
 
 | Defect | Evidence | Disposition |
@@ -1278,7 +1425,7 @@ Default target changed to `multi-user.target` (headless).
 | 5 | CPU/GPU parity harness for the GLM MoE Q4_K path | **partial** — `make test-glm53-moe-q4k` covers warp/small-batch, tile8, expert-major and tile8-off, and is validated to fail pre-fix; tok2, scalar, empty experts, tile tails and scratch reuse are uncovered, and the clamp is checked on real weights rather than synthetically |
 | 6 | cross-machine oracle (pipeline vs single-host, logits + `--dist-replay-check`) | **open** — this is acceptance criterion 1; `--dist-replay-check` already exists in the tree |
 | 7 | boundary gates (2 048→2 056, 4 096→4 100), snapshot round-trip | **partial** — live-pair save and load are verified (§11); fresh-pair and roles-swapped restores and both boundary sweeps are not run |
-| 8 | long-context endurance (262K ingest, 524K alloc) with peak board logged per frontier | **open** — criteria 4 and 5 |
+| 8 | long-context endurance (262K ingest, 524K alloc) with peak board logged per frontier | **done 2026-09-20** (Phase Y) — ~287K and ~479K cold ingests at ctx 524288, peak board 83.9 °C over 61 samples, no throttling, no flaps. One session, not a soak |
 | 9 | docs + release gates | **done 2026-09-20** — `DGX_SPARK.md`, `MODELS.md`, `DISTRIBUTED.md`, and `QA_BEFORE_RELEASES.md` §6/§10 |
 | 10 | *(optional)* CUDA coordinator-side slice prefill fix | **open, optional** — not needed while the Spark is the worker |
 | 11 | *(optional)* IQ2_XXS instantiations | **deferred** by the Q4_K-only decision (§8 #1) |
@@ -1288,9 +1435,11 @@ Default target changed to `multi-user.target` (headless).
 * **Decode for the `0:20` / `21:output` split.** Its prefill is measured (440.42 t/s)
   but the decode figure was cut short by a harness that killed the run
   mid-generation. Prefill completes first and is sound; this one number is not.
-* **An EEE-on/off load comparison on the link.** The change is in place and no flaps
-  have recurred, but the pre-change baseline is only ~4 flaps per session, so "none
-  since" is encouraging rather than conclusive.
+* **An EEE-on/off load comparison on the link.** Partly answered: the flap count
+  held at exactly 4 across 61 samples during an hour of sustained prefill (Phase Y),
+  so the mitigation holds *under load*, which is the regime that matters. What is
+  still not run is the deliberate ablation - EEE back on, same load - so the
+  counterfactual remains inferred from the pre-change baseline of ~4 flaps/session.
 * **The greedy-divergence gap** (§6.1 Q3) — still asserted as a near-tie and never
   measured.
 
