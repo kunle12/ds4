@@ -62,6 +62,20 @@ repository, so these values are recorded as the baseline. The practical
 agreement — identical argmax and identical generated text — is what criterion 1
 asks for.
 
+### 2.3 Boundary gates (criterion 2)
+
+The same comparison at **5 018 tokens**, which crosses both the pooled-DSA
+boundary (2 048) and the prefill-work boundary (4 096), also passes. The single
+Mac prefilled in chunks at 2048 / 4096 / 5018 and the pair at 4096 / 5018, with
+no failure and no non-finite logits:
+
+| metric | value |
+| --- | ---: |
+| mean \|Δ\| | 0.126740 |
+| max \|Δ\| | 0.783037 |
+| top-1 / top-8 / top-16 / top-64 | 1/1 · 8/8 · 15/16 · 62/64 |
+| argmax equal | yes |
+
 ## 3. Reproduction
 
 ```sh

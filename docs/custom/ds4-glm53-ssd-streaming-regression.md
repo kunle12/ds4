@@ -97,12 +97,27 @@ This is the smallest change that restores the documented behaviour:
 | single-Mac `--ssd-streaming`, ctx 1024, 16 GB cache, 16 tokens | `stdout: OK`, generation 6.89 t/s |
 | pair, 8 K, default (E1 on) | 382.3 t/s prefill, 92.9 ms decode — unchanged from before the fix, i.e. generic dispatch still in use |
 
-## 5. Follow-ups
+## 5. Re-measured single-Mac numbers (2026-09-21, after the fix)
 
-1. **Re-measure the single-Mac Q4_K `--ssd-streaming` numbers** with the fix
-   before quoting them again (the old figures predate `ce4d214`).
-2. The real fix for the 2.7× could be to make the **generic** dispatch
-   streaming-aware, so the single-Mac route also gets the faster kernels. This
-   guard is the minimal safe restore, not that optimisation.
-3. Any future dispatch promotion needs a single-host `--ssd-streaming` check in
-   its A/B — the pair-only A/B is what let this through.
+`ds4-bench --metal --ssd-streaming --prompt-file speed-bench/promessi_sposi.txt --gen-tokens 32`:
+
+| frontier | prefill | decode (steady) | plan | expert cache |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 768 | **85.33 t/s** | **8.12 t/s** | 97.08 GiB | 71.65 GiB |
+| 262 144 | **82.03 t/s** | **8.06 t/s** | **99.83 GiB** | 71.65 GiB |
+
+These match the pre-`ce4d214` figures quoted in the design doc (32K: 84.2 / 8.8;
+262K: 82.5 / 8.0; 99.84 GiB plan, 5 435 experts). The path is restored and the
+fallback numbers can be quoted again.
+
+## 6. Follow-ups
+
+1. Making the **generic** dispatch streaming-aware, so the single-Mac route also
+   gets the 2.7× kernels, is a design item rather than a one-line change: the
+   generic API takes the GGUF `model_map`/offsets and reads experts straight from
+   it, while streaming keeps them in the expert cache, and the entry points are
+   shared by every model. It is also unclear the kernel advantage transfers — the
+   streaming route is SSD-I/O bound (82–85 t/s prefill against the pair's resident
+   415 t/s), so the gain would be small. The guard is the correct minimal state.
+2. Any future dispatch promotion needs a single-host `--ssd-streaming` check in
+   its A/B; a pair-only A/B is what let this through.

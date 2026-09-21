@@ -86,7 +86,7 @@ the model fully resident and the Spark inside its thermal envelope.
 | # | Criterion | Status |
 | --- | --- | --- |
 | 1 | **Correctness.** Pipeline greedy continuation matches a single-Mac Q4_K run for ≥ 128 tokens; logits within the repo's cross-backend tolerance | **met 2026-09-21** — byte-identical continuation over 290 bytes (~200 tokens); argmax equal, top-8 7/8, top-16 15/16, mean |Δ| 0.307 (`ds4-glm53-oracle.md`) |
-| 2 | **Boundaries.** Clean greedy output across the pooled-DSA boundary (2 048 → 2 056) and the prefill-work boundary (4 096 → 4 100) | **not run** |
+| 2 | **Boundaries.** Clean greedy output across the pooled-DSA boundary (2 048 → 2 056) and the prefill-work boundary (4 096 → 4 100) | **met 2026-09-21** — 2 891- and 5 018-token prompts cross both boundaries with clean output and agreeing logits (argmax equal, top-8 8/8 at 5 018, no non-finite); `ds4-glm53-oracle.md` |
 | 3 | **Throughput.** ≥ 150 t/s prefill and ≥ 10 t/s decode at 32K on the pair | **met**, and exceeded at depth — see below |
 | 4 | **Capacity.** 262 144-token cold ingest in one session; 524 288 context allocates and runs | **met** — ~287K and ~479K cold ingests at ctx 524288 |
 | 5 | **Thermal.** Board ≤ 88 °C for the whole ingest with the guard installed; zero `HW Thermal Slowdown` events; completion without intervention | **met for one session** (~1 h, 61 samples, peak 83.5 °C, no throttling) — not a soak |
@@ -442,9 +442,9 @@ That is recorded in the implementation log's Appendix B.
 **Caveat on the single-Mac Q4 rows (2026-09-21):** those `--ssd-streaming`
 figures predate commit `ce4d214`, which broke that path's generation (the
 single-host route failed with `Metal model range … not covered by mapped model
-views`). It is fixed again in the working tree — see
-`ds4-glm53-ssd-streaming-regression.md` — but the numbers should be re-measured
-before they are quoted as current.
+views`). It is fixed again, and re-measured `ds4-bench` values now match the table
+(32 768: 85.33 / 8.12; 262 144: 82.03 / 8.06; 99.83 GiB plan) — see
+`ds4-glm53-ssd-streaming-regression.md`.
 
 ---
 

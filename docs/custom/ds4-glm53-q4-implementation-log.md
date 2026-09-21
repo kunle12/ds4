@@ -450,7 +450,7 @@ Against the plan's acceptance criteria:
 | # | Criterion | Status |
 | --- | --- | --- |
 | 1 | Cross-machine oracle: pipeline vs single-host logits | **met 2026-09-21** — greedy continuation byte-identical over 290 bytes (~200 tokens); argmax equal, top-8 7/8, top-16 15/16, mean \|Δ\| 0.307 (`ds4-glm53-oracle.md`) |
-| 2 | Boundary gates (2048→2056, 4096→4100) | **not run** |
+| 2 | Boundary gates (2048→2056, 4096→4100) | **met 2026-09-21** — 2 891- and 5 018-token prompts cross both with clean output and agreeing logits (`ds4-glm53-oracle.md`) |
 | 3 | ≥150 t/s prefill and ≥10 t/s decode at 32K | **met**, with margin on prefill (389.0 t/s) and 2–3% on decode (10.2–10.35 t/s) |
 | 4 | Long-context capacity: 262K ingest, 524K allocation | **met** — ~287K and ~479K cold ingests at ctx 524288, all weights resident |
 | 5 | Endurance with peak board logged per frontier | **met for one session** (~1 h, 61 samples, peak 83.5 °C, no throttling) — not a soak |
