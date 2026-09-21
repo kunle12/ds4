@@ -473,6 +473,13 @@ block. A GLM 5.2 pass does not cover these paths.
 
 - Run the section 3 GLM 5.3 Q2 and Q4 100-case fixtures before and after any
   graph, quantization, attention, KDA, mHC, TP, or cache change.
+- Any change to routed-MoE **dispatch selection** must be measured on a
+  single-host `--ssd-streaming` generation run as well as on the resident pair:
+  the two paths have different weight-access assumptions. A Q4_K generic-dispatch
+  promotion A/B'd only on the resident pair (`ce4d214`) silently broke single-Mac
+  streaming generation — the generic kernels read expert ranges the streaming map
+  had not covered, while `--dump-logits` (sync prefill) still worked. See
+  `docs/custom/ds4-glm53-ssd-streaming-regression.md`.
 - Build and run the focused primitive test:
   `make tests/test_glm53_kda && ./tests/test_glm53_kda`.
   It covers BF16 projections, pool-4 state construction and expansion, grouped

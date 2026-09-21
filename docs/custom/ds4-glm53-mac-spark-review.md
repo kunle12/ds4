@@ -462,12 +462,18 @@ either preserves the default or is behind an opt-in switch that is off by defaul
   default for a single-token GLM 5.3 step on Metal/CUDA (explicit falsy value
   opts out; ROCm and non-5.3 GLM stay opt-in).
 
-**Still open**
+**Remaining items — disposition**
 
-* The single-Mac Q4_K `--ssd-streaming` figures predate `ce4d214` and are being
-  re-measured now that the path is fixed (see the regression note).
-* The generic Q4_K dispatch under streaming reads unmapped ranges; making it
-  streaming-aware, so the single-Mac route also gets the 2.7× kernels, is a
-  design item (today's guard is the minimal safe restore).
-* The ported Q4_K kernels remain test-only; decide keep / make-selectable / delete.
-* Criterion 6 (fresh-pair, roles-swapped restore), as tracked by the docs.
+All tracked items are now resolved or explicitly deferred; the full list is in
+`ds4-glm53-open-items.md`. In short:
+
+* Single-Mac `--ssd-streaming` 32K/262K re-measured and matching the documented
+  figures; the 512K/MTP numbers are deferred as ~1.8 h per configuration with no
+  current decision depending on them.
+* Criterion 6 met (fresh-pair and roles-swapped restores); WS10 closed as not
+  reproducible; the agent-level real task passes.
+* Decisions: keep the ported Q4_K kernels as test-only coverage; do not implement
+  a streaming-aware generic dispatch; a QA gate now requires a single-host
+  streaming check for any dispatch-selection change.
+* Thermal soak repeated (peak 75 °C, no throttling); the EEE ablation is deferred
+  as an infrastructure risk.
