@@ -46088,9 +46088,14 @@ static bool glm_graph_layer_uses_generic_routed_moe(
      * generic dispatch's 258.9 t/s - 2.7x - because the generic path uses
      * tensor-core tile16 Q4_K kernels and the ported ones do not. So the generic
      * dispatch is the default for this type, and `DS4_GLM_GENERIC_MOE_Q4K`, which
-     * used to gate this while the port was being written, is gone. The
-     * GLM-specific Q4_K kernels remain reachable through `DS4_CUDA_GLM_MOE_TYPES`
-     * and are still covered by `make test-glm53-moe-q4k`. */
+     * used to gate this while the port was being written, is gone.
+     *
+     * This predicate is the only selector: both dispatch sites consult it before
+     * the GLM-specific entry point, and `DS4_CUDA_GLM_MOE_TYPES` is read inside
+     * that entry, so it cannot re-route a homogeneous Q4_K trio back. The ported
+     * Q4_K kernels are therefore test-only coverage (`make test-glm53-moe-q4k`),
+     * not a runtime hatch. If a runtime fallback is wanted again, the switch
+     * belongs here, not in ds4_cuda.cu. */
     if (l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_down_exps->type == DS4_TENSOR_Q4_K) {
@@ -47319,6 +47324,8 @@ static bool glm_graph_alloc_slice(
     }
 #ifdef DS4_ROCM_BUILD
     if (glm_graph_env_truthy(
+            getenv("DS4_GLM_LAYER_SLICE_TOKEN_DECODE")) ||
+        glm_graph_env_truthy(
             getenv("DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE"))) {
         fprintf(stderr,
                 "ds4: ROCm GLM one-token layer slices use the optimized token graph\n");
@@ -74467,15 +74474,22 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             return 1;
         }
 
-        const uint64_t hidden_dim = ds4_model_is_glm53()
-            ? (uint64_t)DS4_N_HC * DS4_N_EMBD
-            : (uint64_t)DS4_N_EMBD;
+        /* Width comes from the shared helper so a future model cannot drift
+         * from the wire/buffer sizing used by the distributed layer. */
+        const uint64_t hidden_dim = ds4_engine_hidden_f32_values(e);
+        /* The token graph accepts embeddings or inter-node hidden states on
+         * either side of a slice (the caller's chunk_input/chunk_output), but
+         * the resident continuation path has been timing-validated on ROCm
+         * only; every backend keeps it opt-in. DS4_GLM_LAYER_SLICE_TOKEN_DECODE
+         * is the neutral switch; ROCm also honours the historical
+         * DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE name. */
+        bool layer_slice_token_decode =
+            glm_graph_env_truthy(getenv("DS4_GLM_LAYER_SLICE_TOKEN_DECODE"));
 #ifdef DS4_ROCM_BUILD
-        const bool rocm_layer_slice_token_decode =
-            glm_graph_env_truthy(
+        if (!layer_slice_token_decode) {
+            layer_slice_token_decode = glm_graph_env_truthy(
                     getenv("DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE"));
-#else
-        const bool rocm_layer_slice_token_decode = false;
+        }
 #endif
         uint32_t done = 0;
         while (done < n_tokens) {
@@ -74487,13 +74501,16 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             bool ok = false;
 
             /*
-             * The token graph accepts both embeddings and inter-node hidden
-             * states. Keep the resident ROCm continuation path opt-in until
-             * remote output and timing tests validate it across GLM quants.
+             * A single-token step should use the dedicated decode graph, which
+             * accepts embeddings or inter-node hidden states like the batch
+             * graph. It is always taken for a KV-only step; a step carrying
+             * hidden state in or out (the distributed decode shape) takes it
+             * when the backend opts in, because that continuation has not been
+             * timing-validated on every backend yet.
              */
             if (remaining == 1 && pos > 0 &&
                 ((!input_hc && !output_hc) ||
-                 rocm_layer_slice_token_decode)) {
+                 layer_slice_token_decode)) {
                 float *chunk_logits = output_logits ? logits : NULL;
                 ok = glm_graph_forward_token(g,
                                              &e->model,

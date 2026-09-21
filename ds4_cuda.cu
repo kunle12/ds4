@@ -32155,6 +32155,37 @@ static const char *glm_moe_type_name(uint32_t type) {
     }
 }
 
+/* Parse DS4_CUDA_GLM_MOE_TYPES as a set of exact comma/space separated tokens.
+ * Substring matching used to accept "fooq4kbar" while silently rejecting a
+ * natural "q4_k" typo, which then surfaced later as a missing instantiation at
+ * dispatch time. Unknown tokens are reported once; an unparsable set is empty,
+ * so dispatch refuses loudly instead of guessing. */
+static uint32_t glm_moe_types_parse(const char *set) {
+    uint32_t mask = 0;
+    size_t unknown = 0;
+    for (const char *p = set; p && *p;) {
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+        const char *start = p;
+        while (*p && *p != ',' && *p != ' ' && *p != '\t') p++;
+        const size_t len = (size_t)(p - start);
+        if (len == 0) continue;
+        if (len == 3 && strncmp(start, "q2k", 3) == 0) mask |= 1u;
+        else if (len == 3 && strncmp(start, "q4k", 3) == 0) mask |= 2u;
+        else unknown++;
+    }
+    if (unknown != 0) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "ds4: DS4_CUDA_GLM_MOE_TYPES: %zu unrecognised token(s) in \"%s\" "
+                    "(expected q2k and/or q4k)\n",
+                    unknown, set && set[0] ? set : "");
+        }
+    }
+    return mask;
+}
+
 static int glm_moe_types_allowed(uint32_t gate_type, uint32_t up_type,
                                  uint32_t down_type) {
     /* One type for the whole trio: the expert layouts are per-tensor, and a
@@ -32162,9 +32193,10 @@ static int glm_moe_types_allowed(uint32_t gate_type, uint32_t up_type,
     if (gate_type != up_type || up_type != down_type) return 0;
     const char *set = getenv("DS4_CUDA_GLM_MOE_TYPES");
     if (!set || set[0] == '\0') set = DS4_CUDA_GLM_MOE_TYPES_DEFAULT;
+    const uint32_t mask = glm_moe_types_parse(set);
     switch (gate_type) {
-    case 10u: return strstr(set, "q2k") != NULL;
-    case 12u: return strstr(set, "q4k") != NULL;
+    case 10u: return (mask & 1u) != 0;
+    case 12u: return (mask & 2u) != 0;
     default:  return 0;
     }
 }
@@ -32197,8 +32229,15 @@ static int glm_moe_unsupported_path(uint32_t weight_type, const char *path) {
  * choice per call - which is the way to confirm a switch actually reached the
  * process before trusting a run that depends on it.
  *
- *   DS4_CUDA_GLM_MOE_TYPES=q2k|q4k,...  which weight types this build accepts
- *                                       (default q2k,q4k)
+ *   DS4_CUDA_GLM_MOE_TYPES=q2k|q4k,...  which weight types the GLM-specific
+ *                                       dispatch accepts (default q2k,q4k).
+ *                                       Exact comma/space separated tokens;
+ *                                       unknown tokens warn once. This cannot
+ *                                       re-route a homogeneous Q4_K trio here -
+ *                                       the graph predicate in ds4.c already
+ *                                       sends it to the generic dispatch - so it
+ *                                       narrows the paths that do arrive, notably
+ *                                       Q2_K.
  *   DS4_GLM_MOE_TRACE=1                 print type/tokens/experts/used/path per
  *                                       call on stderr
  *   DS4_GLM_MOE_NO_EXPERT_TILE8=1       force the small-batch warp kernels

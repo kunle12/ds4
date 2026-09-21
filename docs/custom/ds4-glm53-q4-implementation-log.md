@@ -141,8 +141,9 @@ pays for it.
 | `DS4_GLM_MEMORY_GUARD_RESERVE_GB` | both | guard reserve; see §3.3 |
 | `DS4_GLM_MEMORY_GUARD_FRACTION` | both | guard fraction, default 0.99 |
 | `iogpu.wired_limit_mb` | Mac | sysctl; raises the Mac's guard budget (§3.3) |
-| `DS4_CUDA_GLM_MOE_TYPES` | Spark | restricts the expert types CUDA will accept, default `q2k,q4k` |
+| `DS4_CUDA_GLM_MOE_TYPES` | Spark | narrows the types the GLM-specific MoE dispatch accepts (`q2k,q4k` default); it is not a route selector — a homogeneous Q4_K trio is served by the generic dispatch before that entry is consulted (§3.1) |
 | `DS4_GLM_MOE_TRACE=1` | Spark | one line per MoE dispatch: type, tokens, experts, used, path |
+| `DS4_GLM_LAYER_SLICE_TOKEN_DECODE=1` | both | GLM slice single-token steps use the decode graph even with inter-node hidden state; default off (batch graph), since that continuation is not timing-validated on every backend |
 | `--dist-activation-bits 16` | both | halves the wire payload; no measured gain, changes numerics |
 | `--dist-prefill-chunk`, `--dist-prefill-window` | both | no measured effect on this pair |
 
@@ -209,11 +210,17 @@ Mac):
 | `0:26` | 27 | 18 + head | 366.9 t/s | — | 95.2 ms |
 | `0:27` | 28 | 17 + head | 344.9 t/s | — | **93.9 ms** |
 
-**The rule: set the split for prefill.** Both slopes are linear across the range,
-and they differ by ~4×:
+**The rule: set the split for prefill.** The two sensitivities differ by ~3.1× in
+percent terms, but only decode is close to linear per layer:
 
-- moving one layer to the Mac costs **15.8 t/s of prefill**
-- moving one layer to the Mac buys **1.30 ms of decode** (~1.3%)
+- moving one layer to the Mac costs **15.8 t/s of prefill** as an
+  **endpoint average over `0:20`…`0:27`**. It is not uniform: the three segments
+  cost **18.8 / 10.6 / 22.0 t/s per layer** (a 2.1× spread), because the layers
+  being moved differ — dense blocks 0–2 are ~0.4 GiB each, MoE blocks ~4 GiB, and
+  KDA and sparse layers do different work. Read 15.8 as an average, not a local
+  slope.
+- moving one layer to the Mac buys **1.30 ms of decode** (~1.3%), which the
+  segment figures confirm as near-linear (1.50 / 1.10 / 1.30 ms per layer).
 
 Prefill is `max(stage)`, so rebalancing recovers the *whole* difference between the
 stages; decode is `sum(stage)`, so moving a layer only swaps one stage's cost for
@@ -311,7 +318,10 @@ alone with `--ssd-streaming`.
 
 **Prefill is 4.0–4.6× at every depth**; the difference is the SSD cache — the pair
 holds all 177.77 GiB resident, while the single-machine path is bound by whichever
-experts happen to be cached.
+experts happen to be cached. The pair column is the **`0:23` / `24:output`** split,
+the series with a matched standalone run at every depth; the recommended
+**`0:20` / `21:output`** measures **415.0 t/s** at ~287K against 356.30 here, so
+these ratios are conservative.
 
 **Decode's advantage grows with depth**, from nothing at 32K to ~1.5× at 479K,
 because single-machine decode is cache-bound and falls ~40% from 262K to 512K while
@@ -529,6 +539,11 @@ cancel the work it started: both stages stay busy draining in-flight chunks for
 applies to the session cache — resubmitting an identical prompt can return in
 0.191 s, so any prefill figure needs `cached_tokens` beside it.
 
+**A failed prefill costs the whole transcript.** Any failure in the pipelined
+prefill tears down the first-hop connection — including a coordinator-local one —
+which drops the workers' per-session KV; the next request then replays the full
+token prefix (~11.5 min at 287K). There is no partial recovery, by design.
+
 **Checking whether a split fits.** Read the guard line in each log rather than
 estimating; a plan is admitted or refused as a whole.
 
@@ -582,7 +597,7 @@ GLM 5.3 pipeline mode possible at all.
 | 3 | `ds4.c:73521` `ds4_session_eval_output_head_from_hc` | write into `gg->hc_cur` for glm53 | the head collapses the HC block; writing `gg->cur` left it stale |
 | 4 | `ds4_metal.m:4754`, `:4821` | new `ds4_metal_executable_dir()`; search `<exe_dir>/metal/…` as well as `metal/…` and `./metal/…` | kernel sources were CWD-relative, so an installed binary only worked when started from a directory containing `metal/` |
 | 5 | `ds4.c:61000` `glm_layer_payload_tensor_bytes`, KDA branch | stop rejecting the header's uniform `compact_live` counts; return the conv + recurrent state span and assert non-zero | the guard made any slice containing a KDA layer unsizeable as soon as a context existed |
-| 6 | `ds4.c:46076` `glm_graph_layer_uses_generic_routed_moe` | the Q4_K branch is unconditional | the Q4_K-specific kernels were the default and measured **2.7× slower** than the pre-existing generic dispatch at identical output, so the generic one was promoted; the ported kernels remain reachable via `DS4_CUDA_GLM_MOE_TYPES` |
+| 6 | `ds4.c:46076` `glm_graph_layer_uses_generic_routed_moe` | the Q4_K branch is unconditional | the Q4_K-specific kernels were the default and measured **2.7× slower** than the pre-existing generic dispatch at identical output, so the generic one was promoted; the ported kernels are now reached only from `make test-glm53-moe-q4k`, because `DS4_CUDA_GLM_MOE_TYPES` is read inside the GLM-specific dispatch and cannot re-route a homogeneous Q4_K trio to it |
 | 7 | `ds4_server.c:14951` `send_models`, GLM branch | derive ids from `server_model_id_from_engine()` plus `-chat` / `-reasoner` | the branch keys on the GLM family, which covers 5.2 and 5.3 alike, so a 5.3 model was advertised as `glm-5.2*` |
 
 The CUDA GLM MoE port itself (type predicate, Q4_K prefill/decode/expert-major

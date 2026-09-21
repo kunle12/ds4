@@ -51,7 +51,7 @@ stated here: it is available single-machine with `--ssd-streaming` — **−34.4
 against Q2, better on 98 of 100 cases** — and that route does reach 512K on this Mac
 (13.09 GiB decode, 102.00 GiB prefill transient of a 115.19 GiB budget, 5.84 GiB KV,
 70.90 GiB expert cache). What it cannot hold is *speed at depth*: decode falls to
-**4.63–5.02 t/s** at 512K from 8.00 at 262K, and **MTP is a 22 % loss** there. The
+**4.63–5.02 t/s** at 512K from 8.00 at 262K, and **MTP is a ~21 % loss** there. The
 split is a **speed-at-depth, ingest-time and predictability** decision — not a
 quality or capacity one. That conclusion is unchanged.
 
@@ -135,7 +135,7 @@ Measured on the target pair unless noted.
 | Per-layer weights (GGUF tensor table) | embedding and head 1.182 GiB each; blk.0–2 dense at 0.408 GiB each; blk.3–44 MoE at ~4.08 GiB each; blk.45 MTP 4.019 GiB, unmapped |
 | **Pair, Q4_K, `0:20`** | **415.0 t/s prefill / 121.1 ms per token** at 286,646 tk, ctx 524288; 455.2 t/s and 103.0 ms at 39,865 tk |
 | **Pair, Q4_K, `0:23`** | 356.3 t/s / 120.5 ms at 286,646 tk; 398.8 t/s and 98.5 ms at 39,865 tk |
-| Split sensitivity | −15.8 t/s prefill and −1.30 ms decode per layer moved to the Mac; both linear across `0:20`…`0:27` |
+| Split sensitivity | −15.8 t/s prefill and −1.30 ms decode per layer moved to the Mac as **endpoint averages over `0:20`…`0:27`**; decode is near-linear, prefill is not (18.8 / 10.6 / 22.0 t/s per layer across the three segments) |
 | Memory bandwidth | Mac 295.1 GB/s read (369.0 copy), Spark 100.7 (123.2) — the Mac streams memory 2.9× faster |
 | Memory admission | `0:20`: Mac 82.22 GiB of 115.19, Spark 104.73 of 107.61 (reserve 14). `0:27`: Mac 111.64 of 115.19 |
 | Budget derivation | `min(0.99 x base, base − reserve)`, base = `hw.memsize` (Apple) or the CUDA working set; 18 GiB GLM 5.3 reserve, runtime-tunable. Spark's OS-visible total is 121.61 GiB; the Mac's 115.19 comes from `iogpu.wired_limit_mb=120000` |
@@ -239,8 +239,10 @@ Items 1–7 of the original design, as resolved:
    therefore *not* bit-identical by construction, and the acceptance test is a
    tolerance gate rather than equality. Measured agreement after the fixes: mean
    |Δ| 0.0727 against the Metal reference, top-16 16/16.
-7. **Escape hatch** — `DS4_CUDA_GLM_MOE_TYPES=q2k` forces the old behaviour; default
-   `q2k,q4k`.
+7. **Escape hatch** — `DS4_CUDA_GLM_MOE_TYPES` narrows which types the GLM-specific
+   dispatch accepts (`q2k` restores its historical single-type set; default `q2k,q4k`).
+   It is not a route selector: a homogeneous Q4_K trio is claimed by the generic
+   dispatch before that entry is consulted.
 
 ### 4.2 Topology: Spark as worker, Mac as coordinator
 
@@ -409,8 +411,9 @@ That is recorded in the implementation log's Appendix B.
   the generic dispatch prefills at **258.9 t/s** against the ported GLM-specific
   kernels' **95.3 t/s** — 2.7× — with **byte-identical** output over 64 greedy tokens.
   A homogeneous Q4_K trio now routes to the generic dispatch unconditionally, and the
-  ported kernels are a hatch-reachable fallback covered by
-  `make test-glm53-moe-q4k`. Mechanism: the generic path uses tensor-core tile16 Q4_K
+  ported kernels are test-only coverage (`make test-glm53-moe-q4k`) rather than a
+  runtime-selectable fallback — the predicate has no switch back. Mechanism: the
+  generic path uses tensor-core tile16 Q4_K
   kernels, the ported ones do not. This is the difference between criterion 3 passing
   and failing.
 * **Docs updated in the same change set** — and this is the part that had drifted.
@@ -455,7 +458,7 @@ That is recorded in the implementation log's Appendix B.
    the worry that this gives something up.
 5. **New, answered 2026-09-20: which split?** **Mac `0:20` / Spark `21:output`**, with
    `DS4_GLM_MEMORY_GUARD_RESERVE_GB=14` on the Spark. Measured **+16.5 % prefill at
-   depth** against `0:23` with decode unchanged, because the split is ~4× more
+   depth** against `0:23` with decode unchanged, because the split is ~3.1× more
    sensitive for prefill (`max(stage)`) than for decode (`sum(stage)`). This is the
    same answer the owner's instinct pointed at — put the compute-bound layers on the
    Spark — and the measurement now supports it: the Spark is the faster machine per

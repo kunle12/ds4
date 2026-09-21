@@ -18,7 +18,7 @@ make
 ./ds4
 ```
 
-The same build supports M3 and M5 Macs. Hardware-specific fast paths are
+The same build supports M3, M4 and M5 Macs. Hardware-specific fast paths are
 selected automatically; no environment variable is needed to enable them.
 Leave other GPU and memory-heavy applications idle when comparing performance.
 

@@ -506,7 +506,9 @@ The hidden-state payload format is the model's **HC-expanded** width, not `n_emb
 
 ```c
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) return DS4_N_EMBD;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA)
+        return ds4_model_is_glm53() ? (uint64_t)DS4_N_HC * DS4_N_EMBD
+                                    : (uint64_t)DS4_N_EMBD;
     return (uint64_t)DS4_N_HC * DS4_N_EMBD;     /* e.g. 4 * 4096 = 16384 f32 = 64 KiB */
 }
 ```
@@ -774,6 +776,7 @@ The coordinator validates before writing that the route covers every layer (`dis
 | `--debug` | route + per-hop timings |
 | `DS4_DIST_DECODE_PROFILE=1` | per-token timing lines (send / wait / copy / output head) |
 | `DS4_DIST_DISABLE_PREFILL_PIPELINE=1` | force serial prefill (debugging) |
+| `DS4_GLM_LAYER_SLICE_TOKEN_DECODE=1` | GLM slice single-token steps use the decode graph even when carrying inter-node hidden state; default off, since that continuation is not timing-validated on every backend (ROCm also accepts the historical `DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE`) |
 
 Practical caveats, from the code and `docs/DISTRIBUTED.md`:
 
