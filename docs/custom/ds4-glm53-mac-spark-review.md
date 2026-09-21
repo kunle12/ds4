@@ -437,8 +437,23 @@ either preserves the default or is behind an opt-in switch that is off by defaul
 * No runtime run was performed: the E1 switch is off by default, so the pair's behaviour is
   unchanged. Enabling it still needs the A/B in §6 E1 and cross-machine oracle parity.
 
-**Still open (unchanged from §7)**
+**Measured after the change set (2026-09-21, on the live pair)**
 
-* E1 measurement: opt-in decode-graph A/B at 262K and 479K, and the oracle.
-* The ported Q4_K kernels remain test-only; decide keep/make-selectable/delete.
-* Criterion 1/2/6 verification debts, as tracked by the docs.
+* **E1 A/B: the switch wins, and the gain grows with depth.** With
+  `DS4_GLM_LAYER_SLICE_TOKEN_DECODE=1`, distributed decode is **+7.7 %** at
+  ~11 K, **+15.4 %** at ~285 K and **+19.6 %** at ~473 K (median inter-chunk
+  gap; the identical-output wall time agrees within 0.2 %). Prefill is unchanged
+  and the completion text is byte-identical at all three depths. The 285 K
+  run reproduced the documented baseline (415 t/s prefill, 121.1 ms decode).
+  Full numbers and method: `ds4-glm53-e1-decode-graph-ab.md`. The owner then
+  applied it: the switch is set in `~/bin/llm_config.json` **and** the engine
+  default for a single-token GLM 5.3 step on Metal/CUDA (explicit falsy value
+  opts out; ROCm and non-5.3 GLM stay opt-in).
+
+**Still open**
+
+* **Criterion 1 (cross-machine oracle)** — now the only gate before promoting the
+  E1 switch from opt-in to the engine default.
+* The ported Q4_K kernels remain test-only; decide keep / make-selectable / delete.
+* Criterion 2 (boundary gates) and criterion 6 (fresh-pair, roles-swapped
+  restore), as tracked by the docs.

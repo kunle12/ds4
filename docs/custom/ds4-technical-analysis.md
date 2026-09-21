@@ -776,7 +776,7 @@ The coordinator validates before writing that the route covers every layer (`dis
 | `--debug` | route + per-hop timings |
 | `DS4_DIST_DECODE_PROFILE=1` | per-token timing lines (send / wait / copy / output head) |
 | `DS4_DIST_DISABLE_PREFILL_PIPELINE=1` | force serial prefill (debugging) |
-| `DS4_GLM_LAYER_SLICE_TOKEN_DECODE=1` | GLM slice single-token steps use the decode graph even when carrying inter-node hidden state; default off, since that continuation is not timing-validated on every backend (ROCm also accepts the historical `DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE`) |
+| `DS4_GLM_LAYER_SLICE_TOKEN_DECODE` | GLM slice single-token steps use the decode graph even when carrying inter-node hidden state; **default on** for GLM 5.3 on Metal/CUDA (+7.7 %/+15.4 %/+19.6 % decode at ~11K/~285K/~473K, identical output), set `0` to opt out; ROCm and non-5.3 GLM stay opt-in (ROCm also accepts the historical `DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE`) |
 
 Practical caveats, from the code and `docs/DISTRIBUTED.md`:
 

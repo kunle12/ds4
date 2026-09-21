@@ -143,7 +143,7 @@ pays for it.
 | `iogpu.wired_limit_mb` | Mac | sysctl; raises the Mac's guard budget (§3.3) |
 | `DS4_CUDA_GLM_MOE_TYPES` | Spark | narrows the types the GLM-specific MoE dispatch accepts (`q2k,q4k` default); it is not a route selector — a homogeneous Q4_K trio is served by the generic dispatch before that entry is consulted (§3.1) |
 | `DS4_GLM_MOE_TRACE=1` | Spark | one line per MoE dispatch: type, tokens, experts, used, path |
-| `DS4_GLM_LAYER_SLICE_TOKEN_DECODE=1` | both | GLM slice single-token steps use the decode graph even with inter-node hidden state; default off (batch graph), since that continuation is not timing-validated on every backend |
+| `DS4_GLM_LAYER_SLICE_TOKEN_DECODE` | both | GLM slice single-token steps use the decode graph even with inter-node hidden state. Default **on** for GLM 5.3 on Metal/CUDA — measured +7.7 % / +15.4 % / +19.6 % decode at ~11K / ~285K / ~473K with identical output; set `0` to opt out. ROCm and non-5.3 GLM stay opt-in |
 | `--dist-activation-bits 16` | both | halves the wire payload; no measured gain, changes numerics |
 | `--dist-prefill-chunk`, `--dist-prefill-window` | both | no measured effect on this pair |
 

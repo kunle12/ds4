@@ -74477,19 +74477,25 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         /* Width comes from the shared helper so a future model cannot drift
          * from the wire/buffer sizing used by the distributed layer. */
         const uint64_t hidden_dim = ds4_engine_hidden_f32_values(e);
-        /* The token graph accepts embeddings or inter-node hidden states on
-         * either side of a slice (the caller's chunk_input/chunk_output), but
-         * the resident continuation path has been timing-validated on ROCm
-         * only; every backend keeps it opt-in. DS4_GLM_LAYER_SLICE_TOKEN_DECODE
-         * is the neutral switch; ROCm also honours the historical
-         * DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE name. */
-        bool layer_slice_token_decode =
-            glm_graph_env_truthy(getenv("DS4_GLM_LAYER_SLICE_TOKEN_DECODE"));
+        /* Single-token slice steps use the dedicated decode graph, which accepts
+         * embeddings or inter-node hidden states on either side of a slice (the
+         * caller's chunk_input/chunk_output).
+         *
+         * Default on for GLM 5.3 on Metal/CUDA: the A/B measured +7.7% / +15.4%
+         * / +19.6% decode at ~11K / ~285K / ~473K with byte-identical output
+         * (docs/custom/ds4-glm53-e1-decode-graph-ab.md). An explicit falsy value
+         * (0/false/off/no) opts out. ROCm and non-5.3 GLM stay opt-in, since
+         * neither continuation was part of that measurement. */
+        const char *layer_slice_token_env = glm_graph_env_value(
+                "DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE",
+                "DS4_GLM_LAYER_SLICE_TOKEN_DECODE");
 #ifdef DS4_ROCM_BUILD
-        if (!layer_slice_token_decode) {
-            layer_slice_token_decode = glm_graph_env_truthy(
-                    getenv("DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE"));
-        }
+        const bool layer_slice_token_decode =
+            glm_graph_env_truthy(layer_slice_token_env);
+#else
+        const bool layer_slice_token_decode =
+            layer_slice_token_env ? glm_graph_env_truthy(layer_slice_token_env)
+                                  : ds4_model_is_glm53();
 #endif
         uint32_t done = 0;
         while (done < n_tokens) {
@@ -74501,12 +74507,12 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             bool ok = false;
 
             /*
-             * A single-token step should use the dedicated decode graph, which
-             * accepts embeddings or inter-node hidden states like the batch
-             * graph. It is always taken for a KV-only step; a step carrying
-             * hidden state in or out (the distributed decode shape) takes it
-             * when the backend opts in, because that continuation has not been
-             * timing-validated on every backend yet.
+             * A single-token step uses the dedicated decode graph, which accepts
+             * embeddings or inter-node hidden states like the batch graph. A
+             * KV-only step always takes it; a step carrying hidden state in or
+             * out (the distributed decode shape) takes it when
+             * layer_slice_token_decode is set, which is the default for GLM 5.3
+             * on Metal/CUDA (see the switch above).
              */
             if (remaining == 1 && pos > 0 &&
                 ((!input_hc && !output_hc) ||
