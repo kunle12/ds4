@@ -33712,7 +33712,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
                 const uint32_t sh = 2u * (uint32_t)in_dim * sizeof(float);
                 glm_shared_gate_up_swiglu_tok2_exact_kernel
                         <<<(unsigned)((out_dim + warps - 1u) / warps),
-                           warps * 32u, sh>>>(
+                           warps * 32u, sh, cuda_decode_stream()>>>(
                         (float *)mid->ptr, gw, uw, (const float *)x->ptr,
                         (uint32_t)in_dim, (uint32_t)out_dim, clamp);
                 return cuda_ok(cudaGetLastError(),
@@ -33745,7 +33745,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
                 const uint32_t sh = (uint32_t)in_dim * sizeof(float);
                 glm_shared_gate_up_swiglu_one_kernel
                         <<<(unsigned)((out_dim + warps - 1u) / warps),
-                           warps * 32u, sh>>>(
+                           warps * 32u, sh, cuda_decode_stream()>>>(
                         (float *)mid->ptr, gw, uw, (const float *)x->ptr,
                         (uint32_t)in_dim, (uint32_t)out_dim, clamp);
                 return cuda_ok(cudaGetLastError(), "glm shared swiglu one");

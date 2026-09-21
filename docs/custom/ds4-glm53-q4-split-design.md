@@ -90,7 +90,7 @@ the model fully resident and the Spark inside its thermal envelope.
 | 3 | **Throughput.** ≥ 150 t/s prefill and ≥ 10 t/s decode at 32K on the pair | **met**, and exceeded at depth — see below |
 | 4 | **Capacity.** 262 144-token cold ingest in one session; 524 288 context allocates and runs | **met** — ~287K and ~479K cold ingests at ctx 524288 |
 | 5 | **Thermal.** Board ≤ 88 °C for the whole ingest with the guard installed; zero `HW Thermal Slowdown` events; completion without intervention | **met for one session** (~1 h, 61 samples, peak 83.5 °C, no throttling) — not a soak |
-| 6 | **State.** Snapshot save/load across the split round-trips | **half met** — save verified, load path exercised on a live pair; fresh-pair and roles-swapped restore remain |
+| 6 | **State.** Snapshot save/load across the split round-trips | **met 2026-09-21** — fresh-pair restore (cached 772/772, identical output) and roles-swapped restore (Mac-saved snapshot loaded by the Spark coordinator, cached 772/772, identical output); `ds4-glm53-criterion6-snapshot.md` |
 
 **Criterion 3, as measured.** At ctx 32768 with a 28 657-token prompt the pair
 prefills at **389.0 t/s** (2.6× the bar) and decodes at 10.2–10.35 t/s. The split was
@@ -338,7 +338,8 @@ the effort.
 | 4 | Q4_K instantiations: decode warp-per-pair, tok2-reuse, down warp, small-batch | `ds4_cuda.cu` | 2–3 d | **partial** — warp, down warp and small-batch land; tok2 and scalar still refuse Q4_K by name |
 | 5 | CPU/GPU parity harness for the GLM MoE Q4_K path | `tests/`, `Makefile` | 1–2 d | **partial** — `make test-glm53-moe-q4k` covers warp/small-batch, tile8, expert-major and tile8-off, and is validated to fail pre-fix; tok2, scalar, empty experts, tile tails and scratch reuse uncovered; the clamp is checked on real weights rather than synthetically |
 | 6 | Cross-machine oracle: pipeline vs single-host Q4_K, logit tolerance + `--dist-replay-check` | `tests/`, `QA_BEFORE_RELEASES.md` | 1–2 d | **done** — continuation byte-identical over 290 bytes (~200 tokens); logits argmax equal, top-8 7/8, top-16 15/16; `--dist-replay-check` now runs on the coordinator path and passes exact (`ds4-glm53-oracle.md`) |
-| 7 | Boundary gates (2 048→2 056, 4 096→4 100), snapshot round-trip across the split | `QA_BEFORE_RELEASES.md` | 1–2 d | **partial** — live-pair save and load verified; fresh-pair and roles-swapped restores and both sweeps not run |
+| 7 | Boundary gates (2 048→2 056, 4 096→4 100), snapshot round-trip across the split | `QA_BEFORE_RELEASES.md` | 1–2 d | **done 2026-09-21** — both boundaries crossed with agreeing logits; fresh-pair and roles-swapped restores pass (cached 772/772, identical output) |
+| 12 | *(added)* Agent-level real task + CUDA shared-swiglu launch-stream fix | `ds4_cuda.cu`, docs | — | **done 2026-09-21** — headless `ds4-agent` fixed and tested a program across the split; the fused shared-expert kernels moved to `cuda_decode_stream()` |
 | 8 | Long-context endurance: 262K cold ingest, 524K alloc, thermal logging per frontier | `ds4_bench.c`, `speed-bench/` | 1–2 d | **done for one session** — ~287K and ~479K ingests at ctx 524288, peak board logged, no throttling |
 | 9 | Docs + release gates | docs, `QA_BEFORE_RELEASES.md` | 0.5–1 d | **done** — `DISTRIBUTED.md`, `DGX_SPARK.md`, `MODELS.md`, `SERVER.md` and `QA_BEFORE_RELEASES.md` §10/§16 all carry the current split and numbers |
 | 10 | *(optional)* CUDA coordinator-side slice prefill fix | `ds4_cuda.cu` | 1–3 d | **closed as not reproducible 2026-09-21** — roles-swapped Q4_K/Q2 prefill works at 512/4 096-row chunks (`ds4-glm53-ws10-role-swap.md`) |
@@ -384,8 +385,11 @@ Layered, cheapest first; each layer must pass before the next is trusted.
    board 83.5 °C at ~74 % duty, zero thermal events, completion without intervention.
    The plan asked for the ingest repeated twice to show it is not a one-off; that
    repeat has not been run.
-7. **Agent-level.** *Not run.* `tests/test_agent_compaction.py` at ≥ 64K and a real
-   read/edit/test task through `ds4-agent` — the actual workload.
+7. **Agent-level.** *Real task passed 2026-09-21* (see
+   `ds4-glm53-agent-workload.md`): `ds4-agent` run headless as the coordinator
+   read, fixed and tested a small program across the split in one turn. The
+   `tests/test_agent_compaction.py` PTY regression at ≥ 64K was **not** run —
+   `pyte` is not installed and the script does not forward distributed args.
 
 ---
 

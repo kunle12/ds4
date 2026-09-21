@@ -454,7 +454,7 @@ Against the plan's acceptance criteria:
 | 3 | ≥150 t/s prefill and ≥10 t/s decode at 32K | **met**, with margin on prefill (389.0 t/s) and 2–3% on decode (10.2–10.35 t/s) |
 | 4 | Long-context capacity: 262K ingest, 524K allocation | **met** — ~287K and ~479K cold ingests at ctx 524288, all weights resident |
 | 5 | Endurance with peak board logged per frontier | **met for one session** (~1 h, 61 samples, peak 83.5 °C, no throttling) — not a soak |
-| 6 | Distributed snapshot round-trip | **half met** — save verified, load path exercised on a live pair; fresh-pair and roles-swapped restore not run |
+| 6 | Distributed snapshot round-trip | **met 2026-09-21** — fresh-pair restore (cached 772/772, identical output) and roles-swapped restore (Mac-saved snapshot loaded by the Spark coordinator, cached 772/772, identical output); `ds4-glm53-criterion6-snapshot.md` |
 
 **Independently verified:**
 
