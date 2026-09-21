@@ -85,7 +85,7 @@ the model fully resident and the Spark inside its thermal envelope.
 
 | # | Criterion | Status |
 | --- | --- | --- |
-| 1 | **Correctness.** Pipeline greedy continuation matches a single-Mac Q4_K run for ≥ 128 tokens; logits within the repo's cross-backend tolerance | **not run** — the one substantive gap |
+| 1 | **Correctness.** Pipeline greedy continuation matches a single-Mac Q4_K run for ≥ 128 tokens; logits within the repo's cross-backend tolerance | **met 2026-09-21** — byte-identical continuation over 290 bytes (~200 tokens); argmax equal, top-8 7/8, top-16 15/16, mean |Δ| 0.307 (`ds4-glm53-oracle.md`) |
 | 2 | **Boundaries.** Clean greedy output across the pooled-DSA boundary (2 048 → 2 056) and the prefill-work boundary (4 096 → 4 100) | **not run** |
 | 3 | **Throughput.** ≥ 150 t/s prefill and ≥ 10 t/s decode at 32K on the pair | **met**, and exceeded at depth — see below |
 | 4 | **Capacity.** 262 144-token cold ingest in one session; 524 288 context allocates and runs | **met** — ~287K and ~479K cold ingests at ctx 524288 |
@@ -332,16 +332,20 @@ the effort.
 | 3 | Q4_K instantiations: expert-major gate/up + down | `ds4_cuda.cu` | 1–2 d | **done** |
 | 4 | Q4_K instantiations: decode warp-per-pair, tok2-reuse, down warp, small-batch | `ds4_cuda.cu` | 2–3 d | **partial** — warp, down warp and small-batch land; tok2 and scalar still refuse Q4_K by name |
 | 5 | CPU/GPU parity harness for the GLM MoE Q4_K path | `tests/`, `Makefile` | 1–2 d | **partial** — `make test-glm53-moe-q4k` covers warp/small-batch, tile8, expert-major and tile8-off, and is validated to fail pre-fix; tok2, scalar, empty experts, tile tails and scratch reuse uncovered; the clamp is checked on real weights rather than synthetically |
-| 6 | Cross-machine oracle: pipeline vs single-host Q4_K, logit tolerance + `--dist-replay-check` | `tests/`, `QA_BEFORE_RELEASES.md` | 1–2 d | **open** — criterion 1, the remaining gate that matters |
+| 6 | Cross-machine oracle: pipeline vs single-host Q4_K, logit tolerance + `--dist-replay-check` | `tests/`, `QA_BEFORE_RELEASES.md` | 1–2 d | **logit + continuation halves done** (`ds4-glm53-oracle.md`); `--dist-replay-check` did not fire on the CLI coordinator path and its reachability is open |
 | 7 | Boundary gates (2 048→2 056, 4 096→4 100), snapshot round-trip across the split | `QA_BEFORE_RELEASES.md` | 1–2 d | **partial** — live-pair save and load verified; fresh-pair and roles-swapped restores and both sweeps not run |
 | 8 | Long-context endurance: 262K cold ingest, 524K alloc, thermal logging per frontier | `ds4_bench.c`, `speed-bench/` | 1–2 d | **done for one session** — ~287K and ~479K ingests at ctx 524288, peak board logged, no throttling |
 | 9 | Docs + release gates | docs, `QA_BEFORE_RELEASES.md` | 0.5–1 d | **done** — `DISTRIBUTED.md`, `DGX_SPARK.md`, `MODELS.md`, `SERVER.md` and `QA_BEFORE_RELEASES.md` §10/§16 all carry the current split and numbers |
 | 10 | *(optional)* CUDA coordinator-side slice prefill fix | `ds4_cuda.cu` | 1–3 d | **open, optional** — not needed while the Spark is the worker |
 | 11 | *(optional)* IQ2_XXS for the same GLM MoE path | `ds4_cuda.cu` | 1–2 d | **deferred** — one instantiation of the same template, once Q4_K is through QA |
 
-The critical path (1 → 2 → 5 → 6) landed through 5; **6 is the remaining gate that
-matters**. The order of work held as predicted — prefill first, then decode, then the
-QA matrix — which is what let a long ingest be measured behind the guard early.
+The critical path (1 → 2 → 5 → 6) landed through 5; **6's logit and continuation
+halves now pass** (`ds4-glm53-oracle.md`) — the pipeline's greedy output is
+byte-identical to the single-Mac Q4_K run over 290 bytes (~200 tokens), and the
+logits agree on argmax and top-8. What remains of 6 is the `--dist-replay-check`
+diagnostic, which did not fire on the coordinator path. The order of work held as
+predicted — prefill first, then decode, then the QA matrix — which is what let a
+long ingest be measured behind the guard early.
 
 ---
 
@@ -435,6 +439,13 @@ That is recorded in the implementation log's Appendix B.
 | Fastest decode on the pair | `0:27` / `28:output` | 93.9 ms/token at 39,865 tk — ~4.6 ms better than `0:23`, at the cost of 13.5 % prefill and only 3.55 GiB free on the Mac |
 | Q2 throughput on the pair | Q2 pipeline | 380.6 t/s prefill, 12.5 t/s decode at 32K, board 66–77 °C |
 | Q2, one machine | **Mac resident** — not the Spark at 512K | Mac, whole model, ctx 524288, 403K prompt: **186.89 t/s prefill, 19.71 t/s decode**. The Spark's repo-QA figure (531 / 14.35 t/s) is at a smaller context; a whole-model 512K run **wedges the box** |
+
+**Caveat on the single-Mac Q4 rows (2026-09-21):** those `--ssd-streaming`
+figures predate commit `ce4d214`, which broke that path's generation (the
+single-host route failed with `Metal model range … not covered by mapped model
+views`). It is fixed again in the working tree — see
+`ds4-glm53-ssd-streaming-regression.md` — but the numbers should be re-measured
+before they are quoted as current.
 
 ---
 

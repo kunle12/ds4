@@ -46073,6 +46073,14 @@ static bool glm_graph_dense_tensor_layout(
     return true;
 }
 
+/* Set when the active GLM graph streams weights from disk. The generic routed
+ * dispatch is faster on a resident graph (measured 2.7x on the pair), but under
+ * --ssd-streaming it reads expert weight ranges the streaming map has not
+ * covered, which broke the single-Mac Q4_K generation path once the generic
+ * promotion became unconditional (ce4d214). A streaming graph therefore keeps
+ * the GLM-specific dispatch. */
+static bool g_glm_ssd_streaming_active;
+
 static bool glm_graph_layer_uses_generic_routed_moe(
         const ds4_layer_weights *l) {
     if (!l || !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) {
@@ -46099,7 +46107,10 @@ static bool glm_graph_layer_uses_generic_routed_moe(
     if (l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_down_exps->type == DS4_TENSOR_Q4_K) {
-        return true;
+        /* Resident graph: generic is the faster path. Streaming graph: the
+         * generic path cannot reach its experts through the streaming map (see
+         * g_glm_ssd_streaming_active). */
+        return !g_glm_ssd_streaming_active;
     }
     return false;
 }
@@ -47163,6 +47174,7 @@ static bool glm_graph_alloc_slice(
     g->weights = weights;
     g->ssd_streaming = ssd_streaming;
     g->ssd_streaming_cold = ssd_streaming_cold;
+    g_glm_ssd_streaming_active = ssd_streaming;
 
     if (!glm_graph_context_request(ctx_size, &g->ctx_size)) return false;
     if (!glm_graph_memory_guard_slice_with_transient(

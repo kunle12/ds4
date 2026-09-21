@@ -439,6 +439,18 @@ either preserves the default or is behind an opt-in switch that is off by defaul
 
 **Measured after the change set (2026-09-21, on the live pair)**
 
+* **Single-Mac `--ssd-streaming` regression found and fixed.** While building the
+  criterion-1 oracle, the single-Mac Q4_K streaming *generation* path was found
+  broken by `ce4d214` — the Q4_K generic-dispatch promotion, which was A/B'd only
+  on the resident pair. Under streaming the generic dispatch reads expert weight
+  ranges the streaming map has not covered
+  (`Metal model range … not covered by mapped model views`), so prefill or decode
+  fails; `--dump-logits` (sync prefill) still worked, which is why prefill-only
+  checks missed it. Fix: keep the generic dispatch for resident graphs and restore
+  the GLM-specific one while a graph is streaming. The pair is unchanged
+  (382.3 t/s prefill / 92.9 ms decode, i.e. generic still in use) and single-Mac
+  generation works again. Full evidence:
+  `ds4-glm53-ssd-streaming-regression.md`.
 * **E1 A/B: the switch wins, and the gain grows with depth.** With
   `DS4_GLM_LAYER_SLICE_TOKEN_DECODE=1`, distributed decode is **+7.7 %** at
   ~11 K, **+15.4 %** at ~285 K and **+19.6 %** at ~473 K (median inter-chunk
@@ -452,8 +464,9 @@ either preserves the default or is behind an opt-in switch that is off by defaul
 
 **Still open**
 
-* **Criterion 1 (cross-machine oracle)** — now the only gate before promoting the
-  E1 switch from opt-in to the engine default.
+* `--dist-replay-check` did not fire on the CLI coordinator path (see
+  `ds4-glm53-oracle.md`); its reachability needs checking.
+* The single-Mac Q4_K `--ssd-streaming` figures predate `ce4d214` and should be
+  re-measured now that the path is fixed (see the regression note).
 * The ported Q4_K kernels remain test-only; decide keep / make-selectable / delete.
-* Criterion 2 (boundary gates) and criterion 6 (fresh-pair, roles-swapped
-  restore), as tracked by the docs.
+* Criterion 6 (fresh-pair, roles-swapped restore), as tracked by the docs.

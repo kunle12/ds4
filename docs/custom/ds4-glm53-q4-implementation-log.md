@@ -449,7 +449,7 @@ Against the plan's acceptance criteria:
 
 | # | Criterion | Status |
 | --- | --- | --- |
-| 1 | Cross-machine oracle: pipeline vs single-host logits | **not run** — the one substantive gap |
+| 1 | Cross-machine oracle: pipeline vs single-host logits | **met 2026-09-21** — greedy continuation byte-identical over 290 bytes (~200 tokens); argmax equal, top-8 7/8, top-16 15/16, mean \|Δ\| 0.307 (`ds4-glm53-oracle.md`) |
 | 2 | Boundary gates (2048→2056, 4096→4100) | **not run** |
 | 3 | ≥150 t/s prefill and ≥10 t/s decode at 32K | **met**, with margin on prefill (389.0 t/s) and 2–3% on decode (10.2–10.35 t/s) |
 | 4 | Long-context capacity: 262K ingest, 524K allocation | **met** — ~287K and ~479K cold ingests at ctx 524288, all weights resident |
@@ -487,10 +487,15 @@ remaining half. Getting there required fixing two defects (§8): the worker adve
 an ephemeral data port until pinned with `--listen`, and a KDA-layer sizing guard made
 any slice containing a KDA layer unsizeable as soon as a context existed.
 
-**Not verified, and worth stating plainly:** the cross-machine oracle (criterion 1)
-is the check that would catch a whole class of silent divergence between the pair
-and a single host. Nothing in the current work depends on it, but it is the
-outstanding correctness gate.
+**Now verified, 2026-09-21.** The cross-machine oracle (criterion 1) was run: the
+pipeline's greedy continuation is byte-identical to a single-Mac Q4_K
+`--ssd-streaming` run over 290 bytes (~200 tokens) on a 2,891-token prompt that
+crosses the dense/indexed boundary, and the full logits agree on argmax with
+top-8 7/8, top-16 15/16 and mean |Δ| 0.307 — cross-backend numeric drift, not a
+structural divergence (`ds4-glm53-oracle.md`). Getting there surfaced and fixed a
+single-Mac `--ssd-streaming` generation regression from the Q4_K generic-dispatch
+promotion (`ds4-glm53-ssd-streaming-regression.md`). The `--dist-replay-check`
+half of WS6 remains open: the flag did not fire on the CLI coordinator path.
 
 ---
 
