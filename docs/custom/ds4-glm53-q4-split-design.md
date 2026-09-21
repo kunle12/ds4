@@ -332,20 +332,19 @@ the effort.
 | 3 | Q4_K instantiations: expert-major gate/up + down | `ds4_cuda.cu` | 1–2 d | **done** |
 | 4 | Q4_K instantiations: decode warp-per-pair, tok2-reuse, down warp, small-batch | `ds4_cuda.cu` | 2–3 d | **partial** — warp, down warp and small-batch land; tok2 and scalar still refuse Q4_K by name |
 | 5 | CPU/GPU parity harness for the GLM MoE Q4_K path | `tests/`, `Makefile` | 1–2 d | **partial** — `make test-glm53-moe-q4k` covers warp/small-batch, tile8, expert-major and tile8-off, and is validated to fail pre-fix; tok2, scalar, empty experts, tile tails and scratch reuse uncovered; the clamp is checked on real weights rather than synthetically |
-| 6 | Cross-machine oracle: pipeline vs single-host Q4_K, logit tolerance + `--dist-replay-check` | `tests/`, `QA_BEFORE_RELEASES.md` | 1–2 d | **logit + continuation halves done** (`ds4-glm53-oracle.md`); `--dist-replay-check` did not fire on the CLI coordinator path and its reachability is open |
+| 6 | Cross-machine oracle: pipeline vs single-host Q4_K, logit tolerance + `--dist-replay-check` | `tests/`, `QA_BEFORE_RELEASES.md` | 1–2 d | **done** — continuation byte-identical over 290 bytes (~200 tokens); logits argmax equal, top-8 7/8, top-16 15/16; `--dist-replay-check` now runs on the coordinator path and passes exact (`ds4-glm53-oracle.md`) |
 | 7 | Boundary gates (2 048→2 056, 4 096→4 100), snapshot round-trip across the split | `QA_BEFORE_RELEASES.md` | 1–2 d | **partial** — live-pair save and load verified; fresh-pair and roles-swapped restores and both sweeps not run |
 | 8 | Long-context endurance: 262K cold ingest, 524K alloc, thermal logging per frontier | `ds4_bench.c`, `speed-bench/` | 1–2 d | **done for one session** — ~287K and ~479K ingests at ctx 524288, peak board logged, no throttling |
 | 9 | Docs + release gates | docs, `QA_BEFORE_RELEASES.md` | 0.5–1 d | **done** — `DISTRIBUTED.md`, `DGX_SPARK.md`, `MODELS.md`, `SERVER.md` and `QA_BEFORE_RELEASES.md` §10/§16 all carry the current split and numbers |
 | 10 | *(optional)* CUDA coordinator-side slice prefill fix | `ds4_cuda.cu` | 1–3 d | **open, optional** — not needed while the Spark is the worker |
 | 11 | *(optional)* IQ2_XXS for the same GLM MoE path | `ds4_cuda.cu` | 1–2 d | **deferred** — one instantiation of the same template, once Q4_K is through QA |
 
-The critical path (1 → 2 → 5 → 6) landed through 5; **6's logit and continuation
-halves now pass** (`ds4-glm53-oracle.md`) — the pipeline's greedy output is
-byte-identical to the single-Mac Q4_K run over 290 bytes (~200 tokens), and the
-logits agree on argmax and top-8. What remains of 6 is the `--dist-replay-check`
-diagnostic, which did not fire on the coordinator path. The order of work held as
-predicted — prefill first, then decode, then the QA matrix — which is what let a
-long ingest be measured behind the guard early.
+The critical path (1 → 2 → 5 → 6) is now complete. **6 passes**
+(`ds4-glm53-oracle.md`): the pipeline's greedy output is byte-identical to the
+single-Mac Q4_K run over 290 bytes (~200 tokens), the logits agree on argmax and
+top-8, and `--dist-replay-check` reproduces the logits exactly. The order of work
+held as predicted — prefill first, then decode, then the QA matrix — which is what
+let a long ingest be measured behind the guard early.
 
 ---
 

@@ -464,9 +464,10 @@ either preserves the default or is behind an opt-in switch that is off by defaul
 
 **Still open**
 
-* `--dist-replay-check` did not fire on the CLI coordinator path (see
-  `ds4-glm53-oracle.md`); its reachability needs checking.
-* The single-Mac Q4_K `--ssd-streaming` figures predate `ce4d214` and should be
+* The single-Mac Q4_K `--ssd-streaming` figures predate `ce4d214` and are being
   re-measured now that the path is fixed (see the regression note).
+* The generic Q4_K dispatch under streaming reads unmapped ranges; making it
+  streaming-aware, so the single-Mac route also gets the 2.7× kernels, is a
+  design item (today's guard is the minimal safe restore).
 * The ported Q4_K kernels remain test-only; decide keep / make-selectable / delete.
 * Criterion 6 (fresh-pair, roles-swapped restore), as tracked by the docs.

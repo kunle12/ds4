@@ -494,8 +494,9 @@ crosses the dense/indexed boundary, and the full logits agree on argmax with
 top-8 7/8, top-16 15/16 and mean |Δ| 0.307 — cross-backend numeric drift, not a
 structural divergence (`ds4-glm53-oracle.md`). Getting there surfaced and fixed a
 single-Mac `--ssd-streaming` generation regression from the Q4_K generic-dispatch
-promotion (`ds4-glm53-ssd-streaming-regression.md`). The `--dist-replay-check`
-half of WS6 remains open: the flag did not fire on the CLI coordinator path.
+promotion (`ds4-glm53-ssd-streaming-regression.md`). `--dist-replay-check` was
+also found unwired on the coordinator path and is now implemented in the CLI dump
+path; it passes exact on the pair.
 
 ---
 

@@ -795,6 +795,65 @@ static int run_logits_dump(ds4_engine *engine, const cli_config *cfg, const ds4_
         return 1;
     }
 
+    if (cfg->dist && cfg->dist->replay_check) {
+        /* The standalone coordinator path (ds4_dist_run) implements this check,
+         * but the CLI coordinator runs through the engine session delegate, so
+         * it is implemented here. Recreating the distributed session gives a
+         * fresh session id, which makes the workers build fresh KV, i.e. a real
+         * reset-and-replay of the same prompt. */
+        const size_t logits_bytes = (size_t)vocab * sizeof(logits[0]);
+        float *before = malloc(logits_bytes);
+        float *after = malloc(logits_bytes);
+        int replay_rc = 0;
+        if (!before || !after) {
+            fprintf(stderr, "ds4: distributed replay check: out of memory\n");
+            replay_rc = 1;
+        } else {
+            memcpy(before, logits, logits_bytes);
+            ds4_session_free(session);
+            session = NULL;
+            if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0 ||
+                cli_wait_distributed_route(cfg, session) != 0 ||
+                ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4: distributed replay check could not replay: %s\n", err);
+                replay_rc = 1;
+            } else if (ds4_session_copy_logits(session, after, vocab) != vocab) {
+                fprintf(stderr, "ds4: distributed replay check: failed to copy replayed logits\n");
+                replay_rc = 1;
+            } else {
+                uint32_t mismatches = 0;
+                float max_abs = 0.0f;
+                int max_i = 0;
+                for (int i = 0; i < vocab; i++) {
+                    if (before[i] != after[i]) {
+                        const float delta = fabsf(before[i] - after[i]);
+                        if (delta > max_abs) {
+                            max_abs = delta;
+                            max_i = i;
+                        }
+                        mismatches++;
+                    }
+                }
+                if (mismatches != 0) {
+                    fprintf(stderr,
+                            "ds4: distributed replay check failed: mismatches=%u max_abs=%g token=%d\n",
+                            mismatches, max_abs, max_i);
+                    replay_rc = 1;
+                } else {
+                    fprintf(stderr,
+                            "ds4: distributed replay check passed: logits exact across reset/replay\n");
+                }
+            }
+        }
+        free(before);
+        free(after);
+        if (replay_rc != 0) {
+            free(logits);
+            ds4_session_free(session);
+            return 1;
+        }
+    }
+
     FILE *fp = fopen(cfg->gen.dump_logits_path, "wb");
     if (!fp) {
         fprintf(stderr, "ds4: failed to open --dump-logits file: %s\n", cfg->gen.dump_logits_path);

@@ -83,13 +83,16 @@ prefix.
 
 ## 4. Notes and open items
 
-- **`--dist-replay-check` did not fire.** It was passed to the CLI coordinator
-  along with `--dump-logits`, but no `distributed replay check` line was emitted.
-  The flag is honoured in `dist_run_coordinator` (`state.replay_check = opt->replay_check`),
-  reached through `ds4_dist_run`, which `ds4_cli.c`/`ds4_server.c` only call for
-  the **worker** role. Its coordinator-path reachability should be checked before
-  the `--dist-replay-check` half of WS6 is considered done. Not a blocker for
-  criterion 1 as written.
+- **`--dist-replay-check` fixed and passing.** The flag was only honoured in the
+  standalone `dist_run_coordinator` flow (`state.replay_check = opt->replay_check`),
+  reached through `ds4_dist_run`, which `ds4_cli.c`/`ds4_server.c` call only for
+  the **worker** role. The coordinator runs through the engine session delegate,
+  which had no replay check, so the flag silently did nothing. It is now
+  implemented in the CLI coordinator dump path (`run_logits_dump`): with the flag
+  set it recreates the distributed session — a fresh session id makes the workers
+  rebuild their KV, i.e. a real reset — and re-prefills the same prompt, comparing
+  full logits for exact equality. On the pair it reports
+  `logits exact across reset/replay` for the 2,891-token prompt.
 - **Single-Mac Q4_K `--ssd-streaming` numbers need re-measuring.** The figures in
   the split-design doc predate `ce4d214`; the path is fixed but the old numbers
   were not re-validated here.
