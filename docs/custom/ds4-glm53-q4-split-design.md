@@ -141,7 +141,7 @@ Measured on the target pair unless noted.
 | Budget derivation | `min(0.99 x base, base − reserve)`, base = `hw.memsize` (Apple) or the CUDA working set; 18 GiB GLM 5.3 reserve, runtime-tunable. Spark's OS-visible total is 121.61 GiB; the Mac's 115.19 comes from `iogpu.wired_limit_mb=120000` |
 | GPU duty | prefill: Mac 99–100 %, Spark ~57 % (`0:23`) rising to ~74 % (`0:20`). Decode: ~71 % Mac, ~62 % Spark, never ≥90 % |
 | CUDA GLM routed MoE | was `ds4_cuda.cu:32103` Q2_K-only; ported, then the generic dispatch was promoted as default (§8) |
-| CUDA coordinator-side slice prefill | `CUDA tensor read failed: unspecified launch failure` for chunks ≥ 512 rows; **reproduced on pristine `8db1d1d`**; still open (WS 10) |
+| CUDA coordinator-side slice prefill | not reproducible on the current build — Spark coordinator `0:20` + Mac worker `21:output` prefilled 851/4096/5018-row chunks (including explicit 512-row chunks) for Q4_K and Q2 with full logits and no launch failure; the GLM-specific CUDA path it was reported against is unreachable for shipped models (`ds4-glm53-ws10-role-swap.md`) |
 | GLM 5.3 slice payload | `N_HC × N_EMBD` = 16 384 f32/token = 64 KiB; the wire size function said `N_EMBD` — **fixed** |
 | Wire traffic | Mac→Spark 174.85 MB/s mean during prefill (one ~256 MiB burst per 4096-token chunk), Spark→Mac 0.20 MB/s — 871× one-way |
 | Q2 pipeline | 32 768 ctx: 380.6 t/s prefill, 12.5 t/s decode with caps on (383.5 / 12.8 uncapped) |
@@ -196,10 +196,15 @@ recipe, but verifying it needs a GLM MTP support model and there is none here.
 Speculative decoding must not be silently wrong, so it refuses rather than runs
 unverified.
 
-### 3.2 CUDA coordinator-side slice prefill — **still open, still optional**
+### 3.2 CUDA coordinator-side slice prefill — **not reproducible**
 
-Only needed if the Spark must lead. Not needed for the goal, since the Mac is the
-coordinator, which is also where the user sits. WS 10.
+Only needed if the Spark must lead. The 2026-09-21 check
+(`ds4-glm53-ws10-role-swap.md`) ran roles-swapped — Spark CUDA coordinator
+`0:20`, Mac Metal worker `21:output` — and prefilled 851-, 4 096- and 512-row
+chunks for Q4_K and Q2 with full logits and no launch failure; cross-coordinator
+logits agree on argmax and top-8. The GLM-specific CUDA path the report targeted
+is no longer reached by any shipped model. Roles-swapped therefore works; the Mac
+still leads because that is where the user sits, not because it must.
 
 ### 3.3 macOS inbound TCP — **superseded**
 
@@ -336,7 +341,7 @@ the effort.
 | 7 | Boundary gates (2 048→2 056, 4 096→4 100), snapshot round-trip across the split | `QA_BEFORE_RELEASES.md` | 1–2 d | **partial** — live-pair save and load verified; fresh-pair and roles-swapped restores and both sweeps not run |
 | 8 | Long-context endurance: 262K cold ingest, 524K alloc, thermal logging per frontier | `ds4_bench.c`, `speed-bench/` | 1–2 d | **done for one session** — ~287K and ~479K ingests at ctx 524288, peak board logged, no throttling |
 | 9 | Docs + release gates | docs, `QA_BEFORE_RELEASES.md` | 0.5–1 d | **done** — `DISTRIBUTED.md`, `DGX_SPARK.md`, `MODELS.md`, `SERVER.md` and `QA_BEFORE_RELEASES.md` §10/§16 all carry the current split and numbers |
-| 10 | *(optional)* CUDA coordinator-side slice prefill fix | `ds4_cuda.cu` | 1–3 d | **open, optional** — not needed while the Spark is the worker |
+| 10 | *(optional)* CUDA coordinator-side slice prefill fix | `ds4_cuda.cu` | 1–3 d | **closed as not reproducible 2026-09-21** — roles-swapped Q4_K/Q2 prefill works at 512/4 096-row chunks (`ds4-glm53-ws10-role-swap.md`) |
 | 11 | *(optional)* IQ2_XXS for the same GLM MoE path | `ds4_cuda.cu` | 1–2 d | **deferred** — one instantiation of the same template, once Q4_K is through QA |
 
 The critical path (1 → 2 → 5 → 6) is now complete. **6 passes**

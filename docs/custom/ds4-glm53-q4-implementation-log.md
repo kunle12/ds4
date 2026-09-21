@@ -514,7 +514,7 @@ path; it passes exact on the pair.
 | guard `set -u` exit on first `set_cap`; slow-down field off by one; initial `board=0C` | journal `board: parameter not set`, exit 2 | **fixed**, and stub-verified |
 | Install hang: `plymouth-quit-wait` stalling the boot for 17 min | `is-system-running = starting` | **fixed** — unit reordered to `After=local-fs.target`; default target `multi-user` |
 | macOS ALF blocks inbound for adhoc-signed binaries | a 20-line `cc` listener failed identically while Apple-signed `nc` worked | **worked around**, then made moot — no tunnel needed on macOS 26.7 |
-| CUDA coordinator-side slice prefill crashes on chunks ≥512 rows | reproducible on pristine `8db1d1d`, so pre-existing | **open, out of scope** while the Mac leads |
+| CUDA coordinator-side slice prefill crashes on chunks ≥512 rows | reported on pristine `8db1d1d` | **not reproducible 2026-09-21** — roles-swapped Q4_K/Q2 prefill works at 512/4 096-row chunks; the GLM-specific CUDA path it targeted is unreachable for shipped models (`ds4-glm53-ws10-role-swap.md`) |
 | MTP tok2 and scalar debug paths still refuse Q4_K by name | deliberate | **open** — tok2 needs a GLM MTP support model to verify against, and verification is the point of the port |
 
 ---
