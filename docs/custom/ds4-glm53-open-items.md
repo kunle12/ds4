@@ -62,11 +62,17 @@ minimal state. (Design item recorded in
 
 ### Single-Mac 512K and MTP-at-512K re-verify
 The old numbers (decode 4.63–5.02 t/s; "MTP a ~21 % loss at 512K") predate the
-`ce4d214` fix. Re-measuring needs a ~512K ingest — roughly 1.8 h **per
-configuration**, doubled for the MTP pair — and MTP is a non-goal under the split
-with the single-Mac route a fallback. Recommend re-running only if MTP is
-reconsidered. The 32K/262K single-Mac figures have already been re-measured and
-match (`ds4-glm53-ssd-streaming-regression.md` §5).
+`ce4d214` fix. A `ds4-bench` re-run (frontier 524288, ~1.8 h per configuration)
+**did not complete**: the first attempt stopped correctly for a short prompt
+(506,160 vs 524,288 tokens), and the re-launch got through the memory plan — which
+reproduced the documented **102.00 GiB** exactly — then died silently during the
+first 2048-token prefill chunk, with no error line, no jetsam/watchdog entry and
+the process gone. So the 512K decode figure stays **unverified, and the single-Mac
+Q4_K route at 512K may not run on this build at all**; that needs its own
+investigation. MTP-at-512K also stays deferred: `ds4-bench` has no GLM `--mtp`, so
+it needs a CLI run, and MTP is a non-goal under the split. The 32K/262K single-Mac
+figures have already been re-measured and match
+(`ds4-glm53-ssd-streaming-regression.md` §5).
 
 ### EEE-on/off link ablation
 The mitigation (EEE disabled) holds under load — 4 flaps across every session.
