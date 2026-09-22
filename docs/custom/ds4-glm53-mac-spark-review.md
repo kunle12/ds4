@@ -110,6 +110,16 @@ other.
    "keep the fallback covered" stance and the plan's WS 4/5, so not recommended without a
    deliberate decision.
 
+> **Update (2026-09-21, `44fc48f`).** Option 1 was taken, but the "unreachable at
+> runtime" conclusion held only until the SSD-streaming regression fix. That fix makes
+> the predicate return **false** for a streaming graph, which reintroduces a runtime
+> path to the GLM-specific dispatch — so the ported CUDA kernels are no longer strictly
+> test-only. They still have no shipped runtime use, because the single-Mac streaming
+> fallback is Metal and runs the Metal GLM-specific kernels; only a *CUDA* streaming GLM
+> graph would run these instantiations, and that is not a shipped configuration. The
+> `ds4.c` comment, impl-log §10 change 6, split-design §8 and `ds4-glm53-open-items.md`
+> now say this; the "the predicate has no switch back" phrasing is retired.
+
 ### F2 — *Low.* The technical-analysis snippet of `ds4_engine_hidden_f32_values` is inverted.
 
 `docs/custom/ds4-technical-analysis.md` §7.1 shows:

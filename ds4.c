@@ -46078,7 +46078,9 @@ static bool glm_graph_dense_tensor_layout(
  * --ssd-streaming it reads expert weight ranges the streaming map has not
  * covered, which broke the single-Mac Q4_K generation path once the generic
  * promotion became unconditional (ce4d214). A streaming graph therefore keeps
- * the GLM-specific dispatch. */
+ * the GLM-specific dispatch for the homogeneous Q4_K trio in
+ * glm_graph_layer_uses_generic_routed_moe below (the IQ2_XXS branch is generic
+ * either way, so it is unaffected). */
 static bool g_glm_ssd_streaming_active;
 
 static bool glm_graph_layer_uses_generic_routed_moe(
@@ -46090,20 +46092,30 @@ static bool glm_graph_layer_uses_generic_routed_moe(
      * always been served by the generic routed-MoE dispatch. */
     if (l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS) return true;
 
-    /* A homogeneous Q4_K trio is served there too. The GLM-specific dispatch was
-     * ported to accept Q4_K (plan WS 1-4) and does produce identical output, but
-     * measured on the target pair its kernels prefill at 95.3 t/s against the
-     * generic dispatch's 258.9 t/s - 2.7x - because the generic path uses
-     * tensor-core tile16 Q4_K kernels and the ported ones do not. So the generic
-     * dispatch is the default for this type, and `DS4_GLM_GENERIC_MOE_Q4K`, which
-     * used to gate this while the port was being written, is gone.
+    /* A homogeneous Q4_K trio is served there too. The CUDA GLM-specific
+     * dispatch was ported to accept Q4_K (plan WS 1-4) and does produce
+     * identical output, but on the pair it prefills at 95.25 t/s against the
+     * generic dispatch's 258.92 t/s - 2.7x - because the generic CUDA path
+     * selects the tensor-core tile16 MMA kernels while the ported ones are
+     * non-MMA tile8. That A/B's Spark-only-generic arm measured 257.42 t/s, so
+     * the gain is entirely the CUDA side's and the pair becomes Mac-bound once
+     * it applies. The generic dispatch is therefore the default for this type,
+     * and `DS4_GLM_GENERIC_MOE_Q4K`, which gated the A/B while the port was
+     * being written, is gone.
      *
      * This predicate is the only selector: both dispatch sites consult it before
      * the GLM-specific entry point, and `DS4_CUDA_GLM_MOE_TYPES` is read inside
-     * that entry, so it cannot re-route a homogeneous Q4_K trio back. The ported
-     * Q4_K kernels are therefore test-only coverage (`make test-glm53-moe-q4k`),
-     * not a runtime hatch. If a runtime fallback is wanted again, the switch
-     * belongs here, not in ds4_cuda.cu. */
+     * that entry, so it only narrows the accepted types - it cannot re-route a
+     * homogeneous Q4_K trio away from this decision.
+     *
+     * The ported CUDA Q4_K kernels are therefore not the default. They are
+     * exercised directly by `make test-glm53-moe-q4k`, and reached at runtime
+     * only by a *streaming* graph, where this predicate returns false: the
+     * shipped streaming fallback is the single Mac, whose GLM-specific kernels
+     * are the Metal ones, so a CUDA streaming GLM graph - the only way to run
+     * these instantiations - is not a shipped configuration. Any further runtime
+     * fallback belongs here as a condition of this predicate, not in
+     * ds4_cuda.cu. */
     if (l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_down_exps->type == DS4_TENSOR_Q4_K) {

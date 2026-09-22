@@ -43,12 +43,13 @@ prompt-identical. Recorded, no defect.
 
 ## Decisions
 
-### Ported Q4_K kernels — keep as test-only coverage
+### Ported Q4_K kernels — keep, reachable on a streaming graph
 They lose to the generic dispatch on a resident graph (95.3 vs 258.9 t/s) and are
-unreachable at runtime for a homogeneous Q4_K trio; they remain exercised by
-`make test-glm53-moe-q4k`. Re-exposing them at runtime would restore an
-unexamined second dispatch path. Revisit only if a future recipe cannot use the
-generic path.
+exercised directly by `make test-glm53-moe-q4k`. Since `44fc48f` they are also
+reached at runtime by a *streaming* graph, where the predicate returns false; for
+the shipped single-Mac fallback that path is Metal, so the ported CUDA
+instantiations still have no shipped runtime use. Revisit only if a future recipe
+cannot use the generic path.
 
 ### Streaming-aware generic dispatch — not implemented
 Making the generic entry points read experts from the streaming cache would touch

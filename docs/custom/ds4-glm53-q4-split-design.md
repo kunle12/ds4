@@ -422,12 +422,17 @@ That is recorded in the implementation log's Appendix B.
   unexamined" was asking for, and the answer was not the one the workstreams assumed:
   the generic dispatch prefills at **258.9 t/s** against the ported GLM-specific
   kernels' **95.3 t/s** — 2.7× — with **byte-identical** output over 64 greedy tokens.
-  A homogeneous Q4_K trio now routes to the generic dispatch unconditionally, and the
-  ported kernels are test-only coverage (`make test-glm53-moe-q4k`) rather than a
-  runtime-selectable fallback — the predicate has no switch back. Mechanism: the
-  generic path uses tensor-core tile16 Q4_K
-  kernels, the ported ones do not. This is the difference between criterion 3 passing
-  and failing.
+  A homogeneous Q4_K trio now routes to the generic dispatch on a resident graph. The
+  2.7x is the CUDA side's: the generic CUDA path selects tensor-core tile16 MMA
+  kernels, the ported ones are non-MMA tile8, and the A/B's Spark-only-generic arm
+  measured 257.42 t/s against 258.92 for both-generic (both against 95.25 for
+  both-GLM-specific), so the Spark stage was the bottleneck and the pair is Mac-bound
+  once the generic path applies. The ported CUDA kernels are therefore no longer the
+  default: they are exercised by `make test-glm53-moe-q4k`, and since `44fc48f` are
+  also reached at runtime by a *streaming* graph (the predicate's
+  `g_glm_ssd_streaming_active`), which for the shipped single-Mac fallback is Metal,
+  not these CUDA instantiations. `DS4_GLM_GENERIC_MOE_Q4K`, the A/B gate, is gone.
+  This is the difference between criterion 3 passing and failing.
 * **Docs updated in the same change set** — and this is the part that had drifted.
   `docs/DISTRIBUTED.md`, `docs/DGX_SPARK.md`, `docs/MODELS.md`, `docs/SERVER.md` and
   `QA_BEFORE_RELEASES.md` §10/§16 all still described the superseded `0:23` split and
