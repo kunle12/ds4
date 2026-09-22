@@ -17,8 +17,8 @@ original V4.1 analysis was written.
 
 **For token generation, the earlier conclusion is correct: a layer split does not
 speed up decode. It can only recover decode lost to SSD streaming.** For this
-model that means *no measureable gain at short/mid context, and a real but modest
-~1.4-1.6x gain only at the deepest contexts (250K-500K)*.
+model that means *no measurable gain at short/mid context, and a modest
+~1.1-1.4x gain at the deepest contexts (250K-500K)*.
 
 Two measured facts, taken on this exact Mac+Spark pair (GLM 5.3, `ds4-glm53-q4-split-design.md` §0),
 settle it:
@@ -33,10 +33,11 @@ is the *sum* of the two stages; a split cannot beat the faster single machine, i
 can only replace streaming with residency.
 
 V4.1 Q2 does not fit resident on one machine (151.8 GiB of main weights vs ~110 GiB
-usable), so the honest baseline is single-machine **streaming**, and there the
-measured GLM shape applies: split decode is a **wash to 262K** and **~1.5x at
-~479K**, because the single machine's decode is expert-cache bound and degrades
-with depth while the pair's does not.
+usable), so the honest baseline is single-machine **streaming**. The GLM analogue
+suggested a **wash to 262K** and **~1.5x at ~479K** (single-machine decode is
+expert-cache bound and degrades with depth); but **V4.1 Q2 measured on this Mac is
+far more depth-robust** - **10.52 t/s at 262K, 9.48 at 524K**, only ~10% down - so
+the split's depth gain is bounded at **~1.1-1.4x** (§5).
 
 **Prefill is the opposite** (it is a `max` of stages, not a `sum`): the same pair
 measured **4.0-4.6x** the single machine. But that is ingest speed, not token
@@ -142,14 +143,27 @@ weights resident, so - like GLM Q4_K - the meaningful baseline is single-machine
 boundary is legal only after **7, 13 or 19**. Engram layers 1 and 14 must be owned
 by whichever rank holds them.
 
-**Predicted decode**, by analogy with the measured GLM shape (V4.1 Q2's single-Mac
-decode is 14.2 t/s at 32K and 10.5 t/s at 262K, from §11.15):
+**Measured single-Mac performance (2026-09-22)** - these replace the earlier
+estimates, and they are the go/no-go numbers for the split:
 
-| depth | Mac alone (streaming, measured) | split (predicted) | gain |
-| ---: | ---: | ---: | ---: |
-| 32K | 14.2 t/s | ~14 t/s | none |
-| 262K | 10.5 t/s | ~10-11 t/s | none (wash) |
-| ~500K | not measured | ~1.4-1.5x the Mac | modest |
+| depth | prefill | ingest | decode (steady) | plan |
+| ---: | ---: | ---: | ---: | ---: |
+| 262,144 | **356.85 t/s** | 12.2 min | **10.52 t/s** | 102.36 GiB |
+| 524,288 | **310.23 t/s** | 28.2 min | **9.48 t/s** | 102.21 GiB |
+
+(`ds4-bench --ssd-streaming`, `speed-bench/promessi_sposi.txt`, automatic expert
+cache, 64 greedy tokens; the 524K run uses a repeated prompt. §11.15's 374.7 t/s /
+10.5 t/s figure reproduces to within ~5% on prefill and exactly on decode.)
+
+Two things this settles:
+
+* **Decode is depth-robust on this model.** It falls only **~10%** from 262K to 524K
+  (10.52 -> 9.48), against GLM Q4_K's ~40% (8.00 -> 4.63-5.02). So the split's decode
+  case is weaker than the GLM analogy suggested: the gain at depth is bounded by that
+  small degradation, i.e. roughly **1.1-1.4x**, not 1.5x.
+* **Prefill parity holds.** The split was predicted at ~410 t/s; the Mac alone now
+  does 356.85 at 262K and 310.23 at 524K, so the prefill win is **~1.15-1.3x**, not
+  the 4-5x GLM sees.
 
 **Cut orientation - a correction.** The earlier document fixed the Mac *upstream*
 for cut 13 (`Mac 0-13 / Spark 14-39`). Because decode is a sum weighted by each
@@ -159,14 +173,26 @@ decode-optimal *feasible* orientation is the **opposite**: `Spark 0-13 / Mac
 at the balanced 20/20 and ~12.7 for the earlier Mac-upstream cut 13. Even the best
 orientation is a wash against the Mac-alone streaming at ≤262K.
 
-**Prefill - the earlier "parity" claim is the weak link.** §11.15 rested on
-Mac-alone V4.1 Q2 prefill of **317-404 t/s** at 131K-262K. On the same machine,
-GLM 5.3 Q4_K alone measures **82-85 t/s**, a 4.5x gap for a comparably-sized
-model; and 374-404 t/s would put an M4 Max *streaming Q2* above the repository's
-own *resident Q4* M3 Ultra reference (341.75 t/s). Those V4.1 Mac figures have no
-raw artifacts in the tree and are internally suspect. If they are wrong, the V4.1
-split's prefill win is large (GLM-like, ~4x), not parity - but that still does not
-change the **decode** answer.
+**Prefill - now verified, and parity holds.** My earlier suspicion that the
+317-404 t/s figure was wrong (see §6 item 3) does not survive measurement: the Mac
+really does ingest 262K in ~12 minutes. The 4.5x gap against GLM Q4_K's 82 t/s on
+the same machine is a model property - V4.1 Q2's experts are ~9.49 MiB and 53%
+cached against GLM's ~14 MiB and 42% - not a bad measurement.
+
+Both runs used:
+
+```sh
+~/bin/ds4-bench --ssd-streaming -m /Volumes/Models/deepseek/DeepSeek-V4.1-Flash-Q2.gguf \
+  --prompt-file <prompt> --ctx-start <N> --ctx-max <N> --gen-tokens 64 --csv out.csv
+```
+
+and their raw rows (`promessi_sposi.txt` for 262K; a repeated prompt for 524K):
+
+```
+ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes
+262144,262144,356.85,64,9.04,1087.642,63,10.52,0
+524288,524288,310.23,64,8.07,1281.749,63,9.48,0
+```
 
 ---
 
@@ -178,12 +204,15 @@ change the **decode** answer.
    produced it did not.
 2. **It missed the decode-optimal cut orientation** (Mac downstream at cut 13;
    §5 above).
-3. **Its load-bearing prefill number is unverified** (317-404 t/s), inconsistent
-   with both the M3 Ultra resident Q4 figure and the GLM single-Mac figure, and not
-   archived. This is the weakest claim in the withdrawal.
-4. **"No visible improvement" is right for short/mid context but wrong at 500K**,
-   where the measured GLM analogue is ~1.5x. For a 250K-500K coding workload, that
-   is the one place the split's decode case is real.
+3. **Its prefill number looked unverifiable, but it reproduces.** I flagged the
+   317-404 t/s figure as suspect; the 2026-09-22 run measures **356.85 t/s** at
+   262K and **310.23** at 524K, so the withdrawal's prefill reasoning was sound and
+   the GLM-vs-V4.1 gap is real (Q2's smaller experts, higher cache fraction).
+4. **"No visible improvement" is close to right even at 500K for this model.** The
+   GLM analogue suggested ~1.5x at depth, but V4.1 Q2's decode is far more
+   depth-robust (9.48 vs 10.52, ~10%), so the split's depth gain is bounded at
+   roughly **1.1-1.4x** - and that bound is inferred, not measured (no V4.1 split
+   exists).
 
 ---
 
@@ -230,17 +259,19 @@ The question behind this document is not "decode t/s" in isolation - it is a
 large-context coding agent that feels responsive. That reframing changes which
 measured numbers are load-bearing, because a turn's latency is not one number.
 
-**A per-turn budget**, assembled from the repo's measurements (V4.1 Q2 single-Mac
-figures from `ds4-v41-split-design.md` §11.15; pipeline figures are the GLM 5.3
-analogues from `ds4-glm53-q4-implementation-log.md`, the only measured Mac+Spark
-pipeline on this pair):
+**A per-turn budget**, assembled from the repo's measurements - the V4.1 Q2
+single-Mac figures are now **measured on this machine** (2026-09-22, §5), the
+pipeline figures are the GLM 5.3 analogues from
+`ds4-glm53-q4-implementation-log.md` (the only measured Mac+Spark pipeline on this
+pair), and the continued-prefill row is an estimate:
 
 | Step | V4.1 Q2, single M4 Max (streaming) | Mac+Spark pipeline |
 | --- | ---: | ---: |
-| Cold ingest, 262K | **~11.7 min** | ~3 min (415 t/s) |
-| Continued prefill, 2K tool result | ~11 s | ~5 s |
-| **Decode of the assistant turn (incl. reasoning)** | **10.5 t/s @262K -> ~95 s / 1000 tk** | ~11 t/s -> ~91 s |
-| Decode at 500K | ~7-8 t/s (degrades) | ~11 t/s (**~1.5x**) |
+| Cold ingest, 262K | **12.2 min** (measured) | ~3 min (415 t/s) |
+| Cold ingest, 524K | **28.2 min** (measured) | ~7 min |
+| Continued prefill, 2K tool result | ~11 s (est.) | ~5 s |
+| **Decode of the assistant turn (incl. reasoning)** | **10.52 t/s @262K -> ~95 s / 1000 tk** | similar at 262K |
+| Decode at 524K | **9.48 t/s** (measured, ~10% down) | bounded at ~1.1-1.4x |
 | Re-prefill after compaction / think-level change | another full ingest | same |
 
 Two consequences:
@@ -259,8 +290,9 @@ Two consequences:
   The check is not at startup either: `ds4_tp_hello_fixed` carries no device field
   (`ds4_tp.c:1964`), so the pair would bind and then diverge.
 - **Pipeline: viable**, and it helps the agent profile - both stages resident, so
-  the M5's TensorOps path only makes its own stage faster; prefill ~4-5x and depth
-  decode ~1.5x.
+  the M5's TensorOps path only makes its own stage faster. The size of the win is
+  model-dependent: GLM measured 4-5x prefill and ~1.5x depth decode, while V4.1 Q2
+  is only ~1.15-1.3x prefill and at most ~1.1-1.4x decode (§5).
 - But decode is `sum(stage)`, so a pipeline does **not** beat an M5 *standalone* at
   short/mid context. If the intent of adding an M5 is response speed, the better
   uses are M5 standalone or two M5s in TP.
@@ -288,11 +320,12 @@ For a large-context agent at ~10 t/s these dominate any split:
 ### 9.3 A response win that already exists: residency
 
 On this same M4 Max a **resident** model decodes ~2.5-3.5x faster than streaming
-V4.1 Q2 (measured 2026-09-19, `ds4-technical-analysis.md` §17.7):
+V4.1 Q2 (V4 Flash measured 2026-09-19, `ds4-technical-analysis.md` §17.7; V4.1 Q2
+measured 2026-09-22, §5):
 
 | Model on the M4 Max | Residency | Decode |
 | --- | --- | ---: |
-| DeepSeek V4.1 Flash Q2 | streams | 10.5 t/s @262K |
+| DeepSeek V4.1 Flash Q2 | streams | **10.52 t/s @262K; 9.48 @524K** |
 | DeepSeek V4 Flash (IQ2/Q4K hybrid) | **resident** (106.53 GiB plan) | 27.9 t/s; **34.8 t/s with DSpark** |
 
 If the task tolerates V4 Flash quality, that is a larger response improvement than
@@ -301,43 +334,40 @@ path for it.)
 
 ### 9.4 What this changes about the recommendation
 
-- If V4.1 quality is required: run it on the Mac alone with §9.2's settings; treat
-  the Spark pipeline as a *prefill/depth* upgrade only, after the port.
-- The go/no-go for that port is one unmeasured number - the **V4.1 Q2 single-Mac
-  cold 262K ingest** (§5). If it is really ~12 min, the pipeline buys little and is
-  not worth 700-1,100 lines; if it is ~50 min, the pipeline buys the same 4-5x as
-  GLM.
+- If V4.1 quality is required: run it on the Mac alone with §9.2's settings; the
+  Spark pipeline would be a *prefill/depth* upgrade only, after the port.
+- The go/no-go number is now measured (§5): the Mac alone ingests 262K in **12.2
+  min** and 524K in **28.2 min**, and decodes at **9.48 t/s at 524K** (~10% below
+  262K). So the pipeline's prefill case is **~1.15-1.3x**, not 4-5x, and its decode
+  case is bounded at **~1.1-1.4x**. That is not worth 700-1,100 lines.
 - If hardware is being added anyway: **two like machines (TP)** beat any M4+M5
   combination for response speed.
 
 ---
 
-## 10. What would need the hardware, and the ask
+## 10. What remains to be measured, and the ask
 
-Confirming a *V4.1-specific* number, rather than the GLM analogy, needs:
+The single-Mac V4.1 Q2 measurement is now **done** (§5, 2026-09-22) and it settles
+the port's prefill case. What is *not* measured - and cannot be without the port -
+is a real V4.1 split's decode at depth:
 
-- The `DeepSeek-V4.1-Flash-Q2.gguf` model on whichever machine runs it (it is not
-  on the Mac or the Spark today - only GLM is), and
-- For a real split number, the ~700-1,100-line port first (it does not exist).
+1. **A V4.1 pipeline decode/prefill number** needs the ~700-1,100-line slice port
+   first; there is no way to measure it as-is.
+2. If wanted, the **GLM topology A/B** (pair vs resident Mac vs streaming Mac) at
+   ~500K can be re-run on the pair as the closest available analogue.
 
-Without the port, the cheap checks are:
-
-1. **Re-measure single-Mac V4.1 Q2 cold prefill/decode** at 262K and 500K (this
-   alone would settle §5's suspect 317-404 t/s), and
-2. If wanted, **re-run the GLM topology A/B** (pair vs resident Mac vs streaming
-   Mac) at 500K once the pair is free.
-
-Both need a machine and the model. **I am not touching the Spark or the Mac - both
-are busy (the Spark is running the GLM worker, the Mac the GLM coordinator). Tell
-me when they are free and which of the two checks you want.**
+Both need a free machine. The V4.1 Q2 model is at
+`/Volumes/Models/deepseek/DeepSeek-V4.1-Flash-Q2.gguf` on the Mac, and the §5 runs
+are reproducible from the command and CSV rows recorded there.
 
 ---
 
 ## 11. Recommendation
 
 - **Do not port the V4.1 pipeline for token-generation speed.** Decode is the one
-  quantity a layer split cannot improve; it is a wash to 262K and only ~1.4-1.5x
-  at 500K, at the cost of ~700-1,100 lines and a permanently coupled pair.
+  quantity a layer split cannot improve; measured on this model, it is a wash to
+  262K and at most **~1.1-1.4x at 524K** (bounded by the Mac's ~10% depth
+  degradation), at the cost of ~700-1,100 lines and a permanently coupled pair.
 - **For the end goal (§9) - a responsive large-context coding agent - the
   priorities are different, and mostly cheaper.** Absorb the re-prefill cost
   (`--kv-disk-space-mb 65536`), keep the thought level stable, spend fewer
@@ -345,11 +375,11 @@ me when they are free and which of the two checks you want.**
   resident V4 Flash + DSpark on the Mac alone (27.9-34.8 t/s) beats every streaming
   V4.1 configuration.
 - **If V4.1 quality is required and the Spark is to be used**, the split is a
-  *prefill/depth* upgrade, not a response upgrade: expect ~4-5x ingest and ~1.5x
-  decode at 500K, ~nothing below 262K.
+  *prefill/depth* upgrade, not a response upgrade: expect **~1.15-1.3x ingest** and
+  at most ~1.1-1.4x decode at 524K, ~nothing below 262K.
 - **If hardware is being added anyway**, prefer a like machine: two M5s in TP, or
   two Sparks (21.9 t/s measured). An M4+M5 pair cannot TP and, as a pipeline, only
   matches the Mac+Spark profile.
-- **Revisit the port only if** a V4.1 slice port lands for another reason (capacity
-  or prefill), or the measured V4.1 Mac-alone cold ingest shows the streaming
-  penalty is far larger than the GLM analogy suggests.
+- **Revisit the port only if** it lands for another reason (capacity, or a future
+  model/quant that truly exceeds one machine), or a like-machine TP option is not
+  available.
