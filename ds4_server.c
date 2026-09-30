@@ -7019,7 +7019,26 @@ static bool sse_error_event(int fd, const request *r, const char *msg) {
     return ok;
 }
 
+/* OpenAI's finish_reason is a closed enum (stop, length, tool_calls,
+ * content_filter, function_call).  DS4 uses the internal sentinel "error" for
+ * failed turns; writing it verbatim over an HTTP 200 makes strict clients
+ * (e.g. the Vercel AI SDK openai-compatible provider used by OpenCode) reject
+ * the whole response as a decode error.  Report anything unrecognised as
+ * "stop"; the real failure is still recorded in the server log. */
+static const char *openai_finish_reason(const char *finish) {
+    if (finish &&
+        (strcmp(finish, "stop") == 0 ||
+         strcmp(finish, "length") == 0 ||
+         strcmp(finish, "tool_calls") == 0 ||
+         strcmp(finish, "content_filter") == 0 ||
+         strcmp(finish, "function_call") == 0)) {
+        return finish;
+    }
+    return finish ? "stop" : finish;
+}
+
 static bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
+    finish = openai_finish_reason(finish);
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -7105,6 +7124,7 @@ static bool sse_done(int fd, const request *r, const char *id,
 static bool sse_chat_finish(int fd, const request *r, const char *id, const char *content,
                             const char *reasoning, const tool_calls *calls, const char *finish,
                             int prompt_tokens, int completion_tokens) {
+    finish = openai_finish_reason(finish);
     if (!sse_chunk(fd, r, id, NULL, NULL)) return false;
 
     buf b = {0};
@@ -8135,6 +8155,7 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
                                    size_t raw_len, const tool_calls *calls,
                                    const char *finish, int prompt_tokens,
                                    int completion_tokens) {
+    finish = openai_finish_reason(finish);
     if (!openai_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
 
     buf b = {0};
@@ -9001,6 +9022,7 @@ static bool final_response(int fd, bool enable_cors,
                            const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
                            int prompt_tokens, int completion_tokens) {
+    finish = openai_finish_reason(finish);
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
@@ -12587,6 +12609,15 @@ static int server_generation_rewind(server *s, server_slot *slot,
                                      const request *r, int pos,
                                      char *err, size_t errlen) {
     pthread_mutex_lock(&s->inference_mu);
+    /* Fast path: a DeepSeek V4 DSpark boundary rewind can restore the verifier's
+     * block-start frontier and replay a few tokens in place, avoiding the
+     * full-context rebuild whose Metal prefill can hang. */
+    if (ds4_session_rewind_speculative_boundary(slot->session, pos) == 0) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: in-place DSpark boundary rewind to %d", pos);
+        pthread_mutex_unlock(&s->inference_mu);
+        return 0;
+    }
     ds4_session_rewind(slot->session, pos);
     ds4_tokens prefix = {0};
     ds4_tokens_copy(&prefix, ds4_session_tokens(slot->session));
@@ -14458,6 +14489,14 @@ decode_again:
                 final_finish = "error";
                 snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
                          recovery_err[0] ? recovery_err : "unknown error");
+            } else if (j->req.stream) {
+                /* A streaming request cannot append a model-visible tool-error
+                 * continuation, so the raw model text (parsed_content) is
+                 * returned as the assistant message.  Mirror the non-streaming
+                 * parse-failure contract and terminate with a valid recovery
+                 * reason rather than the internal "error" sentinel; the detail
+                 * stays in err for the server log. */
+                final_finish = tool_parse_failure_recovery_finish(final_finish);
             }
             if (!parsed_ok) {
                 /* Print raw DSML snippet for debugging */

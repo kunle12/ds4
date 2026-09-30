@@ -60312,6 +60312,14 @@ struct ds4_session {
     float *glm_mtp_hc;
     float *glm_mtp_logits0;
     ds4_spec_frontier greedy_splitkv_anchor;
+    /* Persisted block-start frontier of the last DeepSeek V4 DSpark verify, used
+     * to serve a short speculative-boundary rewind in place instead of rebuilding
+     * the whole context (which could hang in the Metal prefill path). */
+    ds4_spec_frontier ds_rewind_frontier;
+    int ds_rewind_pos;
+    int ds_rewind_end;
+    bool ds_rewind_valid;
+    float *ds_rewind_logits;   /* s->logits captured at the frontier snapshot */
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
@@ -62401,6 +62409,28 @@ static bool spec_frontier_commit_prefix(ds4_session *s, uint32_t prefix_len) {
 
 static bool spec_frontier_commit_prefix1(ds4_session *s) {
     return spec_frontier_commit_prefix(s, 1);
+}
+
+/* Persist the block-start frontier of a DeepSeek V4 DSpark verify so a short
+ * speculative-boundary rewind can restore it and replay the retained tokens
+ * instead of rebuilding the whole context.  The tensor bodies live in the
+ * graph's spec_* buffers; only the metadata and the boundary logits are copied
+ * here.  `start` is s->checkpoint.len at snapshot time: after the seed token in
+ * the normal path, or at the block start when seed batching is fused; the replay
+ * is driven by the checkpoint tokens, so both map correctly. */
+static void ds4_session_dspark_note_rewind_frontier(ds4_session *s,
+                                                    const ds4_spec_frontier *f,
+                                                    int start, int draft_n) {
+    if (!s || !f) return;
+    s->ds_rewind_frontier = *f;
+    s->ds_rewind_pos = start;
+    s->ds_rewind_end = start + draft_n;
+    /* The boundary logits are required when the rewind keeps only the seed, so
+     * refuse the fast path entirely if the capture buffer is unavailable. */
+    s->ds_rewind_valid = s->ds_rewind_logits != NULL;
+    if (s->ds_rewind_logits)
+        memcpy(s->ds_rewind_logits, s->logits,
+               (size_t)DS4_N_VOCAB * sizeof(float));
 }
 
 static void session_greedy_splitkv_reset(ds4_session *s) {
@@ -73265,6 +73295,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (need_spec_verifier) {
         s->spec_row_logits =
             xmalloc((size_t)DS4_N_VOCAB * sizeof(s->spec_row_logits[0]));
+        if (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark) {
+            s->ds_rewind_logits =
+                xmalloc((size_t)DS4_N_VOCAB * sizeof(s->ds_rewind_logits[0]));
+        }
     }
     if (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark) {
         const uint64_t dspark_feature_count =
@@ -73300,6 +73334,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s->sample_probs);
             free(s->mtp_logits);
             free(s->spec_row_logits);
+            free(s->ds_rewind_logits);
             free(s->dspark_markov_bias);
             free(s->dspark_conf_features);
             free(s);
@@ -73383,6 +73418,7 @@ void ds4_session_free(ds4_session *s) {
     free(s->mtp_logits);
 #ifndef DS4_NO_GPU
     free(s->spec_row_logits);
+    free(s->ds_rewind_logits);
     free(s->dspark_markov_bias);
     free(s->dspark_conf_features);
 #endif
@@ -80479,6 +80515,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
     if (stats_enabled) {
         s->dspark_stats.snapshot_ms += (now_sec() - snapshot_t0) * 1000.0;
     }
+    if (have_frontier) {
+        ds4_session_dspark_note_rewind_frontier(s, &frontier, start, draft_n);
+    }
     bool ok = have_frontier && row_logits && (draft_n <= 1 || row_tops);
     bool verifier_may_have_mutated = false;
     bool tp_verify_sent = false;
@@ -81029,6 +81068,9 @@ static int ds4_session_eval_dspark_speculative_stochastic(
     int row_tops[DS4_DSPARK_MAX_BLOCK_SIZE];
     const int start = s->checkpoint.len;
     bool have_frontier = spec_frontier_snapshot(&frontier, s);
+    if (have_frontier) {
+        ds4_session_dspark_note_rewind_frontier(s, &frontier, start, draft_n);
+    }
     bool ok = have_frontier && s->spec_row_logits;
     bool verifier_may_have_mutated = false;
     bool tp_verify_sent = false;
@@ -85248,6 +85290,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_image_count = 0;
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
+    s->ds_rewind_valid = false;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (s->ds41_graph_ready) ds41_graph_reset(&s->ds41_graph);
 #endif
@@ -85309,9 +85352,83 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     s->mtp_draft_valid = false;
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
+    s->ds_rewind_valid = false;
     s->glm_mtp_have = 0;
     s->glm_mtp_rollback_valid = false;
     ds4_session_glm_cap_dense_cache(s);
+#endif
+}
+
+/* In-place rewind for a short DeepSeek V4 DSpark speculative-boundary rollback.
+ *
+ * Only attempt this immediately after a DSpark verify (the caller is the
+ * server's generation-rewind path): restore the persisted block-start frontier,
+ * then advance through the retained tokens with the ordinary decode kernel so
+ * every derived counter/cache stays consistent without re-prefilling the whole
+ * context.  Returns 0 on success; nonzero tells the caller to rebuild. */
+int ds4_session_rewind_speculative_boundary(ds4_session *s, int pos) {
+#ifndef DS4_NO_GPU
+    if (!s || !s->ds_rewind_valid || !s->checkpoint_valid) return -1;
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) return -1;
+    if (s->distributed) return -1;
+    if (s->engine && s->engine->tp.active) return -1;
+    if (pos < s->ds_rewind_pos || pos > s->ds_rewind_end) return -1;
+    if (pos >= s->checkpoint.len) return -1;
+
+    const int base = s->ds_rewind_pos;
+    const int n = pos - base;
+    if (n < 0 || n >= DS4_DSPARK_MAX_BLOCK_SIZE) return -1;
+
+    const int saved_len = s->checkpoint.len;   /* full committed block end */
+    int retained[DS4_DSPARK_MAX_BLOCK_SIZE];
+    for (int i = 0; i < n; i++) retained[i] = s->checkpoint.v[base + i];
+
+    if (!spec_frontier_restore(&s->ds_rewind_frontier, s)) {
+        /* A partial tensor copy may have left the graph inconsistent. */
+        s->checkpoint_valid = false;
+        s->ds_rewind_valid = false;
+        return -1;
+    }
+
+    ds4_engine *e = s->engine;
+    s->checkpoint.len = base;
+    if (n == 0) {
+        /* Retained exactly the seed token: the frontier is already at `pos`, so
+         * restore the logits captured at snapshot time (the verifier overwrote
+         * s->logits with the block-end distribution). */
+        if (s->ds_rewind_logits)
+            memcpy(s->logits, s->ds_rewind_logits,
+                   (size_t)DS4_N_VOCAB * sizeof(float));
+    } else {
+        for (int i = 0; i < n; i++) {
+            if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
+                                                (uint32_t)retained[i],
+                                                (uint32_t)s->checkpoint.len,
+                                                s->logits)) {
+                /* Restore the full committed token vector so the caller's
+                 * rebuild fallback re-prefills the intended prompt, and leave
+                 * the session invalid. */
+                s->checkpoint.len = saved_len;
+                s->checkpoint_valid = false;
+                s->ds_rewind_valid = false;
+                return -1;
+            }
+            token_vec_push(&s->checkpoint, retained[i]);
+        }
+    }
+    s->checkpoint.len = pos;
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    /* Match ds4_session_rewind(): the verify's target-hidden capture is no longer
+     * valid past the rewound frontier. */
+    ds4_session_dspark_capture_invalidate(s);
+    session_greedy_splitkv_reset(s);
+    s->ds_rewind_valid = false;
+    return 0;
+#else
+    (void)s;
+    (void)pos;
+    return -1;
 #endif
 }
 
