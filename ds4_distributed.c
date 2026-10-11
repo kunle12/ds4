@@ -436,6 +436,8 @@ struct ds4_dist_core {
     ds4_engine *engine;
     char listen_host[NI_MAXHOST];
     int listen_port;
+    int requested_port;
+    bool retired;
     unsigned refs;
     struct ds4_dist_core *next;
 };
@@ -3772,17 +3774,20 @@ static int dist_coordinator_prefill_prompt_pipelined(
             rc = 1;
             break;
         }
-        if (pos == span_start &&
-            reset_first_chunk &&
-            ds4_session_layer_slice_reset(session, err, errlen) != 0) {
-            rc = 1;
-            break;
-        }
         const double local_t0 = dist_now_sec();
         /* Chunk-local GPU work only: the sender/reader threads carry the
          * wire traffic without the GPU lock, so a concurrent session's
-         * decode step can run between chunks. */
+         * decode step can run between chunks. The slice reset joins the
+         * same section for uniformity with the decode-span path, even
+         * though it is host-side bookkeeping today. */
         pthread_mutex_lock(&state->shared->gpu_mu);
+        if (pos == span_start &&
+            reset_first_chunk &&
+            ds4_session_layer_slice_reset(session, err, errlen) != 0) {
+            pthread_mutex_unlock(&state->shared->gpu_mu);
+            rc = 1;
+            break;
+        }
         rc = ds4_session_eval_layer_slice(session,
                                           prompt->v + pos,
                                           chunk,
@@ -4408,7 +4413,11 @@ static void *dist_coordinator_accept_main(void *arg) {
         int fd = accept(listen_fd, (struct sockaddr *)&ss, &slen);
         if (fd < 0) {
             if (errno == EINTR) continue;
-            if (errno == EBADF || errno == EINVAL) break;
+            /* EBADF/EINVAL fire when the listener is closed at core retire;
+             * check the shared shutdown flag as well so any other errno on a
+             * retired core also terminates the loop instead of spinning. */
+            if (errno == EBADF || errno == EINVAL ||
+                state->shared->shutting_down) break;
             DIST_COORD_DEBUG(state, "ds4: distributed coordinator: accept failed: %s\n", strerror(errno));
             continue;
         }
@@ -5614,32 +5623,43 @@ cleanup:
 
 /* Acquire the engine's shared coordinator core, creating it on first use:
  * one listener + accept thread + worker registry per engine. Sessions copy
- * the read-only launch template out of the core and share its registry. */
+ * the read-only launch template out of the core and share its registry.
+ * The registry lock is held across creation so two concurrent acquires can
+ * never both miss and create (a second bind on the same port fails, which
+ * used to surface as a spurious session-create error). Cores are matched by
+ * the requested listen port; an ephemeral port (0) resolves per core but
+ * still matches later requests. */
 static ds4_dist_core *dist_core_acquire(
         ds4_engine *engine,
         const ds4_dist_options *opt,
         char *err,
         size_t errlen) {
     const char *host = opt->listen_host ? opt->listen_host : "";
+    ds4_dist_core *core = NULL;
+    int listen_fd = -1;
+
     pthread_mutex_lock(&g_dist_core_mu);
     for (ds4_dist_core *it = g_dist_cores; it; it = it->next) {
-        if (it->engine == engine &&
-            it->listen_port == opt->listen_port &&
+        if (!it->retired &&
+            it->engine == engine &&
+            it->requested_port == opt->listen_port &&
             strcmp(it->listen_host, host) == 0) {
             it->refs++;
             pthread_mutex_unlock(&g_dist_core_mu);
             return it;
         }
     }
-    pthread_mutex_unlock(&g_dist_core_mu);
 
-    int listen_fd = dist_open_listener(opt->listen_host, opt->listen_port, err, errlen);
-    if (listen_fd < 0) return NULL;
-    const int effective_port = dist_listener_port(listen_fd);
+    listen_fd = dist_open_listener(opt->listen_host, opt->listen_port, err, errlen);
+    if (listen_fd < 0) {
+        pthread_mutex_unlock(&g_dist_core_mu);
+        return NULL;
+    }
 
-    ds4_dist_core *core = calloc(1, sizeof(*core));
+    core = calloc(1, sizeof(*core));
     if (!core) {
         close(listen_fd);
+        pthread_mutex_unlock(&g_dist_core_mu);
         if (errlen) snprintf(err, errlen, "out of memory creating distributed coordinator core");
         return NULL;
     }
@@ -5648,7 +5668,8 @@ static ds4_dist_core *dist_core_acquire(
     core->listen_fd = listen_fd;
     core->engine = engine;
     snprintf(core->listen_host, sizeof(core->listen_host), "%s", host);
-    core->listen_port = effective_port;
+    core->requested_port = opt->listen_port;
+    core->listen_port = dist_listener_port(listen_fd);
     core->refs = 1;
 
     core->state.engine = engine;
@@ -5675,6 +5696,7 @@ static ds4_dist_core *dist_core_acquire(
         pthread_mutex_destroy(&core->shared.mu);
         pthread_mutex_destroy(&core->shared.gpu_mu);
         free(core);
+        pthread_mutex_unlock(&g_dist_core_mu);
         if (errlen) snprintf(err, errlen, "failed to start distributed coordinator accept loop");
         return NULL;
     }
@@ -5687,14 +5709,13 @@ static ds4_dist_core *dist_core_acquire(
     DIST_COORD_DEBUG(&core->state,
                      "ds4: distributed coordinator API: listening on %s:%d model_id=%u layers=%u local=%u:%s activation_bits=%u\n",
                      opt->listen_host,
-                     effective_port,
+                     core->listen_port,
                      core->state.model_id,
                      core->state.n_layers,
                      opt->layers.start,
                      local_end,
                      core->state.activation_bits);
 
-    pthread_mutex_lock(&g_dist_core_mu);
     core->next = g_dist_cores;
     g_dist_cores = core;
     pthread_mutex_unlock(&g_dist_core_mu);
@@ -5702,9 +5723,11 @@ static ds4_dist_core *dist_core_acquire(
 }
 
 /* Drop one session's reference. At zero the listener closes and workers are
- * shut down, but the core itself is retained: detached accept/client threads
- * still touch it, the same process-lifetime choice the per-session state
- * used to make. The engine's next session opens a fresh core. */
+ * shut down, but the core stays in the registry list, marked retired:
+ * detached accept/client threads still touch it for process lifetime (the
+ * same choice the per-session state used to make), and ds4_dist_gpu_mutex
+ * handles stay valid across a retire/recreate cycle. The engine's next
+ * session opens a fresh core. */
 static void dist_core_release(ds4_dist_core *core) {
     if (!core) return;
     pthread_mutex_lock(&g_dist_core_mu);
@@ -5712,12 +5735,14 @@ static void dist_core_release(ds4_dist_core *core) {
         pthread_mutex_unlock(&g_dist_core_mu);
         return;
     }
-    for (ds4_dist_core **link = &g_dist_cores; *link; link = &(*link)->next) {
-        if (*link == core) {
-            *link = core->next;
-            break;
-        }
+    /* Close the listener before publishing the retired flag: a new core for
+     * the same port can only be created once this one stopped listening. */
+    if (core->listen_fd >= 0) {
+        shutdown(core->listen_fd, SHUT_RDWR);
+        close(core->listen_fd);
+        core->listen_fd = -1;
     }
+    core->retired = true;
     pthread_mutex_unlock(&g_dist_core_mu);
 
     pthread_mutex_lock(&core->shared.mu);
@@ -5726,12 +5751,8 @@ static void dist_core_release(ds4_dist_core *core) {
         if (it->fd >= 0) shutdown(it->fd, SHUT_RDWR);
     }
     pthread_mutex_unlock(&core->shared.mu);
-    if (core->listen_fd >= 0) {
-        shutdown(core->listen_fd, SHUT_RDWR);
-        close(core->listen_fd);
-        core->listen_fd = -1;
-    }
-    /* core stays allocated: detached threads still reference it. */
+    /* core stays allocated and listed: detached threads still reference it,
+     * and gpu-mutex handles stay stable across a retire/recreate cycle. */
 }
 
 int ds4_dist_session_create(
@@ -5799,14 +5820,15 @@ void *ds4_dist_gpu_mutex(ds4_engine *engine) {
     pthread_mutex_lock(&g_dist_core_mu);
     void *handle = NULL;
     for (ds4_dist_core *it = g_dist_cores; it; it = it->next) {
-        if (it->engine == engine) {
+        if (!it->retired && it->engine == engine) {
             handle = &it->shared.gpu_mu;
             break;
         }
     }
     pthread_mutex_unlock(&g_dist_core_mu);
-    /* Cores are retained for process lifetime, so the handle stays valid
-     * even if the engine's sessions are released in the meantime. */
+    /* Cores are retained for process lifetime (retired ones keep their
+     * mutexes intact), so the handle stays valid even if the engine's
+     * sessions are released in the meantime. */
     return handle;
 }
 
