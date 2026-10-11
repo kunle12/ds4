@@ -1042,6 +1042,28 @@ static int dist_set_socket_low_latency(int fd) {
     };
     if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0) rc = -1;
     if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one)) != 0) rc = -1;
+    /* Tight keepalive parameters. The OS defaults (~2 h before the first
+     * probe) leave a silently stalled peer undetected far past any client
+     * deadline, which is how a wedged worker or a NIC flap froze requests
+     * until the agent's own timeout fired
+     * (docs/custom/ds4-glm53-response-data-timeout.md). 30 s / 10 s / 3
+     * detects a dead peer within about a minute, while idle-but-healthy
+     * connections are unaffected: the kernel answers probes and the
+     * application never sees them. */
+    {
+        int keep_idle = 30, keep_intvl = 10, keep_cnt = 3;
+#ifdef TCP_KEEPIDLE
+        (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
+#elif defined(TCP_KEEPALIVE)
+        (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keep_idle, sizeof(keep_idle));
+#endif
+#ifdef TCP_KEEPINTVL
+        (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
+#endif
+#ifdef TCP_KEEPCNT
+        (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
+#endif
+    }
     if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_tv, sizeof(send_tv)) != 0) rc = -1;
     /* Do not install a receive timeout by default.  Worker control sockets can
      * be legitimately idle while a KV snapshot is transferred on a separate
@@ -1067,6 +1089,34 @@ static int dist_set_socket_low_latency(int fd) {
     if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) != 0) rc = -1;
 #endif
     return rc;
+}
+
+/* Bound the coordinator's wait for a worker response. Applied only on the
+ * coordinator side, only on sockets whose reads are all response waits: the
+ * work socket is read solely while a result is outstanding, and the KV
+ * snapshot dials are per-operation. A worker that stalls without closing the
+ * connection (wedge, NIC flap) then fails the span within the deadline and
+ * the normal rebuild machinery takes over — forget route, worker re-dials,
+ * next request replays — instead of hanging the request far past any client
+ * timeout. The worker's own read loop must NOT get this option: it idles
+ * legitimately between requests. Default 120 s: the longest legitimate wait
+ * is one deep prefill chunk or the worker's snapshot tmpfile serialisation,
+ * both well under 20 s. 0 disables. */
+static void dist_apply_result_recv_deadline(int fd) {
+    long sec = 120;
+    const char *env = getenv("DS4_DIST_RESULT_TIMEOUT_SEC");
+    if (env && env[0]) {
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(env, &end, 10);
+        if (errno == 0 && end != env && *end == '\0' && v >= 0 && v <= 3600) sec = v;
+    }
+    if (sec <= 0) return;
+    struct timeval recv_tv = {
+        .tv_sec = (time_t)sec,
+        .tv_usec = 0,
+    };
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
 }
 
 #ifdef DS4_DIST_TRACE
@@ -2594,6 +2644,9 @@ static int dist_coordinator_eval_remote_on_fd(
     void *payload = NULL;
     if (rc == 0) {
         const double recv_t0 = profile ? dist_now_sec() : 0.0;
+        /* The response wait is the only unbounded read on the work socket;
+         * bound it so a stalled worker fails fast (see the helper). */
+        dist_apply_result_recv_deadline(fd);
         rc = dist_recv_result_alloc(fd,
                                     state,
                                     request_id,
@@ -3350,6 +3403,9 @@ static void *dist_prefill_result_reader_main(void *arg) {
 
     const uint32_t logits_bytes =
         (uint32_t)((uint64_t)ds4_engine_vocab_size(reader->state->engine) * sizeof(float));
+    /* Every read on this fd is a per-chunk response wait; bound them so a
+     * stall mid-prefill fails the pipeline instead of hanging the request. */
+    dist_apply_result_recv_deadline(reader->fd);
     for (uint32_t i = 0; i < reader->count; i++) {
         const uint64_t request_id = reader->first_request_id + (uint64_t)i;
         uint32_t kind = 0;
@@ -4937,6 +4993,9 @@ static int dist_save_remote_shard_to_file(
     uint64_t request_id = d->snapshot_request_id++;
     int fd = dist_connect_endpoint(entry->host, (int)entry->port, err, errlen);
     if (fd < 0) return 1;
+    /* All reads on this per-operation connection are snapshot response
+     * waits; bound them like work results. */
+    dist_apply_result_recv_deadline(fd);
 
     ds4_dist_snapshot_req_fixed req;
     memset(&req, 0, sizeof(req));
@@ -5054,6 +5113,7 @@ static int dist_load_remote_shard_from_payload(
     uint64_t request_id = d->snapshot_request_id++;
     int fd = dist_connect_endpoint(entry->host, (int)entry->port, err, errlen);
     if (fd < 0) return 1;
+    dist_apply_result_recv_deadline(fd);
 
     ds4_dist_snapshot_begin_fixed begin;
     memset(&begin, 0, sizeof(begin));
