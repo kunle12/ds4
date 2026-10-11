@@ -159,26 +159,30 @@ with the current build. Two things follow:
   reading for a serial pipeline — at least one of those figures was taken over
   a window that mixed regimes. Same-window decode duties must sum to ≤ 100 %.
 
-### 2.4 The per-token budget the observation implies (estimates)
+### 2.4 The per-token budget, measured (2026-10-11, `DS4_DIST_DECODE_PROFILE=1`)
 
-Taking the post-E1 decode period at ~285 K (~106–107 ms median gap) and the
-owner's duties at face value:
+The original estimates below were confirmed wrong in one half and right in
+the other — the profile lines settle it:
 
-| stage | estimate | basis |
-| --- | ---: | --- |
-| Mac stage (21 layers + embed + readback) | ~42 ms (~40 %) | 40 % × 106 ms |
-| Spark stage (24 layers + head) | ~69 ms (~65 %) | 65 % × 106 ms |
-| wire (64 KiB out, 605 KiB back) + copy/sample | ~3–5 ms | docs' ~2 ms + logits memcpy |
-| **sum** | **~106–112 ms** | measured 106–107 ms |
+| stage | estimated (§2.4 original) | **measured at 285 K** |
+| --- | ---: | ---: |
+| Mac stage (21 layers + embed + readback) | ~42 ms | **~29.5 ms** |
+| Spark stage (24 layers + head) | ~69 ms | **~73.5 ms** |
+| wire (64 KiB out, 605 KiB logits back) + copy | ~3–5 ms | ~0.6 ms (send 0.10, copy 0.04) |
+| **total** | ~106–112 ms | **~107 ms** ✓ |
 
-The sum closing on the measured period is the check: the pipeline has almost no
-dead time beyond the structural serialisation — E1 already squeezed the fat
-out. The 42/69 split is also consistent with the machines' measured bandwidths
-(295.1 vs 100.7 GB/s, a 2.9× ratio) and with the per-layer decode asymmetry the
-split sweep measured (−1.30 ms per layer moved Mac-ward, impl-log §4.3). These
-stage times are **inferred, not measured**; `DS4_DIST_DECODE_PROFILE=1`
-(`ds4_distributed.c:752`) prints exactly this breakdown per token and per span,
-on both sides — §5.
+The sum was right, the split was not: the Mac stage is ~27 % of the token, not
+~40 %, so the stage imbalance — and therefore the Spark's dominance at decode
+— is larger than estimated. Phase-aligned duty meters agree: decode Mac
+32.9 % avg (macmon), Spark 65.7 % (nvidia-smi); prefill Mac 99.1 %, Spark
+69.2 % avg with 96 % median samples. All §7.2 arithmetic below is re-derived
+from these measurements in `ds4-glm53-ws0-headmove-results.md` §5.
+
+The pipeline has almost no dead time beyond the structural serialisation —
+the stages sum to the measured period, so E1 already squeezed the fat out.
+The per-layer decode asymmetry the split sweep measured (−1.30 ms per layer
+moved Mac-ward, impl-log §4.3) remains the right sensitivity number for
+split decisions.
 
 ---
 
@@ -206,7 +210,18 @@ client is served. §4 is ordered by gain against those metrics.
 
 ## 4. Levers, ranked
 
-### 4.1 Move the output head to the coordinator — configuration-only candidate, ≈ −8–10 % decode
+### 4.1 Move the output head to the coordinator — **landed 2026-10-11; measured −2 % decode, +1.18 GiB Spark memory**
+
+> **Measured outcome** (full data: `ds4-glm53-ws0-headmove-results.md` §3–4):
+> decode 108.53 → **106.40 ms** at 285 K (−2 %, not the −8.5 % predicted
+> below), prefill unchanged, output byte-identical, oracle **better** than the
+> old topology (mean |Δ| 0.170 vs 0.307), Spark plan 104.73 → **103.55 GiB**,
+> return payload 0.59 → 0.06 MiB/token. Adopted in `~/bin/llm_config.json`.
+> The prediction erred by pricing the Spark's head read at the 100.7 GB/s
+> CPU-proxy bandwidth; the back-solved GPU-side head cost is **~4.3 ms** — the
+> GB10 reads at ~3× the proxy, exactly the caveat the impl-log attached to
+> that figure ("the ratio is the point"). The original estimate is kept below
+> unchanged, as the worked error it is.
 
 The single biggest asymmetry inside the decode `sum(stage)` is not a layer —
 it is the **output head**: 1.182 GiB of weights read once per token, on the
@@ -411,28 +426,39 @@ alone is sufficient: today's serial single-request decode is all bubbles
 (40 %/65 %), and concurrency against an unbalanced split caps the Mac at
 T_mac/T_spark.
 
-### 7.2 Decode duty ceilings by configuration (stage times from §2.4, estimates)
+### 7.2 Decode duty ceilings (re-derived 2026-10-11 from measured stages)
 
-| configuration | T_mac | T_spark | Mac duty at saturation | Spark duty | prefill (0:20 basis) |
+The original §7.2 table below was built on the §2.4 estimates (42/69 ms) and
+is kept as the worked error; the measured stages (§2.4 above,
+`ds4-glm53-ws0-headmove-results.md` §5) give a very different picture:
+
+| configuration | T_mac | T_spark | Mac duty at saturation | Spark duty | aggregate |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| today, head on Spark, `0:20` | ~42 ms | ~69 ms | 61 % | 100 % | 455 t/s |
-| §4.1: head on Mac, `0:20` | ~46 ms | ~57 ms | **81 %** | 100 % | ~455 t/s (unchanged) |
-| §4.1 + 2 layers Mac-ward (~`0:22`) | ~50 ms | ~52 ms | **~96 %** | 100 % | ~425 t/s (−7 %) |
+| measured, head on Mac, `0:20` | ~30 ms | ~71 ms | **~42 %** | 100 % | ~14 t/s |
+| measured, headless + balanced decode (≈7 layers Mac-ward) | ~41 ms | ~42 ms | ~98 % | 100 % | ~24 t/s, but **prefill −~110 t/s (−25 %)** |
 
-The remaining few percent are wire and scheduling bubbles (~2–3 ms per
-round trip) — **96 %/100 % is the realistic decode ceiling**; a meter showing
-both pinned at 100 % will still only appear during prefill or with sampling
-coarse enough to blur the bubbles.
+| original estimate (superseded) | T_mac | T_spark | Mac duty | Spark duty | prefill |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| head on Spark, `0:20` (was "today") | ~42 ms | ~69 ms | 61 % | 100 % | 455 t/s |
+| head on Mac, `0:20` | ~46 ms | ~57 ms | 81 % | 100 % | ~455 t/s |
+| head on Mac + 2 layers Mac-ward | ~50 ms | ~52 ms | ~96 % | 100 % | ~425 t/s |
 
-Two expectations to set explicitly:
+The measured stage ratio (30/71) is far from balance, and the ~2-layer
+rebounce of the estimate is really ~7 layers — about 110 t/s of prefill by the
+measured −15.8 t/s/layer endpoint slope. **That trade is not worth making.**
+The honest decode saturation picture on any prefill-healthy split is therefore
+**Mac ≈ 42 %, Spark ≈ 100 %, aggregate ≈ 14 t/s**; the route to more Mac duty
+or more throughput per pass is true batching (§4.3), whose stage floors should
+be re-derived from the measured per-stage numbers when that workstream starts.
+A meter showing both GPUs pinned at 100 % will only appear during prefill.
+
+Two expectations that survive unchanged:
 
 * **Saturation buys aggregate throughput, not per-token latency.** At
-  saturation the pair produces ~1 token per 52–57 ms ≈ **18–19 t/s across all
-  clients** (vs 9.4 t/s single-stream today); each client's inter-token gap
-  becomes ≈ N × T_spark (114 ms at N=2 post-head-move) — still far better than
-  today's multi-client reality of N × full round trip plus session re-sync
-  replays between prompts. A single client alone will continue to read
-  ~40 %/65 % on the meters — that is correct behaviour, not a regression.
+  saturation the pair produces ~1 token per 71 ms ≈ **14 t/s across all
+  clients** (vs 9.4 t/s single-stream); each client's inter-token gap becomes
+  ≈ N × T_spark. A single client alone will continue to read ~30–40 %/65 % on
+  the meters — that is correct behaviour, not a regression.
 * **Duty is not FLOPs.** During decode both GPUs are memory-bound; 100 % duty
   means "a kernel is resident 100 % of the time", which is exactly the state
   in which the hardware cannot do more batch-1 work than it is already doing.
@@ -440,30 +466,31 @@ Two expectations to set explicitly:
 ### 7.3 Prefill stays Mac-bound — and that is the one place 100/100 is refused
 
 Prefill is `max(stage)` with the Mac the binding stage (99–100 %) and the Spark
-blocked at ~74 %. Balancing prefill would require moving layers Spark-ward,
-and the Spark is at 104.73 of 107.61 GiB at `0:20` — memory refuses, which the
-split sweep already established (impl-log §3.3). With concurrent clients the
-Spark's prefill idle cannot be harvested either: a new client's prefill needs
-the Spark's stage too, and if the Spark is saturated by decode the prefill
-queues. **Recommended acceptance: prefill remains ~100 %/74 %, decode becomes
-~96 %/100 % at load.** If the last 7 % of prefill matters more than the last
-15 points of Mac decode duty, keep `0:20` and accept ~81 % — that is the
-§7.2 middle row, and it is the recommended default because prefill is the
-phase every new client pays.
+blocked at ~70 % (measured 69.2 % avg). Balancing prefill would require moving
+layers Spark-ward, and the Spark is at 103.55 of 107.61 GiB at `0:20` headless
+— memory still refuses, which the split sweep already established (impl-log
+§3.3). With concurrent clients the Spark's prefill idle cannot be harvested
+either: a new client's prefill needs the Spark's stage too, and if the Spark is
+saturated by decode the prefill queues. **Recommended acceptance: prefill
+remains ~100 %/~70 %, decode saturates at ~42 %/100 % on this split.** The
+alternative — ~98 %/100 % decode duty via ~7 layers Mac-ward — costs ~25 % of
+prefill and is recorded as considered-and-refused.
 
 ### 7.4 Recommended sequence
 
-1. **§4.1 head-on-coordinator A/B** (configuration + oracle gate) — ~−8 % decode
-   single-stream, stage balance 42/69 → 46/57, +1.18 GiB Spark slack (the
-   memory enabler for step 2), prefill unchanged.
+1. ~~**§4.1 head-on-coordinator A/B**~~ **done 2026-10-11** — measured −2 %
+   decode, +1.18 GiB Spark slack, oracle re-passed and *improved*; adopted in
+   the launcher config (§4.1 header and the results doc).
 2. **§4.2 multi-session interleaving** (the design doc
-   `ds4-glm53-multi-session-design.md`) — concurrent clients, both GPUs
-   toward their §7.2 ceilings, aggregate ~18–19 t/s at saturation; per-client
-   ITL ≈ N × T_spark under load.
-3. **Split decision, measured, not assumed:** re-run the split sweep's
-   decode points at `0:22`-vs-`0:20` with the head on the Mac *and* ≥2
-   concurrent clients, reading duties from both meters; take the 2-layer
-   shift only if the measured prefill cost is acceptable (§7.2's third row).
-4. **§4.3 true batching** only if per-pass throughput beyond ~19 t/s is ever
-   needed — it multiplies throughput but does not by itself raise duties
-   (the stages still alternate per pass); it is a later, larger decision.
+   `ds4-glm53-multi-session-design.md`; workstream 0 of it is done) —
+   concurrent clients, the Spark toward 100 % at ~14 t/s aggregate; per-client
+   ITL ≈ N × T_spark under load. The Mac's duty ceiling on this split is
+   ~42 % (§7.2) — the design's value is throughput and per-client latency
+   under load, not the Mac's meter.
+3. **Split decision:** closed for decode by measurement (§7.2) — the
+   `0:22`-style rebalance is refused; revisit only if prefill ever stops being
+   the binding phase.
+4. **§4.3 true batching** if throughput beyond ~14 t/s aggregate is needed —
+   it multiplies per-pass tokens and does not require stage balance; its stage
+   floors come from the measured context-independent terms (~2.2 ms/layer on
+   the Spark, ~1.4 ms/layer on the Mac) plus the depth term.

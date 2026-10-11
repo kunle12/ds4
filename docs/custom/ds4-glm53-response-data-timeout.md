@@ -1,8 +1,12 @@
 # `Timed out waiting for response data` — the GLM 5.3 pipeline under the code agent
 
-**Status:** root cause identified from source at `59e0b97` plus OpenCode's published
-transport source; no experiment run (both machines busy). One small engine fix is
-proposed (§5) and is a natural companion to the multi-session workstream.
+**Status:** root cause identified and **fixed**. The bounded result wait and
+the keepalive tuning are implemented at `c2787ea`, deployed to `~/bin` on both
+hosts, and stall-verified on the live pair (a worker `SIGSTOP` mid-decode now
+fails the request at the 120 s deadline, the worker re-dials on resume, and a
+fresh request succeeds — previously the same freeze hung indefinitely).
+Measured evidence: `ds4-glm53-ws0-headmove-results.md` §2. §5's items 1–2 are
+done; the rest of that section stands as written for the future.
 **Symptom:** occasionally, the code agent (OpenCode) against the Mac+Spark
 GLM 5.3 Flash pair aborts a request with `Timed out waiting for response data`.
 

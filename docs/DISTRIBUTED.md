@@ -166,11 +166,19 @@ long-prefill throughput, not as a guaranteed decode speedup.
 The same model file on both machines; the Mac coordinates and the Spark works.
 Q4_K does not fit on the Spark alone, so this split is what makes it usable there.
 Neither machine can hold the whole model, and the split is a contiguous layer range
-chosen at launch: the coordinator takes `0:N`, the worker `N+1:output` plus the head.
+chosen at launch: the coordinator takes `0:N`, the worker `N+1:M`.
 
-**Recommended: coordinator `0:20`, worker `21:output`.** Measured at ctx 524288 on a
-286,646-token prompt, cold: **415.0 t/s prefill and 121.1 ms per token** — an
-11.5-minute ingest. The previously used `0:23` / `24:output` gives 356.3 t/s and
+**Recommended: coordinator `0:20`, worker `21:44` (headless).** The output
+head stays on the coordinator — the worker returns hidden states and the Mac
+runs the head locally, which the engine supports directly
+(`ds4.c:70648-70652`). Measured 2026-10-11 against the older `21:output`
+worker at 286K: prefill unchanged (407 vs 410 t/s), decode 106.4 vs 108.5 ms,
+byte-identical output, Spark plan 103.55 vs 104.73 GiB, and a *closer*
+cross-machine oracle (mean |Δ| 0.170 vs 0.307 — the head runs on Metal on both
+sides of the comparison). Full data: `docs/custom/ds4-glm53-ws0-headmove-results.md`.
+The older `0:23` / `24:output` figures are retained below for history:
+**415.0 t/s prefill and 121.1 ms per token** —
+an 11.5-minute ingest. The previously used `0:23` / `24:output` gives 356.3 t/s and
 120.5 ms at the same depth, so the Spark-heavy split is **+16.5 % prefill with decode
 unchanged**. At 39,865 tokens the same comparison is 455.2 against 398.8 t/s and
 103.0 against 98.5 ms.
@@ -179,10 +187,12 @@ The two hosts talk **directly** over the point-to-point link — no tunnel. The
 coordinator listens on the link address and the worker dials it:
 
 ```sh
-# Spark — worker. The 14 GiB guard reserve is what lets this larger slice fit.
+# Spark — worker, started FIRST (it retries until the coordinator listens).
+#   Headless: the output head stays on the coordinator. The 14 GiB guard
+#   reserve is what lets this larger slice fit.
 DS4_GLM_MEMORY_GUARD_RESERVE_GB=14 \
 ~/bin/ds4 --cuda -m ~/mlmodels/glm/GLM-5.3-Flash-Q4_K.gguf \
-  --role worker --layers 21:output --coordinator 192.168.2.1 9911 \
+  --role worker --layers 21:44 --coordinator 192.168.2.1 9911 \
   --listen 192.168.2.2 55911 --ctx 524288
 
 # Mac — coordinator, serving HTTP on 8081.

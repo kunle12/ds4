@@ -20,13 +20,16 @@ layer range: the coordinator holds a prefix and the worker holds the rest plus t
 output head. Both machines keep their half resident, which is the point — the
 single-machine alternative has to stream experts from SSD and is bound by that.
 
-**Recommended configuration** (ctx 524288, all 45 layers resident):
+**Recommended configuration** (ctx 524288, all 45 layers resident; worker
+headless since 2026-10-11 — the output head stays on the coordinator,
+−2 % decode, +1.18 GiB Spark slack, oracle improved; see
+`ds4-glm53-ws0-headmove-results.md`):
 
 ```sh
 # Spark — worker, started FIRST (it retries until the coordinator listens)
 DS4_GLM_MEMORY_GUARD_RESERVE_GB=14 /home/xun/bin/ds4 --cuda \
   -m /home/xun/mlmodels/glm/GLM-5.3-Flash-Q4_K.gguf --role worker \
-  --layers 21:output --coordinator 192.168.2.1 9911 --listen 192.168.2.2 55911 --ctx 524288
+  --layers 21:44 --coordinator 192.168.2.1 9911 --listen 192.168.2.2 55911 --ctx 524288
 
 # Mac — coordinator
 /Users/xun/dev/ds4/ds4-server --chdir /Users/xun/dev/ds4 --metal \

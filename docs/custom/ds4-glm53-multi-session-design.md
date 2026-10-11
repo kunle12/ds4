@@ -1,17 +1,21 @@
 # GLM 5.3 Flash multi-session pipeline — concurrent clients on Mac + Spark
 
-**Status:** proposed. Nothing here is implemented; this document is the consent
-request the review rules require for structural engine work. No experiment was
-run — both machines are busy — so every "today" claim is read from source at
-`24444e5`, and every projected number is an estimate marked as such.
+**Status:** workstream 0 **done and stall-verified on the live pair**
+(2026-10-11, `ds4-glm53-ws0-headmove-results.md` §2); the §4.1 head-move
+prerequisite is **landed and adopted** (same doc §3–4), so the memory
+arithmetic below uses the worker's 103.55 GiB plan. Workstreams 1–3 remain
+proposed and unimplemented.
 **Scope:** serving multiple concurrent HTTP clients on the GLM 5.3 Flash Q4_K
 Mac+Spark pipeline, with the owner's stated top priority — ~100 % GPU duty on
-both machines under load — as the acceptance target.
+both machines under load — as the acceptance target (re-derived honestly in
+the analysis §7.2 after measurement: the Spark reaches ~100 % at ~14 t/s
+aggregate; the Mac's decode ceiling on any prefill-healthy split is ~42 %).
 **Companion:** `ds4-glm53-gpu-utilisation-analysis.md` is the analysis this
-follows from; its §7 has the saturation arithmetic this design relies on, and
-its §4.1 (output head on the coordinator) is assumed landed first, because it
-both balances the decode stages (81 % vs 61 % Mac duty at saturation) and frees
-the 1.18 GiB of Spark memory that admits the second session. Workstream 0 comes
+follows from; its §7 has the saturation arithmetic (re-derived 2026-10-11 from
+measured stage times), and its §4.1 (output head on the coordinator) has
+**landed**: +1.18 GiB of Spark memory — the enabler for the second session —
+plus −2 % decode and −90 % return payload, with the oracle re-passed and
+improved. Workstream 0 comes
 from `ds4-glm53-response-data-timeout.md`: the code agent's
 `Timed out waiting for response data` failures are unbounded result waits on
 stalled worker connections, and the fix is standalone-landable before any of
@@ -29,7 +33,7 @@ the concurrency work.
 | 4 | **Single-client regression-free.** One client alone behaves exactly as today | E1-harness A/B: prefill t/s and decode median gap within noise; continuation sha256 identical at ~11 K/~285 K/~473 K |
 | 5 | **Correctness gates on the live pair** | criterion-1 oracle, boundary gates (2048→2056, 4096→4100), `--dist-replay-check`, per-session snapshot round-trip (criterion-6 machinery, session ids already in the frames) |
 | 6 | **Admission.** Memory over-subscription is refused loudly, not OOM'd | guard session accounting (`glm_session_graph_bytes`, `ds4.c:73169-73172`) refuses an Nth session; server queues or errors cleanly |
-| 7 | **Bounded stalls** (workstream 0, independent of 1–6). A worker-side stall that does not close the TCP connection produces a visible failure within the result deadline, not a silent hang | stall the worker mid-request on the pair (or drop the link without RST); the request errors/rebuilds within ~2 min instead of freezing until the agent's 300 s chunk timeout (`ds4-glm53-response-data-timeout.md` §3) |
+| 7 | **Bounded stalls** (workstream 0, independent of 1–6). A worker-side stall that does not close the TCP connection produces a visible failure within the result deadline, not a silent hang | **passed 2026-10-11** — worker `SIGSTOP` mid-decode failed the request at 119.9 s (120 s deadline), clean client termination, worker re-dialled after resume, fresh request succeeded (`ds4-glm53-ws0-headmove-results.md` §2) |
 
 Expected per-client latency, stated now to set expectations: at saturation each
 client's inter-token gap is ≈ N × T_spark (114 ms at N=2 post-head-move, 171 ms
