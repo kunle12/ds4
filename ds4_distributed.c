@@ -222,6 +222,24 @@ typedef struct ds4_dist_worker_entry {
     struct ds4_dist_worker_entry *next;
 } ds4_dist_worker_entry;
 
+/* Mutable route state shared by every coordinator session of one engine:
+ * the worker registry, its generation, shutdown flag, and the GPU command
+ * mutex. Sessions embed their own read-only copy of the launch options but
+ * point here, so N server slots share one listener, one accept thread and one
+ * worker view. The CLI standalone coordinator owns one privately. */
+typedef struct ds4_dist_shared {
+    pthread_mutex_t mu;
+    ds4_dist_worker_entry *workers;
+    uint64_t generation;
+    bool shutting_down;
+    /* Serialises local GPU command submission across all sessions of the
+     * engine: ds4_gpu_begin_commands uses process-global state, so exactly
+     * one thread at a time may encode evals, head applications, KV shard
+     * IO or image encodes. The server's inference_mu no longer covers
+     * decode round trips once sessions self-serve them concurrently. */
+    pthread_mutex_t gpu_mu;
+} ds4_dist_shared;
+
 typedef struct {
     ds4_engine *engine;
     uint32_t model_id;
@@ -237,10 +255,7 @@ typedef struct {
     uint32_t prefill_chunk;
     uint32_t prefill_window;
     uint32_t activation_bits;
-    uint64_t generation;
-    pthread_mutex_t mu;
-    ds4_dist_worker_entry *workers;
-    bool shutting_down;
+    ds4_dist_shared *shared;
 } ds4_dist_coordinator_state;
 
 typedef struct {
@@ -383,19 +398,50 @@ typedef struct {
     uint64_t tensor_bytes;
 } ds4_dist_kv_shard_file;
 
+struct ds4_dist_core;
+typedef struct ds4_dist_core ds4_dist_core;
+
 struct ds4_dist_session {
     ds4_dist_coordinator_state state;
-    int listen_fd;
-    pthread_t accept_tid;
-    bool accept_started;
-    ds4_dist_accept_ctx accept_ctx;
+    ds4_dist_core *core;
     ds4_dist_route_plan plan;
     bool plan_ready;
     uint64_t plan_generation;
     uint64_t session_id;
     uint64_t request_id;
     uint64_t snapshot_request_id;
+    /* The session's private work connection to the route's first hop.
+     * Work frames never ride the registry's hello connection: each session
+     * dials the worker's data listener, so strict per-fd request matching
+     * becomes per-session and concurrent sessions never interleave frames. */
+    int work_fd;
+    char work_host[NI_MAXHOST];
+    uint32_t work_port;
 };
+
+/* One listener, accept thread and worker registry per engine, shared by all
+ * ds4_dist_sessions of that engine. Keyed by engine pointer plus listen
+ * host/port and refcounted by session create/free, so the server's N slots
+ * bind the coordinator port exactly once (a second bind used to fail, which
+ * is what made multi-session serving impossible). Retired cores are never
+ * freed: detached accept/client threads still touch them during shutdown,
+ * the same lifetime choice the per-session state used to make. */
+struct ds4_dist_core {
+    ds4_dist_shared shared;
+    ds4_dist_coordinator_state state;   /* accept thread + hello validation */
+    int listen_fd;
+    pthread_t accept_tid;
+    bool accept_started;
+    ds4_dist_accept_ctx accept_ctx;
+    ds4_engine *engine;
+    char listen_host[NI_MAXHOST];
+    int listen_port;
+    unsigned refs;
+    struct ds4_dist_core *next;
+};
+
+static ds4_dist_core *g_dist_cores;
+static pthread_mutex_t g_dist_core_mu = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
     int id;
@@ -1930,13 +1976,13 @@ static void dist_coordinator_add_worker(
     entry->n_layers = hello->n_layers;
     entry->listen_port = hello->listen_port;
 
-    pthread_mutex_lock(&state->mu);
-    if (state->shutting_down) {
-        pthread_mutex_unlock(&state->mu);
+    pthread_mutex_lock(&state->shared->mu);
+    if (state->shared->shutting_down) {
+        pthread_mutex_unlock(&state->shared->mu);
         free(entry);
         return;
     }
-    ds4_dist_worker_entry **link = &state->workers;
+    ds4_dist_worker_entry **link = &state->shared->workers;
     while (*link) {
         ds4_dist_worker_entry *old = *link;
         if (strcmp(old->peer_host, peer_host) == 0 &&
@@ -1958,10 +2004,10 @@ static void dist_coordinator_add_worker(
         }
         link = &old->next;
     }
-    entry->next = state->workers;
-    state->workers = entry;
-    state->generation++;
-    pthread_mutex_unlock(&state->mu);
+    entry->next = state->shared->workers;
+    state->shared->workers = entry;
+    state->shared->generation++;
+    pthread_mutex_unlock(&state->shared->mu);
 
     char layer_end[32];
     if (entry->has_output) snprintf(layer_end, sizeof(layer_end), "output");
@@ -2040,20 +2086,20 @@ static bool dist_route_search_workers(
 
 static void dist_coordinator_report_plan(ds4_dist_coordinator_state *state) {
     if (!dist_coordinator_debug_enabled(state)) return;
-    pthread_mutex_lock(&state->mu);
+    pthread_mutex_lock(&state->shared->mu);
     uint32_t n = 0;
-    for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) n++;
+    for (ds4_dist_worker_entry *it = state->shared->workers; it; it = it->next) n++;
     ds4_dist_worker_entry **workers = n ? calloc(n, sizeof(workers[0])) : NULL;
     ds4_dist_worker_entry **path = n ? calloc(n, sizeof(path[0])) : NULL;
     if ((n && !workers) || (n && !path)) {
         free(workers);
         free(path);
-        pthread_mutex_unlock(&state->mu);
+        pthread_mutex_unlock(&state->shared->mu);
         fprintf(stderr, "ds4: distributed coordinator: out of memory building route plan\n");
         return;
     }
     uint32_t i = 0;
-    for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) workers[i++] = it;
+    for (ds4_dist_worker_entry *it = state->shared->workers; it; it = it->next) workers[i++] = it;
     qsort(workers, n, sizeof(workers[0]), dist_worker_route_cmp);
 
     const uint32_t last = state->n_layers - 1u;
@@ -2117,7 +2163,7 @@ static void dist_coordinator_report_plan(ds4_dist_coordinator_state *state) {
                                  " -> local output");
     }
     complete = complete && has_output && next == state->n_layers;
-    pthread_mutex_unlock(&state->mu);
+    pthread_mutex_unlock(&state->shared->mu);
 
     if (complete) {
         fprintf(stderr, "ds4: distributed coordinator: complete route ready: %s\n", plan);
@@ -2153,9 +2199,9 @@ static void dist_coordinator_forget_route_workers(
         ds4_dist_coordinator_state *state,
         const ds4_dist_route_plan *plan) {
     bool removed_any = false;
-    pthread_mutex_lock(&state->mu);
+    pthread_mutex_lock(&state->shared->mu);
     for (uint32_t i = 0; i < plan->count; i++) {
-        ds4_dist_worker_entry **link = &state->workers;
+        ds4_dist_worker_entry **link = &state->shared->workers;
         while (*link) {
             ds4_dist_worker_entry *entry = *link;
             if (!dist_route_entry_matches_worker(&plan->entry[i], entry)) {
@@ -2176,8 +2222,8 @@ static void dist_coordinator_forget_route_workers(
             break;
         }
     }
-    if (removed_any) state->generation++;
-    pthread_mutex_unlock(&state->mu);
+    if (removed_any) state->shared->generation++;
+    pthread_mutex_unlock(&state->shared->mu);
 
     if (removed_any && dist_coordinator_debug_enabled(state)) dist_coordinator_report_plan(state);
 }
@@ -2257,25 +2303,25 @@ static bool dist_coordinator_build_route_plan(
     memset(plan, 0, sizeof(*plan));
     if (generation) *generation = 0;
 
-    pthread_mutex_lock(&state->mu);
+    pthread_mutex_lock(&state->shared->mu);
     uint32_t n = 0;
-    for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) n++;
+    for (ds4_dist_worker_entry *it = state->shared->workers; it; it = it->next) n++;
     ds4_dist_worker_entry **workers = n ? calloc(n, sizeof(workers[0])) : NULL;
     ds4_dist_worker_entry **path = n ? calloc(n, sizeof(path[0])) : NULL;
     if ((n && !workers) || (n && !path)) {
         free(workers);
         free(path);
-        pthread_mutex_unlock(&state->mu);
+        pthread_mutex_unlock(&state->shared->mu);
         if (errlen) snprintf(err, errlen, "out of memory building route");
         return false;
     }
     uint32_t i = 0;
-    for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) workers[i++] = it;
+    for (ds4_dist_worker_entry *it = state->shared->workers; it; it = it->next) workers[i++] = it;
     qsort(workers, n, sizeof(workers[0]), dist_worker_route_cmp);
 
     const uint32_t last = state->n_layers - 1u;
     if (state->local_start != 0) {
-        pthread_mutex_unlock(&state->mu);
+        pthread_mutex_unlock(&state->shared->mu);
         free(workers);
         free(path);
         if (errlen) snprintf(err, errlen, "coordinator route does not start at layer 0");
@@ -2283,8 +2329,8 @@ static bool dist_coordinator_build_route_plan(
     }
     if (state->local_end == last &&
         (state->local_has_output || state->local_can_output_head)) {
-        if (generation) *generation = state->generation;
-        pthread_mutex_unlock(&state->mu);
+        if (generation) *generation = state->shared->generation;
+        pthread_mutex_unlock(&state->shared->mu);
         free(workers);
         free(path);
         return true;
@@ -2301,7 +2347,7 @@ static bool dist_coordinator_build_route_plan(
                                    path,
                                    &path_len,
                                    &missing)) {
-        pthread_mutex_unlock(&state->mu);
+        pthread_mutex_unlock(&state->shared->mu);
         free(workers);
         free(path);
         if (errlen) snprintf(err, errlen, "distributed route incomplete: missing layer %u", missing);
@@ -2321,7 +2367,7 @@ static bool dist_coordinator_build_route_plan(
         if (state->use_control_for_work && plan->count == 0) {
             entry.fd = dup(w->fd);
             if (entry.fd < 0) {
-                pthread_mutex_unlock(&state->mu);
+                pthread_mutex_unlock(&state->shared->mu);
                 free(workers);
                 free(path);
                 dist_route_plan_free(plan);
@@ -2333,7 +2379,7 @@ static bool dist_coordinator_build_route_plan(
 
         ds4_dist_route_entry *new_entries = realloc(plan->entry, (size_t)(plan->count + 1u) * sizeof(plan->entry[0]));
         if (!new_entries) {
-            pthread_mutex_unlock(&state->mu);
+            pthread_mutex_unlock(&state->shared->mu);
             free(workers);
             free(path);
             if (entry.fd >= 0) close(entry.fd);
@@ -2344,15 +2390,15 @@ static bool dist_coordinator_build_route_plan(
         plan->entry = new_entries;
         plan->entry[plan->count++] = entry;
         if (!dist_route_plan_append_blob(plan, &entry, err, errlen)) {
-            pthread_mutex_unlock(&state->mu);
+            pthread_mutex_unlock(&state->shared->mu);
             free(workers);
             free(path);
             dist_route_plan_free(plan);
             return false;
         }
     }
-    if (generation) *generation = state->generation;
-    pthread_mutex_unlock(&state->mu);
+    if (generation) *generation = state->shared->generation;
+    pthread_mutex_unlock(&state->shared->mu);
     free(workers);
     free(path);
     if (plan->count != 0 && !dist_route_plan_append_return_upstream(plan, err, errlen)) {
@@ -2381,9 +2427,9 @@ static bool dist_coordinator_ensure_route(
 
 static uint64_t dist_coordinator_generation(ds4_dist_coordinator_state *state) {
     if (!state) return 0;
-    pthread_mutex_lock(&state->mu);
-    uint64_t generation = state->generation;
-    pthread_mutex_unlock(&state->mu);
+    pthread_mutex_lock(&state->shared->mu);
+    uint64_t generation = state->shared->generation;
+    pthread_mutex_unlock(&state->shared->mu);
     return generation;
 }
 
@@ -2692,12 +2738,16 @@ static int dist_coordinator_eval_remote_on_fd(
     }
     if (kind == DS4_DIST_RESULT_HIDDEN_STATE && payload_bytes == hidden_hc_bytes) {
         const double head_t0 = profile ? dist_now_sec() : 0.0;
+        /* The coordinator-side head is GPU work and joins the same command
+         * exclusion as the local slice eval. */
+        pthread_mutex_lock(&state->shared->gpu_mu);
         int head_rc = ds4_session_eval_output_head_from_hc(session,
                                                            payload,
                                                            n_tokens,
                                                            logits,
                                                            err,
                                                            errlen);
+        pthread_mutex_unlock(&state->shared->gpu_mu);
         free(payload);
         if (profile) {
             const double head_t1 = dist_now_sec();
@@ -2764,11 +2814,6 @@ static int dist_coordinator_eval_span(
             return 1;
         }
     }
-    if (reset_session &&
-        ds4_session_layer_slice_reset(session, err, errlen) != 0) {
-        free(hidden);
-        return 1;
-    }
 
     const bool local_logits = plan->count == 0;
     int remote_fd = -1;
@@ -2783,6 +2828,17 @@ static int dist_coordinator_eval_span(
     }
 
     const double local_t0 = profile ? dist_now_sec() : 0.0;
+    /* Local GPU work is the only part of the span that must exclude other
+     * sessions; the remote round trip below runs without the GPU lock so a
+     * concurrent session can evaluate its local stage while this one waits
+     * on the worker. */
+    pthread_mutex_lock(&state->shared->gpu_mu);
+    if (reset_session &&
+        ds4_session_layer_slice_reset(session, err, errlen) != 0) {
+        pthread_mutex_unlock(&state->shared->gpu_mu);
+        free(hidden);
+        return 1;
+    }
     int rc = ds4_session_eval_layer_slice(session,
                                           tokens,
                                           n_tokens,
@@ -2795,6 +2851,7 @@ static int dist_coordinator_eval_span(
                                           local_logits ? logits : NULL,
                                           err,
                                           errlen);
+    pthread_mutex_unlock(&state->shared->gpu_mu);
     const double local_t1 = profile ? dist_now_sec() : 0.0;
     double remote_t0 = 0.0, remote_t1 = 0.0;
     if (rc == 0 && plan->count != 0) {
@@ -3722,6 +3779,10 @@ static int dist_coordinator_prefill_prompt_pipelined(
             break;
         }
         const double local_t0 = dist_now_sec();
+        /* Chunk-local GPU work only: the sender/reader threads carry the
+         * wire traffic without the GPU lock, so a concurrent session's
+         * decode step can run between chunks. */
+        pthread_mutex_lock(&state->shared->gpu_mu);
         rc = ds4_session_eval_layer_slice(session,
                                           prompt->v + pos,
                                           chunk,
@@ -3734,6 +3795,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
                                           NULL,
                                           err,
                                           errlen);
+        pthread_mutex_unlock(&state->shared->gpu_mu);
         const double local_t1 = dist_now_sec();
         local_eval_sec += local_t1 - local_t0;
         if (rc != 0) break;
@@ -3819,12 +3881,14 @@ static int dist_coordinator_prefill_prompt_pipelined(
         reader.final_payload) {
         const uint32_t last_pos = (chunk_count - 1u) * chunk_cap;
         const uint32_t last_tokens = total - last_pos;
+        pthread_mutex_lock(&state->shared->gpu_mu);
         int head_rc = ds4_session_eval_output_head_from_hc(session,
                                                            reader.final_payload,
                                                            last_tokens,
                                                            logits,
                                                            err,
                                                            errlen);
+        pthread_mutex_unlock(&state->shared->gpu_mu);
         free(reader.final_payload);
         return head_rc;
     }
@@ -4149,13 +4213,13 @@ static int dist_run_coordinator_generation(
  * ========================================================================= */
 
 static void dist_coordinator_remove_worker(ds4_dist_coordinator_state *state, int fd) {
-    pthread_mutex_lock(&state->mu);
-    ds4_dist_worker_entry **link = &state->workers;
+    pthread_mutex_lock(&state->shared->mu);
+    ds4_dist_worker_entry **link = &state->shared->workers;
     while (*link) {
         ds4_dist_worker_entry *entry = *link;
         if (entry->fd == fd) {
             *link = entry->next;
-            state->generation++;
+            state->shared->generation++;
             DIST_COORD_DEBUG(state,
                              "ds4: distributed coordinator: removed worker %s:%s layers=%u:%u%s\n",
                              entry->peer_host,
@@ -4163,14 +4227,14 @@ static void dist_coordinator_remove_worker(ds4_dist_coordinator_state *state, in
                              entry->layer_start,
                              entry->layer_end,
                              entry->has_output ? "+output" : "");
-            pthread_mutex_unlock(&state->mu);
+            pthread_mutex_unlock(&state->shared->mu);
             free(entry);
             if (dist_coordinator_debug_enabled(state)) dist_coordinator_report_plan(state);
             return;
         }
         link = &entry->next;
     }
-    pthread_mutex_unlock(&state->mu);
+    pthread_mutex_unlock(&state->shared->mu);
 }
 
 static void dist_coordinator_monitor_worker_fd(
@@ -4385,6 +4449,45 @@ static uint64_t dist_make_session_id(const void *ptr) {
     return id ? id : 1u;
 }
 
+/* The session's private WORK connection to the route's first hop: dialed to
+ * the worker's data listener (the same per-op path KV snapshots use), cached
+ * across plan rebuilds while the first hop is unchanged, and never shared
+ * with other sessions, so concurrent sessions never interleave request
+ * frames on one socket. */
+static int dist_session_work_fd(
+        ds4_dist_session *d,
+        const ds4_dist_route_entry *first,
+        char *err,
+        size_t errlen) {
+    if (d->work_fd >= 0 && d->work_port == first->port &&
+        strcmp(d->work_host, first->host) == 0) {
+        return 0;
+    }
+    if (d->work_fd >= 0) {
+        shutdown(d->work_fd, SHUT_RDWR);
+        close(d->work_fd);
+        d->work_fd = -1;
+    }
+    int fd = dist_connect_endpoint(first->host, (int)first->port, err, errlen);
+    if (fd < 0) return 1;
+    snprintf(d->work_host, sizeof(d->work_host), "%s", first->host);
+    d->work_port = first->port;
+    d->work_fd = fd;
+    return 0;
+}
+
+/* Tear the WORK connection down after a transport failure and force the next
+ * route resolution to re-dial: the plan is rebuilt and its first-hop fd is
+ * re-duplicated from the fresh connection. */
+static void dist_session_drop_work_connection(ds4_dist_session *d) {
+    if (d->work_fd >= 0) {
+        shutdown(d->work_fd, SHUT_RDWR);
+        close(d->work_fd);
+        d->work_fd = -1;
+    }
+    d->plan_ready = false;
+}
+
 static int dist_session_ensure_route(ds4_dist_session *d, char *err, size_t errlen) {
     if (!d) {
         if (errlen) snprintf(err, errlen, "missing distributed session");
@@ -4397,6 +4500,45 @@ static int dist_session_ensure_route(ds4_dist_session *d, char *err, size_t errl
         d->plan_ready = false;
         d->plan_generation = 0;
         return 1;
+    }
+    if (d->plan.count != 0) {
+        /* The shared core does not carry a context size (sessions may
+         * differ), so the worker-capacity check the hello path used to make
+         * is enforced here, per session. */
+        pthread_mutex_lock(&d->state.shared->mu);
+        for (uint32_t i = 0; i < d->plan.count; i++) {
+            for (ds4_dist_worker_entry *w = d->state.shared->workers; w; w = w->next) {
+                if (dist_route_entry_matches_worker(&d->plan.entry[i], w) &&
+                    w->ctx_size != 0 &&
+                    d->state.ctx_size != 0 &&
+                    w->ctx_size < d->state.ctx_size) {
+                    pthread_mutex_unlock(&d->state.shared->mu);
+                    dist_route_plan_free(&d->plan);
+                    d->plan_ready = false;
+                    d->plan_generation = 0;
+                    if (errlen) snprintf(err, errlen,
+                                         "worker context too small: worker=%u coordinator=%u",
+                                         w->ctx_size, d->state.ctx_size);
+                    return 1;
+                }
+            }
+        }
+        pthread_mutex_unlock(&d->state.shared->mu);
+        /* Sessions send work over their own data connection to the first
+         * hop; the plan owns a dup so its lifetime stays self-contained
+         * (dist_route_plan_free closes it, the session cache survives). */
+        if (dist_session_work_fd(d, &d->plan.entry[0], err, errlen) != 0) {
+            d->plan_ready = false;
+            d->plan_generation = 0;
+            return 1;
+        }
+        d->plan.entry[0].fd = dup(d->work_fd);
+        if (d->plan.entry[0].fd < 0) {
+            d->plan_ready = false;
+            d->plan_generation = 0;
+            if (errlen) snprintf(err, errlen, "failed to duplicate session work connection: %s", strerror(errno));
+            return 1;
+        }
     }
     d->plan_ready = true;
     d->plan_generation = generation;
@@ -5205,10 +5347,17 @@ int ds4_dist_session_save_payload(
         shards[shard].fp = dist_tmpfile_or_err("distributed KV shard", err, errlen);
         if (!shards[shard].fp) goto cleanup;
         if (shard == 0) {
+            /* Local shard gather reads GPU KV state and joins the command
+             * exclusion, so a concurrently decoding session cannot interleave
+             * with it once the server no longer serialises whole requests. */
+            pthread_mutex_lock(&d->state.shared->gpu_mu);
             if (ds4_session_save_layer_payload(owner, shards[shard].fp,
                                                layer_start, layer_end,
-                                               err, errlen) != 0)
+                                               err, errlen) != 0) {
+                pthread_mutex_unlock(&d->state.shared->gpu_mu);
                 goto cleanup;
+            }
+            pthread_mutex_unlock(&d->state.shared->gpu_mu);
             if (dist_measure_file(shards[shard].fp, &shards[shard].bytes,
                                   "distributed local KV shard", err, errlen) != 0)
                 goto cleanup;
@@ -5413,13 +5562,17 @@ int ds4_dist_session_load_payload(
                                                     errlen) != 0)
             goto cleanup;
         if (shard == 0) {
+            /* Local shard apply writes GPU KV state; same exclusion. */
+            pthread_mutex_lock(&d->state.shared->gpu_mu);
             if (ds4_session_load_layer_payload(owner, tmp, shard_bytes,
                                                tokens_arg, layout.token_count,
                                                layer_start, layer_end,
                                                err, errlen) != 0) {
+                pthread_mutex_unlock(&d->state.shared->gpu_mu);
                 fclose(tmp);
                 goto cleanup;
             }
+            pthread_mutex_unlock(&d->state.shared->gpu_mu);
         } else {
             if (dist_load_remote_shard_from_payload(d, entry,
                                                     tokens_arg, layout.token_count,
@@ -5459,6 +5612,128 @@ cleanup:
  * selects these calls when the owning session has a coordinator attached.
  */
 
+/* Acquire the engine's shared coordinator core, creating it on first use:
+ * one listener + accept thread + worker registry per engine. Sessions copy
+ * the read-only launch template out of the core and share its registry. */
+static ds4_dist_core *dist_core_acquire(
+        ds4_engine *engine,
+        const ds4_dist_options *opt,
+        char *err,
+        size_t errlen) {
+    const char *host = opt->listen_host ? opt->listen_host : "";
+    pthread_mutex_lock(&g_dist_core_mu);
+    for (ds4_dist_core *it = g_dist_cores; it; it = it->next) {
+        if (it->engine == engine &&
+            it->listen_port == opt->listen_port &&
+            strcmp(it->listen_host, host) == 0) {
+            it->refs++;
+            pthread_mutex_unlock(&g_dist_core_mu);
+            return it;
+        }
+    }
+    pthread_mutex_unlock(&g_dist_core_mu);
+
+    int listen_fd = dist_open_listener(opt->listen_host, opt->listen_port, err, errlen);
+    if (listen_fd < 0) return NULL;
+    const int effective_port = dist_listener_port(listen_fd);
+
+    ds4_dist_core *core = calloc(1, sizeof(*core));
+    if (!core) {
+        close(listen_fd);
+        if (errlen) snprintf(err, errlen, "out of memory creating distributed coordinator core");
+        return NULL;
+    }
+    pthread_mutex_init(&core->shared.mu, NULL);
+    pthread_mutex_init(&core->shared.gpu_mu, NULL);
+    core->listen_fd = listen_fd;
+    core->engine = engine;
+    snprintf(core->listen_host, sizeof(core->listen_host), "%s", host);
+    core->listen_port = effective_port;
+    core->refs = 1;
+
+    core->state.engine = engine;
+    core->state.model_id = (uint32_t)ds4_engine_model_id(engine);
+    core->state.n_layers = (uint32_t)ds4_engine_layer_count(engine);
+    core->state.local_start = opt->layers.start;
+    core->state.local_end = dist_resolved_layer_end(opt, core->state.n_layers);
+    core->state.ctx_size = 0u; /* sessions carry their own context size */
+    core->state.local_has_output = opt->layers.has_output;
+    core->state.local_can_output_head = ds4_engine_has_output_head(engine);
+    core->state.replay_check = opt->replay_check;
+    core->state.debug = opt->debug;
+    core->state.use_control_for_work = false;
+    core->state.prefill_chunk = opt->prefill_chunk;
+    core->state.prefill_window = opt->prefill_window;
+    core->state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
+    core->state.shared = &core->shared;
+
+    core->accept_ctx.state = &core->state;
+    core->accept_ctx.listen_fd = listen_fd;
+    if (pthread_create(&core->accept_tid, NULL, dist_coordinator_accept_main,
+                       &core->accept_ctx) != 0) {
+        close(listen_fd);
+        pthread_mutex_destroy(&core->shared.mu);
+        pthread_mutex_destroy(&core->shared.gpu_mu);
+        free(core);
+        if (errlen) snprintf(err, errlen, "failed to start distributed coordinator accept loop");
+        return NULL;
+    }
+    pthread_detach(core->accept_tid);
+    core->accept_started = true;
+
+    char local_end[32];
+    if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");
+    else snprintf(local_end, sizeof(local_end), "%u", opt->layers.end);
+    DIST_COORD_DEBUG(&core->state,
+                     "ds4: distributed coordinator API: listening on %s:%d model_id=%u layers=%u local=%u:%s activation_bits=%u\n",
+                     opt->listen_host,
+                     effective_port,
+                     core->state.model_id,
+                     core->state.n_layers,
+                     opt->layers.start,
+                     local_end,
+                     core->state.activation_bits);
+
+    pthread_mutex_lock(&g_dist_core_mu);
+    core->next = g_dist_cores;
+    g_dist_cores = core;
+    pthread_mutex_unlock(&g_dist_core_mu);
+    return core;
+}
+
+/* Drop one session's reference. At zero the listener closes and workers are
+ * shut down, but the core itself is retained: detached accept/client threads
+ * still touch it, the same process-lifetime choice the per-session state
+ * used to make. The engine's next session opens a fresh core. */
+static void dist_core_release(ds4_dist_core *core) {
+    if (!core) return;
+    pthread_mutex_lock(&g_dist_core_mu);
+    if (core->refs == 0 || --core->refs > 0) {
+        pthread_mutex_unlock(&g_dist_core_mu);
+        return;
+    }
+    for (ds4_dist_core **link = &g_dist_cores; *link; link = &(*link)->next) {
+        if (*link == core) {
+            *link = core->next;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_dist_core_mu);
+
+    pthread_mutex_lock(&core->shared.mu);
+    core->shared.shutting_down = true;
+    for (ds4_dist_worker_entry *it = core->shared.workers; it; it = it->next) {
+        if (it->fd >= 0) shutdown(it->fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&core->shared.mu);
+    if (core->listen_fd >= 0) {
+        shutdown(core->listen_fd, SHUT_RDWR);
+        close(core->listen_fd);
+        core->listen_fd = -1;
+    }
+    /* core stays allocated: detached threads still reference it. */
+}
+
 int ds4_dist_session_create(
         ds4_dist_session **out,
         ds4_engine *engine,
@@ -5479,32 +5754,22 @@ int ds4_dist_session_create(
     }
     if (dist_validate_options(opt, err, errlen) != 0) return 1;
 
-    int listen_fd = dist_open_listener(opt->listen_host, opt->listen_port, err, errlen);
-    if (listen_fd < 0) return 1;
+    ds4_dist_core *core = dist_core_acquire(engine, opt, err, errlen);
+    if (!core) return 1;
 
     ds4_dist_session *d = calloc(1, sizeof(*d));
     if (!d) {
-        close(listen_fd);
+        dist_core_release(core);
         if (errlen) snprintf(err, errlen, "out of memory creating distributed session");
         return 1;
     }
 
-    d->listen_fd = listen_fd;
-    d->state.engine = engine;
-    d->state.model_id = (uint32_t)ds4_engine_model_id(engine);
-    d->state.n_layers = (uint32_t)ds4_engine_layer_count(engine);
-    d->state.local_start = opt->layers.start;
-    d->state.local_end = dist_resolved_layer_end(opt, d->state.n_layers);
+    /* Read-only launch template from the shared core; the mutable worker
+     * registry and the GPU command mutex are shared through core->shared. */
+    d->state = core->state;
     d->state.ctx_size = ctx_size > 0 ? (uint32_t)ctx_size : 0u;
-    d->state.local_has_output = opt->layers.has_output;
-    d->state.local_can_output_head = ds4_engine_has_output_head(engine);
-    d->state.replay_check = opt->replay_check;
-    d->state.debug = opt->debug;
-    d->state.use_control_for_work = true;
-    d->state.prefill_chunk = opt->prefill_chunk;
-    d->state.prefill_window = opt->prefill_window;
-    d->state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
-    pthread_mutex_init(&d->state.mu, NULL);
+    d->core = core;
+    d->work_fd = -1;
     d->session_id = dist_make_session_id(d);
     d->request_id = 1;
     /* KV snapshots use separate data connections and can run while pipelined
@@ -5512,51 +5777,45 @@ int ds4_dist_session_create(
      * so progress callbacks cannot perturb the reader's contiguous expectations. */
     d->snapshot_request_id = UINT64_C(1) << 63;
 
-    char local_end[32];
-    if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");
-    else snprintf(local_end, sizeof(local_end), "%u", opt->layers.end);
-    DIST_COORD_DEBUG(&d->state,
-                     "ds4: distributed coordinator API: listening on %s:%d model_id=%u layers=%u local=%u:%s activation_bits=%u\n",
-                     opt->listen_host,
-                     opt->listen_port,
-                     d->state.model_id,
-                     d->state.n_layers,
-                     opt->layers.start,
-                     local_end,
-                     d->state.activation_bits);
-
-    d->accept_ctx.state = &d->state;
-    d->accept_ctx.listen_fd = listen_fd;
-    if (pthread_create(&d->accept_tid, NULL, dist_coordinator_accept_main, &d->accept_ctx) != 0) {
-        close(listen_fd);
-        pthread_mutex_destroy(&d->state.mu);
-        free(d);
-        if (errlen) snprintf(err, errlen, "failed to start distributed coordinator accept loop");
-        return 1;
-    }
-    pthread_detach(d->accept_tid);
-    d->accept_started = true;
     *out = d;
     return 0;
 }
 
 void ds4_dist_session_free(ds4_dist_session *d) {
     if (!d) return;
-    if (d->listen_fd >= 0) {
-        shutdown(d->listen_fd, SHUT_RDWR);
-        close(d->listen_fd);
-        d->listen_fd = -1;
+    if (d->work_fd >= 0) {
+        shutdown(d->work_fd, SHUT_RDWR);
+        close(d->work_fd);
+        d->work_fd = -1;
     }
     dist_route_plan_free(&d->plan);
-    pthread_mutex_lock(&d->state.mu);
-    d->state.shutting_down = true;
-    for (ds4_dist_worker_entry *it = d->state.workers; it; it = it->next) {
-        if (it->fd >= 0) shutdown(it->fd, SHUT_RDWR);
+    dist_core_release(d->core);
+    /* The session itself is safe to free: detached threads only ever touch
+     * the retained core, and the plan owned its own dup'ed descriptors. */
+    free(d);
+}
+
+void *ds4_dist_gpu_mutex(ds4_engine *engine) {
+    pthread_mutex_lock(&g_dist_core_mu);
+    void *handle = NULL;
+    for (ds4_dist_core *it = g_dist_cores; it; it = it->next) {
+        if (it->engine == engine) {
+            handle = &it->shared.gpu_mu;
+            break;
+        }
     }
-    pthread_mutex_unlock(&d->state.mu);
-    /* Client threads are detached and remove their registry entries after the
-     * socket closes. Keep this small coordinator object process-lifetime to
-     * avoid racing those threads during application shutdown. */
+    pthread_mutex_unlock(&g_dist_core_mu);
+    /* Cores are retained for process lifetime, so the handle stays valid
+     * even if the engine's sessions are released in the meantime. */
+    return handle;
+}
+
+void ds4_dist_gpu_lock(void *gpu_mutex) {
+    if (gpu_mutex) pthread_mutex_lock((pthread_mutex_t *)gpu_mutex);
+}
+
+void ds4_dist_gpu_unlock(void *gpu_mutex) {
+    if (gpu_mutex) pthread_mutex_unlock((pthread_mutex_t *)gpu_mutex);
 }
 
 int ds4_dist_session_route_ready(ds4_dist_session *d, char *err, size_t errlen) {
@@ -5616,43 +5875,45 @@ int ds4_dist_session_sync(
                                                                        err,
                                                                        errlen);
             if (prefill_rc != 0) {
+                dist_session_drop_work_connection(d);
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
-                                                             owner,
-                                                             &d->plan,
-                                                             prompt,
-                                                             d->session_id,
-                                                             &d->request_id,
-                                                             logits,
-                                                             &d->plan_generation,
-                                                             prefill_rc != DS4_DIST_RECV_REMOTE_ERROR,
-                                                             err,
-                                                             errlen) != 0) {
-                    d->plan_ready = false;
-                    d->plan_generation = 0;
-                    return 1;
+                                                                 owner,
+                                                                 &d->plan,
+                                                                 prompt,
+                                                                 d->session_id,
+                                                                 &d->request_id,
+                                                                 logits,
+                                                                 &d->plan_generation,
+                                                                 prefill_rc != DS4_DIST_RECV_REMOTE_ERROR,
+                                                                 err,
+                                                                 errlen) != 0) {
+                        d->plan_ready = false;
+                        d->plan_generation = 0;
+                        return 1;
+                    }
+                    d->plan_ready = true;
                 }
-                d->plan_ready = true;
+                return 0;
             }
-            return 0;
-        }
 
-        uint32_t pos = pos0;
-        while (pos < (uint32_t)prompt->len) {
-            const uint32_t remaining = (uint32_t)prompt->len - pos;
-            const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
-            int eval_rc = dist_coordinator_eval_span(&d->state,
-                                                     owner,
-                                                     &d->plan,
-                                                     prompt->v + pos,
-                                                     chunk,
-                                                     pos,
-                                                     d->session_id,
-                                                     d->request_id++,
-                                                     false,
-                                                     logits,
-                                                     err,
-                                                     errlen);
+            uint32_t pos = pos0;
+            while (pos < (uint32_t)prompt->len) {
+                const uint32_t remaining = (uint32_t)prompt->len - pos;
+                const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
+                int eval_rc = dist_coordinator_eval_span(&d->state,
+                                                         owner,
+                                                         &d->plan,
+                                                         prompt->v + pos,
+                                                         chunk,
+                                                         pos,
+                                                         d->session_id,
+                                                         d->request_id++,
+                                                         false,
+                                                         logits,
+                                                         err,
+                                                         errlen);
             if (eval_rc != 0) {
+                dist_session_drop_work_connection(d);
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -5687,6 +5948,7 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
     if (prefill_rc != 0) {
+        dist_session_drop_work_connection(d);
         if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -5737,6 +5999,7 @@ int ds4_dist_session_eval(
         ds4_tokens transcript = {0};
         ds4_tokens_copy(&transcript, checkpoint);
         ds4_tokens_push(&transcript, token);
+        dist_session_drop_work_connection(d);
         if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -5772,6 +6035,11 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
         return 1;
     }
 
+    ds4_dist_shared shared;
+    memset(&shared, 0, sizeof(shared));
+    pthread_mutex_init(&shared.mu, NULL);
+    pthread_mutex_init(&shared.gpu_mu, NULL);
+
     ds4_dist_coordinator_state state;
     memset(&state, 0, sizeof(state));
     state.engine = engine;
@@ -5788,7 +6056,7 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
     state.prefill_chunk = opt->prefill_chunk;
     state.prefill_window = opt->prefill_window;
     state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
-    pthread_mutex_init(&state.mu, NULL);
+    state.shared = &shared;
 
     char local_end[32];
     if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");

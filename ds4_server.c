@@ -10173,6 +10173,10 @@ struct server {
     kv_disk_cache kv;
     tool_memory tool_mem;
     server_image_cache image_cache; /* Protected by inference_mu. */
+    /* Distributed coordinator engines: decode steps self-serve in the slot
+     * thread (the engine serialises GPU work internally and the wire wait
+     * holds no server lock), so inference_mu only guards prefill/vision. */
+    bool dist_coordinator;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     pthread_mutex_t tool_mu;
@@ -10215,8 +10219,16 @@ static bool server_encode_image(server *s, const server_image_input *input,
         server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit");
         return true;
     }
-    if (!ds4_engine_vision_encode_memory(s->engine, input->encoded,
-                                         input->encoded_len, out, err, errlen))
+    /* The encoder runs on the same GPU as the distributed local evals; join
+     * their command exclusion so a concurrently decoding session cannot
+     * interleave with it. No-op for engines without a coordinator core. */
+    void *gpu_mutex = ds4_dist_gpu_mutex(s->engine);
+    ds4_dist_gpu_lock(gpu_mutex);
+    const bool ok = ds4_engine_vision_encode_memory(s->engine, input->encoded,
+                                                    input->encoded_len, out,
+                                                    err, errlen);
+    ds4_dist_gpu_unlock(gpu_mutex);
+    if (!ok)
         return false;
     /* Row width must match the encoder's allocation: the mmproj projection
      * dim is validated to equal the model's n_embd at load (Qwen3.8 is
@@ -12454,7 +12466,13 @@ static int server_session_sync(server *s, server_slot *slot,
                                const ds4_tokens *prompt,
                                char *err, size_t errlen) {
     if (!s || !slot || !prompt) return 1;
-    if (!s->batched_mode) {
+    /* Distributed sessions sync the whole suffix in one call: the dist
+     * prefill chunks internally, reports progress per chunk and yields the
+     * GPU lock between chunks, so decode steps from other slots interleave
+     * fine. The batched quantum loop would feed the pipelined prefill
+     * spans no larger than one chunk, silently switching it onto the
+     * serial span path (measured 269 t/s against ~370 at 11K). */
+    if (!s->batched_mode || s->dist_coordinator) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync(slot->session, prompt, err, errlen);
         server_prefill_leave(s);
@@ -12520,7 +12538,8 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
     if (!image_count)
         return server_session_sync(s, slot, prompt, err, errlen);
     if (!s || !slot || !prompt || !images) return 1;
-    if (!s->batched_mode) {
+    /* Same one-shot rule as server_session_sync for distributed sessions. */
+    if (!s->batched_mode || s->dist_coordinator) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync_multimodal(slot->session, prompt,
                                              images, image_count,
@@ -13213,6 +13232,23 @@ static int server_eval_tokens(server *s, server_slot *slot, int token,
                               char *err, size_t errlen) {
     *n_accepted = 0;
     if (!s || !slot) return 1;
+    /* Distributed coordinator sessions self-serve decode in the calling
+     * slot thread: the engine serialises the local GPU stage across
+     * sessions and the remote round trip holds no server lock, so N slots
+     * overlap their wire waits instead of queueing whole round trips. The
+     * batched decode worker is skipped entirely (it has no native batch
+     * for slice sessions). */
+    if (s->dist_coordinator) {
+        if (g_stop_requested || slot_job_cancelled(slot)) {
+            if (err && errlen) snprintf(err, errlen, "%s",
+                                        g_stop_requested ? "shutdown requested" :
+                                                           "client disconnected");
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+        int rc = ds4_session_eval(slot->session, token, err, errlen);
+        if (rc == 0) { accepted[0] = token; *n_accepted = 1; }
+        return rc;
+    }
     if (!s->batched_mode) {
         if (g_stop_requested || slot_job_cancelled(slot)) {
             if (err && errlen) snprintf(err, errlen, "%s",
@@ -15978,6 +16014,8 @@ int main(int argc, char **argv) {
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
+    s.dist_coordinator =
+        cfg.engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR;
     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;

@@ -241,6 +241,22 @@ at `0:20`); decode is **not** GPU-bound on either machine (~71 % Mac, ~62 % Spar
 never above 90 %) and is weight-bandwidth-bound at batch 1 — which is why the split
 barely moves it, and why speculation does not rescue it either.
 
+### Concurrent clients on the Mac+Spark pipeline
+
+`--batched-session N` now works for the pipeline (it used to fail at the
+second session's coordinator bind): each slot keeps its own session, KV and
+private work connection to the worker, decode steps self-serve in the slot
+threads (the engine serialises the local GPU stage), and outputs are
+byte-identical to single-session runs. **Memory bounds the configuration,
+by measurement**: 2 slots × ctx 65536 with `--dist-prefill-chunk 2048` is the
+gated configuration (worker ≥ 10 GiB available throughout; +62 % aggregate
+decode at 2 clients); 2 × 262144 wedged the Spark's GPU driver and required a
+power cycle despite the guard admitting it — keep the worker's *available*
+memory ≥ ~10 GiB, not merely inside the guard budget, and see
+`docs/custom/ds4-glm53-multisession-results.md` before raising ctx or the
+slot count. The single-session production configuration at ctx 524288 is
+unchanged.
+
 ### Full PRO Q4
 
 For two 512 GB Mac Studios, use the split artifacts:

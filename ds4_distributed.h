@@ -100,6 +100,17 @@ int ds4_dist_session_eval(
         char *err,
         size_t errlen);
 
+/* GPU-command exclusion for coordinator engines, shared across every session
+ * of the engine. Local slice evals, coordinator-side head application, KV
+ * shard IO and image encoding must hold it: ds4_gpu_begin_commands keeps
+ * process-global state, so exactly one thread may encode at a time. Returns
+ * NULL when the engine has no coordinator core (nothing to exclude).
+ * Sessions acquire the same exclusion internally; these are for GPU work in
+ * other modules (the server's image encoder). */
+void *ds4_dist_gpu_mutex(ds4_engine *engine);
+void ds4_dist_gpu_lock(void *gpu_mutex);
+void ds4_dist_gpu_unlock(void *gpu_mutex);
+
 /* Save/load use the normal DSV4 payload format. The coordinator gathers or
  * pushes remote layer shards internally so saved files are topology-neutral.
  */

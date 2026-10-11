@@ -481,12 +481,12 @@ prefill and is recorded as considered-and-refused.
 1. ~~**§4.1 head-on-coordinator A/B**~~ **done 2026-10-11** — measured −2 %
    decode, +1.18 GiB Spark slack, oracle re-passed and *improved*; adopted in
    the launcher config (§4.1 header and the results doc).
-2. **§4.2 multi-session interleaving** (the design doc
-   `ds4-glm53-multi-session-design.md`; workstream 0 of it is done) —
-   concurrent clients, the Spark toward 100 % at ~14 t/s aggregate; per-client
-   ITL ≈ N × T_spark under load. The Mac's duty ceiling on this split is
-   ~42 % (§7.2) — the design's value is throughput and per-client latency
-   under load, not the Mac's meter.
+2. ~~**§4.2 multi-session interleaving**~~ **done 2026-10-11** — workstreams
+   1–3 of the design landed and gated: 2 concurrent clients at ctx 65536
+   produce byte-identical output at **+62 % aggregate decode (17.8 vs
+   11.0 t/s)**, per-client gap 91→112 ms, Spark duty 65→77 % (median sample
+   96 %) at N=2; the ctx ceiling is memory-bound by measurement
+   (`ds4-glm53-multisession-results.md`).
 3. **Split decision:** closed for decode by measurement (§7.2) — the
    `0:22`-style rebalance is refused; revisit only if prefill ever stops being
    the binding phase.

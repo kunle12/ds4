@@ -1,10 +1,12 @@
 # GLM 5.3 Flash multi-session pipeline — concurrent clients on Mac + Spark
 
-**Status:** workstream 0 **done and stall-verified on the live pair**
-(2026-10-11, `ds4-glm53-ws0-headmove-results.md` §2); the §4.1 head-move
-prerequisite is **landed and adopted** (same doc §3–4), so the memory
-arithmetic below uses the worker's 103.55 GiB plan. Workstreams 1–3 remain
-proposed and unimplemented.
+**Status:** workstreams 0–3 **implemented, gated and deployed 2026-10-11**
+(`ds4-glm53-multisession-results.md` has the measurements, including the
+corrected memory table and the ctx-262144 incident). The §4.1 head-move
+prerequisite is landed (the `21:44` headless worker, in production). What
+remains of this design: workstream 4 (shared GLM prefill workspace — now
+*necessary* for per-session ctx above 65536, see the incident), workstream 5
+(dynamic prefill chunk policy) and workstream 6 (disk-KV eviction).
 **Scope:** serving multiple concurrent HTTP clients on the GLM 5.3 Flash Q4_K
 Mac+Spark pipeline, with the owner's stated top priority — ~100 % GPU duty on
 both machines under load — as the acceptance target (re-derived honestly in
@@ -27,13 +29,13 @@ the concurrency work.
 
 | # | Criterion | Measurable gate |
 | --- | --- | --- |
-| 1 | **Concurrency.** N clients decode simultaneously, each with its own session and KV | two interleaved sessions produce byte-identical continuations to the same prompts run alone (per-session graphs are independent and evals serialise per GPU, so interleaving must not touch numerics) |
-| 2 | **Saturation.** At N ≥ 2 decoding clients: Spark duty ~100 %, Mac duty ≈ T_mac/T_spark (~81 % with the head move, ~96 % at a rebalanced split) | aligned `nvidia-smi`/`macmon` sampling during a steady multi-client decode window |
-| 3 | **Throughput.** Aggregate decode ≈ 1/T_spark ≈ 17–19 t/s (vs 9.4 t/s single-stream today) | `speed-bench/serve_concurrency_bench.py --concurrency N` |
-| 4 | **Single-client regression-free.** One client alone behaves exactly as today | E1-harness A/B: prefill t/s and decode median gap within noise; continuation sha256 identical at ~11 K/~285 K/~473 K |
-| 5 | **Correctness gates on the live pair** | criterion-1 oracle, boundary gates (2048→2056, 4096→4100), `--dist-replay-check`, per-session snapshot round-trip (criterion-6 machinery, session ids already in the frames) |
-| 6 | **Admission.** Memory over-subscription is refused loudly, not OOM'd | guard session accounting (`glm_session_graph_bytes`, `ds4.c:73169-73172`) refuses an Nth session; server queues or errors cleanly |
-| 7 | **Bounded stalls** (workstream 0, independent of 1–6). A worker-side stall that does not close the TCP connection produces a visible failure within the result deadline, not a silent hang | **passed 2026-10-11** — worker `SIGSTOP` mid-decode failed the request at 119.9 s (120 s deadline), clean client termination, worker re-dialled after resume, fresh request succeeded (`ds4-glm53-ws0-headmove-results.md` §2) |
+| 1 | **Concurrency.** N clients decode simultaneously, each with its own session and KV | **passed 2026-10-11** — 2 interleaved sessions at ctx 65536 produced byte-identical continuations to their alone-runs (`ds4-glm53-multisession-results.md` §2) |
+| 2 | **Saturation.** At N ≥ 2 decoding clients: Spark duty rises toward 100 %, Mac duty toward T_mac/T_spark | **measured at N=2** — Spark 64.5 %→76.8 % avg (median sample 96 %), Mac 48.7 %→56.1 % avg; the trend matches the §7.2 arithmetic, and higher N is memory-bound (see the incident, results §3) |
+| 3 | **Throughput.** Aggregate decode rises with N | **measured at N=2: 17.8 t/s vs 11.0 single-stream (+62 %)**; per-client gap 91→112 ms |
+| 4 | **Single-client regression-free.** One client alone behaves exactly as today | **passed** — decode 91–95 ms and sha `a3898c57…` at every stage; production config re-verified after deploy |
+| 5 | **Correctness gates on the live pair** | criterion-1 oracle and boundary gates passed for the headless topology 2026-10-11 (`ds4-glm53-ws0-headmove-results.md` §4); per-session snapshot round-trip under concurrency not yet re-run |
+| 6 | **Admission.** Memory over-subscription is refused loudly, not OOM'd | **refuted by measurement**: the guard admitted a second session at ctx 262144 whose creation wedged the GB10 (results §3) — the budget is necessary-not-sufficient; the operating rule is ≥ ~10 GiB worker-available after all sessions, which the guard does not enforce |
+| 7 | **Bounded stalls** (workstream 0, independent of 1–6). A worker-side stall that does not close the TCP connection produces a visible failure within the result deadline, not a silent hang | **passed 2026-10-11** — worker `SIGSTOP` mid-decode failed the request at 120.0 s, clean client termination, worker re-dialled after resume, fresh request succeeded; re-verified on the WS1–3 architecture |
 
 Expected per-client latency, stated now to set expectations: at saturation each
 client's inter-token gap is ≈ N × T_spark (114 ms at N=2 post-head-move, 171 ms
@@ -174,8 +176,18 @@ multi-session configurations are therefore:
 | sessions × ctx | Spark marginal (est.) | fits after head move? |
 | --- | ---: | --- |
 | 2 × 524288 | ~6 GiB | no, unless reserve ≤ 12 — not recommended |
-| 2–3 × 262144 | ~3 GiB each | yes, with margin at reserve 13 |
-| 4–6 × 131072 | ~1.5–2 GiB each | yes |
+| 2 × 262144 | ~4.2 GiB | **no — measured 2026-10-11: wedges the GB10** (results §3) |
+| 2 × 131072 | ~3 GiB | untested; suspect — do not assume |
+| **2 × 65536 (+ chunk 2048)** | ~2 GiB | **yes — measured: works, ≥ 10 GiB worker-available throughout** |
+
+> **Correction 2026-10-11.** The original table here estimated "2–3 × 262144
+> fits with margin" — that estimate is withdrawn. The first live attempt at
+> 2 × 262144 froze the box inside the NVIDIA driver under memory pressure
+> (power cycle required) even though the guard admitted it, proving again that
+> the guard budget and the idle `free -g` figure are necessary, not
+> sufficient. The operative rule is now: keep the worker's *available* memory
+> ≥ ~10 GiB after all sessions exist, and size ctx from measurement only.
+> `ds4-glm53-multisession-results.md` §3 has the incident and the evidence.
 
 These are estimates; the guard prints actuals (`required=… budget=…` and the
 per-session graph accounting) and criterion 6's admission behaviour is "refuse
@@ -187,7 +199,9 @@ levers belong to this workstream because they decide how many clients fit:
   `share_session_prefill_workspace` for the ds4 graph, `ds4.c:73210-73235`):
   the chunk-cap-sized prefill buffers are the bulk of the scratch and only one
   session prefills at a time under §3.3's mutex; sharing them cuts the
-  per-session marginal toward KV-only.
+  per-session marginal toward KV-only. **Promoted from optional to necessary**
+  by the 262144 incident — it is the only route to per-session ctx above
+  65536.
 * **Disk-KV eviction for idle sessions** (criterion 6 already proves the
   save/restore across the pair): more logical clients than resident sessions,
   at the cost of a replay on wake — a natural fit for the server's existing
@@ -232,11 +246,11 @@ for 0, criterion 4 for 3).
 
 | # | Workstream | Files | Est. | Notes |
 | --- | --- | --- | ---: | --- |
-| 0 | Bounded result wait + dist socket keepalive tuning | `ds4_distributed.c` | 0.5–1 d | request-scoped poll deadline in `dist_recv_result_alloc` and the prefill result reader (~120 s default; the blanket `DS4_DIST_SOCKET_RECV_TIMEOUT_SEC` is the wrong knob — the worker read loop legitimately idles between requests); `TCP_KEEPALIVE` ≈ 30 s / 10 s / 3 on dist sockets; kills the 5-min agent freeze, no protocol change; motivation and analysis in `ds4-glm53-response-data-timeout.md` §5 |
-| 1 | Shared coordinator core | `ds4_distributed.c`, `ds4.h` | 1–2 d | registry/listener/generation hoist; single-session byte-identical |
-| 2 | Per-session work connections | `ds4_distributed.c` | 1–2 d | lazy dial + keep-alive; snapshot-style; no protocol change |
-| 3 | Shrunken local-eval mutex + server concurrency | `ds4_distributed.c`, `ds4_server.c` | 2–3 d | drop `inference_mu` for distributed; queue on refused admission; `--dist-prefill-chunk` guidance |
-| 4 | Shared GLM prefill workspace | `ds4.c` | 1–2 d | optional, unlocks more sessions |
+| 0 | Bounded result wait + dist socket keepalive tuning | `ds4_distributed.c` | 0.5–1 d | **done** (`c2787ea`), stall-verified twice, including on the WS1–3 architecture |
+| 1 | Shared coordinator core | `ds4_distributed.c`, `ds4.h` | 1–2 d | **done 2026-10-11** — registry/listener/accept hoisted to a refcounted per-engine core; single-session byte-identical |
+| 2 | Per-session work connections | `ds4_distributed.c` | 1–2 d | **done 2026-10-11** — sessions dial the worker's data listener; plans own dups; failure drops and re-dials; strict matching is per-session |
+| 3 | Shrunken local-eval mutex + server concurrency | `ds4_distributed.c`, `ds4_server.c` | 2–3 d | **done 2026-10-11** — shared `gpu_mu` around the GPU sections; dist slots self-serve decode; image encoder joins the exclusion; one-shot sync in batched mode (the 269→430 t/s quantum fix); +62 % aggregate at 2 clients, outputs byte-identical |
+| 4 | Shared GLM prefill workspace | `ds4.c` | 1–2 d | **now necessary** for per-session ctx above 65536 (the 262144 incident); unlocks more/larger sessions |
 | 5 | Dynamic prefill chunk policy | `ds4_distributed.c` | 1 d | later; behind the existing knob |
 | 6 | Disk-KV eviction for pipeline sessions | `ds4_server.c` | 2 d | later; reuses criterion-6 transport |
 
