@@ -42335,6 +42335,13 @@ struct ds4_engine {
     int            placement_session_count_hint;
     uint32_t       glm_session_count;
     uint64_t       glm_session_graph_bytes;
+    /* Engine-owned shared GLM prefill workspace: the chunk-shaped batch and
+     * GLM-5.3 prefill buffers are identical for every same-shape session
+     * and are only ever touched inside serialized evals, so the first
+     * session allocates them, ownership moves here, and further sessions
+     * alias them (their per-session cost drops to caches and single-token
+     * scratch). NULL until the first eligible session publishes. */
+    struct ds4_glm_shared_ws *glm_shared_ws;
 };
 
 static DS4_MAYBE_UNUSED uint64_t ds4_engine_glm_graph_budget(
@@ -45067,6 +45074,10 @@ typedef struct ds4_glm_gpu_graph {
     /* GLM-5.3 layer-major prefill workspace. It is allocated at graph
      * creation for the full supported prefill chunk. */
     uint32_t glm53_prefill_cap;
+    /* True when the batch/prefill buffers above (the engine-shared set)
+     * alias the engine-owned shared workspace: freeing this graph must
+     * leave them alone. */
+    bool ws_borrowed;
     ds4_gpu_tensor *batch_hc_cur;
     ds4_gpu_tensor *batch_hc_next;
     ds4_gpu_tensor *batch_hc_flat;
@@ -45161,6 +45172,121 @@ typedef struct ds4_glm_gpu_graph {
     int verify_ws_ready;
     int verify_ws_tier;
 } ds4_glm_gpu_graph;
+
+/* The shareable per-graph prefill workspace: the chunk-shaped batch buffers
+ * and the GLM-5.3 layer-major prefill buffers. Every use is inside an eval
+ * call (prefill chunk or single-token step), and evals are serialized per
+ * engine - gpu_mu around local slice evals on the coordinator, the worker's
+ * eval lock around whole evals - so the shared scratch is exclusive to
+ * whichever eval holds the lock. Offsets keep aliasing, publishing and
+ * free-skipping in lockstep with one list. */
+static const size_t glm_ws_slot_offsets[] = {
+    offsetof(ds4_glm_gpu_graph, prefill_tokens),
+    offsetof(ds4_glm_gpu_graph, batch_router_logits),
+    offsetof(ds4_glm_gpu_graph, batch_router_probs),
+    offsetof(ds4_glm_gpu_graph, batch_router_selected),
+    offsetof(ds4_glm_gpu_graph, batch_router_weights),
+    offsetof(ds4_glm_gpu_graph, batch_cur),
+    offsetof(ds4_glm_gpu_graph, batch_next),
+    offsetof(ds4_glm_gpu_graph, batch_attn_norm),
+    offsetof(ds4_glm_gpu_graph, batch_q_rank),
+    offsetof(ds4_glm_gpu_graph, batch_q_rank_norm),
+    offsetof(ds4_glm_gpu_graph, batch_q),
+    offsetof(ds4_glm_gpu_graph, batch_indexer_k),
+    offsetof(ds4_glm_gpu_graph, batch_indexer_gate),
+    offsetof(ds4_glm_gpu_graph, batch_indexer_q),
+    offsetof(ds4_glm_gpu_graph, batch_indexer_weights),
+    offsetof(ds4_glm_gpu_graph, batch_indexer_scores),
+    offsetof(ds4_glm_gpu_graph, batch_indexer_pool_selected),
+    offsetof(ds4_glm_gpu_graph, batch_indexer_selected),
+    offsetof(ds4_glm_gpu_graph, batch_qk_low),
+    offsetof(ds4_glm_gpu_graph, batch_attn_lora),
+    offsetof(ds4_glm_gpu_graph, batch_kv_raw),
+    offsetof(ds4_glm_gpu_graph, batch_kv_norm),
+    offsetof(ds4_glm_gpu_graph, batch_k_nope),
+    offsetof(ds4_glm_gpu_graph, batch_value),
+    offsetof(ds4_glm_gpu_graph, batch_heads),
+    offsetof(ds4_glm_gpu_graph, batch_attn_out),
+    offsetof(ds4_glm_gpu_graph, batch_after_attn),
+    offsetof(ds4_glm_gpu_graph, batch_ffn_norm),
+    offsetof(ds4_glm_gpu_graph, batch_ffn_gate),
+    offsetof(ds4_glm_gpu_graph, batch_ffn_up),
+    offsetof(ds4_glm_gpu_graph, batch_shared_mid),
+    offsetof(ds4_glm_gpu_graph, batch_ffn_mid),
+    offsetof(ds4_glm_gpu_graph, batch_routed_gate),
+    offsetof(ds4_glm_gpu_graph, batch_routed_up),
+    offsetof(ds4_glm_gpu_graph, batch_routed_down),
+    offsetof(ds4_glm_gpu_graph, batch_ffn_out),
+    offsetof(ds4_glm_gpu_graph, batch_hc_cur),
+    offsetof(ds4_glm_gpu_graph, batch_hc_next),
+    offsetof(ds4_glm_gpu_graph, batch_hc_flat),
+    offsetof(ds4_glm_gpu_graph, batch_hc_mix),
+    offsetof(ds4_glm_gpu_graph, batch_hc_split),
+    offsetof(ds4_glm_gpu_graph, batch_hc_after_attn),
+    offsetof(ds4_glm_gpu_graph, batch_kda_q),
+    offsetof(ds4_glm_gpu_graph, batch_kda_k),
+    offsetof(ds4_glm_gpu_graph, batch_kda_v),
+    offsetof(ds4_glm_gpu_graph, batch_kda_lowrank),
+    offsetof(ds4_glm_gpu_graph, batch_kda_raw_gate),
+    offsetof(ds4_glm_gpu_graph, batch_kda_raw_beta),
+    offsetof(ds4_glm_gpu_graph, batch_kda_output_gate),
+    offsetof(ds4_glm_gpu_graph, batch_kda_out),
+};
+#define GLM_WS_SLOT_COUNT \
+    ((int)(sizeof(glm_ws_slot_offsets) / sizeof(glm_ws_slot_offsets[0])))
+
+static ds4_gpu_tensor **glm_ws_slot(ds4_glm_gpu_graph *g, int i) {
+    return (ds4_gpu_tensor **)((char *)g + glm_ws_slot_offsets[i]);
+}
+
+/* Engine-owned shared workspace published by the first eligible session. */
+struct ds4_glm_shared_ws {
+    bool ready;
+    /* Shape key: only sessions with the identical shape may alias. */
+    uint32_t ctx_size;
+    uint32_t work_ctx;
+    uint32_t compact_cap;
+    uint32_t layer_start;
+    uint32_t layer_end;
+    uint32_t batch_cap;
+    uint32_t glm53_prefill_cap;
+    bool generic_routed_moe;
+    ds4_gpu_tensor *slot[GLM_WS_SLOT_COUNT];
+};
+
+static bool glm_shared_ws_matches(const struct ds4_glm_shared_ws *ws,
+                                  uint32_t ctx_size,
+                                  uint32_t work_ctx,
+                                  uint32_t compact_cap,
+                                  uint32_t layer_start,
+                                  uint32_t layer_end) {
+    return ws && ws->ready &&
+           ws->ctx_size == ctx_size &&
+           ws->work_ctx == work_ctx &&
+           ws->compact_cap == compact_cap &&
+           ws->layer_start == layer_start &&
+           ws->layer_end == layer_end;
+}
+
+/* Move ownership of the freshly allocated shared set from the first graph
+ * to the engine: the graph keeps its pointers (now borrowed), so every
+ * later same-shape session aliases the same memory. */
+static void glm_shared_ws_publish(struct ds4_glm_shared_ws *ws,
+                                  ds4_glm_gpu_graph *g) {
+    ws->ready = true;
+    ws->ctx_size = g->ctx_size;
+    ws->work_ctx = g->ctx_cap;
+    ws->compact_cap = g->compact_cache_cap;
+    ws->layer_start = g->layer_start;
+    ws->layer_end = g->layer_end;
+    ws->batch_cap = g->batch_cap;
+    ws->glm53_prefill_cap = g->glm53_prefill_cap;
+    ws->generic_routed_moe = g->generic_routed_moe;
+    for (int i = 0; i < GLM_WS_SLOT_COUNT; i++) {
+        ws->slot[i] = *glm_ws_slot(g, i);
+    }
+    g->ws_borrowed = true;
+}
 
 static int glm_graph_directional_steering_tier(
         const ds4_glm_gpu_graph *g,
@@ -45523,6 +45649,7 @@ static bool glm_graph_memory_guard_for_compact_cap(
         uint32_t           ctx_size,
         uint32_t           compact_cap,
         uint64_t           transient_extra_bytes,
+        uint64_t           shared_ws_discount_bytes,
         const char        *phase) {
     if (!model) return true;
     if (glm_graph_memory_guard_disabled()) return true;
@@ -45554,6 +45681,13 @@ static bool glm_graph_memory_guard_for_compact_cap(
                                         include_output);
     uint64_t required = glm_graph_saturating_add_u64(model_bytes, graph_bytes);
     required = glm_graph_saturating_add_u64(required, transient_extra_bytes);
+    /* Sessions aliasing the engine's shared prefill workspace do not
+     * allocate it; charge only what this session really adds. */
+    if (required > shared_ws_discount_bytes) {
+        required -= shared_ws_discount_bytes;
+    } else {
+        required = 0;
+    }
 
     uint64_t budget_base = 0;
     uint64_t budget = 0;
@@ -45664,6 +45798,7 @@ static bool glm_graph_memory_guard(
             ctx_size,
             compact_cap,
             0,
+            0,
             "before GLM graph allocation");
 }
 
@@ -45690,6 +45825,7 @@ static bool glm_graph_memory_guard_with_transient(
             ctx_size,
             compact_cap,
             transient_extra_bytes,
+            0,
             phase);
 }
 
@@ -45718,6 +45854,7 @@ static bool glm_graph_memory_guard_slice(
             ctx_size,
             compact_cap,
             0,
+            0,
             "before GLM graph allocation");
 }
 
@@ -45731,6 +45868,7 @@ static bool glm_graph_memory_guard_slice_with_transient(
         bool               include_output,
         uint32_t           ctx_size,
         uint64_t           transient_extra_bytes,
+        uint64_t           shared_ws_discount_bytes,
         const char        *phase) {
     const uint32_t work_ctx =
         glm_graph_full_attention_cap(ctx_size, ssd_streaming);
@@ -45748,6 +45886,7 @@ static bool glm_graph_memory_guard_slice_with_transient(
             ctx_size,
             compact_cap,
             transient_extra_bytes,
+            shared_ws_discount_bytes,
             phase);
 }
 
@@ -46937,6 +47076,14 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     glm_graph_verify_ws_free(g);
     glm_graph_ws_free(g);
     if (!g) return;
+    if (g->ws_borrowed) {
+        /* The shared prefill workspace is engine-owned; this graph only
+         * aliased it. Drop the aliases so the frees below leave the
+         * engine's tensors untouched. */
+        for (int i = 0; i < GLM_WS_SLOT_COUNT; i++) {
+            *glm_ws_slot(g, i) = NULL;
+        }
+    }
     for (int tier = 0; tier < DS4_MAX_GPUS; tier++) {
         ds4_gpu_tensor_free(g->directional_steering_dirs_by_tier[tier]);
         g->directional_steering_dirs_by_tier[tier] = NULL;
@@ -47183,7 +47330,8 @@ static bool glm_graph_alloc_slice(
         uint32_t           layer_start,
         uint32_t           layer_end,
         bool               require_token_embd,
-        bool               require_output_head) {
+        bool               require_output_head,
+        struct ds4_glm_shared_ws *shared_ws) {
     if (!g || !model || !weights || ctx_size <= 0) return false;
     const int *placement = g->placement;
     memset(g, 0, sizeof(*g));
@@ -47194,6 +47342,28 @@ static bool glm_graph_alloc_slice(
     g_glm_ssd_streaming_active = ssd_streaming;
 
     if (!glm_graph_context_request(ctx_size, &g->ctx_size)) return false;
+    /* A same-shape session aliases the engine's shared prefill workspace
+     * instead of allocating its own; every use sits inside a serialized
+     * eval, so exclusivity is guaranteed by the eval lock, not by
+     * ownership. Mismatched shapes (or the first eligible session) keep
+     * private buffers. */
+    const uint32_t pre_guard_work_ctx =
+        glm_graph_full_attention_cap(g->ctx_size, g->ssd_streaming);
+    const uint32_t pre_guard_compact_cap =
+        glm_graph_compact_cache_initial_cap(g->ctx_size, pre_guard_work_ctx);
+    const bool ws_share =
+        shared_ws &&
+        glm_shared_ws_matches(shared_ws,
+                              g->ctx_size,
+                              pre_guard_work_ctx,
+                              pre_guard_compact_cap,
+                              layer_start,
+                              layer_end);
+    const uint64_t ws_discount_bytes =
+        ws_share ?
+            glm_graph_workspace_bytes_for_cap(pre_guard_work_ctx,
+                                              pre_guard_compact_cap,
+                                              g->ssd_streaming) : 0;
     if (!glm_graph_memory_guard_slice_with_transient(
                 model,
                 weights,
@@ -47204,8 +47374,18 @@ static bool glm_graph_alloc_slice(
                 require_output_head,
                 g->ctx_size,
                 streaming_transient_guard_bytes,
+                ws_discount_bytes,
                 "before GLM graph allocation")) {
         return false;
+    }
+    if (ws_share) {
+        for (int i = 0; i < GLM_WS_SLOT_COUNT; i++) {
+            *glm_ws_slot(g, i) = shared_ws->slot[i];
+        }
+        g->batch_cap = shared_ws->batch_cap;
+        g->glm53_prefill_cap = shared_ws->glm53_prefill_cap;
+        g->generic_routed_moe = shared_ws->generic_routed_moe;
+        g->ws_borrowed = true;
     }
     if (!glm_graph_validate_layout(model,
                                    weights,
@@ -47392,6 +47572,18 @@ static bool glm_graph_alloc_slice(
             ok = false; \
         } \
     } while (0)
+/* Shared-workspace fields: borrowed graphs alias the engine's tensors
+ * instead of allocating, so the per-session cost drops to caches and
+ * single-token scratch. */
+#define DS4_GLM_GRAPH_ALLOC_SHARED(var, bytes_) \
+    do { \
+        if (!ws_share) { \
+            DS4_GLM_GRAPH_ALLOC_TENSOR(var, bytes_); \
+        } else if (!(var)) { \
+            fprintf(stderr, "ds4: GLM shared workspace alias missing %s\n", #var); \
+            ok = false; \
+        } \
+    } while (0)
 
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->cur, emb_bytes);
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->next, emb_bytes);
@@ -47468,29 +47660,30 @@ static bool glm_graph_alloc_slice(
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->router_weights, (uint64_t)DS4_N_EXPERT_USED * sizeof(float));
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->output_norm, emb_bytes);
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->logits, logits_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_router_logits, batch_rows * DS4_N_EXPERT * sizeof(float));
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_router_probs, batch_rows * DS4_N_EXPERT * sizeof(float));
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_router_selected, batch_rows * DS4_N_EXPERT_USED * sizeof(int32_t));
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_router_weights, batch_rows * DS4_N_EXPERT_USED * sizeof(float));
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_router_logits, batch_rows * DS4_N_EXPERT * sizeof(float));
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_router_probs, batch_rows * DS4_N_EXPERT * sizeof(float));
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_router_selected, batch_rows * DS4_N_EXPERT_USED * sizeof(int32_t));
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_router_weights, batch_rows * DS4_N_EXPERT_USED * sizeof(float));
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->prefill_seed_router_selected,
                                (uint64_t)DS4_N_LAYER *
                                DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS *
                                DS4_N_EXPERT_USED *
                                sizeof(int32_t));
 
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->prefill_tokens, batch_rows * sizeof(int32_t));
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_cur, batch_rows * emb_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_next, batch_rows * emb_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_attn_norm, batch_rows * emb_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_q_rank, batch_rows * q_rank_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_q_rank_norm, batch_rows * q_rank_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_q, batch_rows * q_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_indexer_k, batch_rows * indexer_k_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->prefill_tokens, batch_rows * sizeof(int32_t));
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_cur, batch_rows * emb_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_next, batch_rows * emb_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_attn_norm, batch_rows * emb_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_q_rank, batch_rows * q_rank_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_q_rank_norm, batch_rows * q_rank_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_q, batch_rows * q_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_indexer_k, batch_rows * indexer_k_bytes);
     if (g->glm53) {
-        DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_indexer_gate,
+        DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_indexer_gate,
                                    batch_indexer_gate_bytes);
     }
-    if (g->compact_cache_cap != 0 && g->indexed_prefill_cap != 0) {
+    if (!ws_share &&
+        g->compact_cache_cap != 0 && g->indexed_prefill_cap != 0) {
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_indexer_q, batch_indexer_q_bytes);
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_indexer_weights, batch_indexer_weights_bytes);
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_indexer_scores, batch_indexer_scores_bytes);
@@ -47502,24 +47695,24 @@ static bool glm_graph_alloc_slice(
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_qk_low, batch_qk_low_bytes);
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_attn_lora, batch_attn_lora_bytes);
     }
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_kv_raw, batch_rows * kv_raw_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_kv_norm, batch_rows * kv_norm_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_k_nope, batch_rows * k_nope_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_value, batch_rows * heads_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_heads, batch_rows * heads_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_attn_out, batch_rows * emb_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_after_attn, batch_rows * emb_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_ffn_norm, batch_rows * emb_bytes);
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_ffn_gate, batch_rows * g->dense_hidden_max * sizeof(float));
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_ffn_up, batch_rows * g->dense_hidden_max * sizeof(float));
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_shared_mid, batch_rows * DS4_N_FF_EXP * sizeof(float));
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_ffn_mid, batch_rows * g->ffn_mid_elems * sizeof(float));
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_kv_raw, batch_rows * kv_raw_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_kv_norm, batch_rows * kv_norm_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_k_nope, batch_rows * k_nope_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_value, batch_rows * heads_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_heads, batch_rows * heads_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_attn_out, batch_rows * emb_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_after_attn, batch_rows * emb_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_ffn_norm, batch_rows * emb_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_ffn_gate, batch_rows * g->dense_hidden_max * sizeof(float));
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_ffn_up, batch_rows * g->dense_hidden_max * sizeof(float));
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_shared_mid, batch_rows * DS4_N_FF_EXP * sizeof(float));
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_ffn_mid, batch_rows * g->ffn_mid_elems * sizeof(float));
     if (g->generic_routed_moe) {
-        DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_routed_gate, batch_rows * routed_mid_bytes);
-        DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_routed_up, batch_rows * routed_mid_bytes);
-        DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_routed_down, batch_rows * routed_down_bytes);
+        DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_routed_gate, batch_rows * routed_mid_bytes);
+        DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_routed_up, batch_rows * routed_mid_bytes);
+        DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_routed_down, batch_rows * routed_down_bytes);
     }
-    DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_ffn_out, batch_rows * emb_bytes);
+    DS4_GLM_GRAPH_ALLOC_SHARED(g->batch_ffn_out, batch_rows * emb_bytes);
 
     for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
         int cache_tier = 0;
@@ -47620,6 +47813,11 @@ static bool glm_graph_alloc_slice(
         glm_graph_free(g);
         return false;
     }
+    if (shared_ws && !shared_ws->ready) {
+        /* First eligible session: ownership of the shared set moves to the
+         * engine, this graph borrows it from now on. */
+        glm_shared_ws_publish(shared_ws, g);
+    }
     glm_graph_ws_init(g);
     return true;
 }
@@ -47646,7 +47844,8 @@ static bool glm_graph_alloc(
                                  0,
                                  normal_layers - 1u,
                                  true,
-                                 true);
+                                 true,
+                                 NULL);
 }
 
 static uint32_t glm_graph_weight_type_for_offset(
@@ -47694,6 +47893,17 @@ static bool glm53_graph_prefill_workspace_ensure(
         return false;
     }
     if (g->glm53_prefill_cap >= rows) return true;
+    if (g->ws_borrowed) {
+        /* A borrowed workspace belongs to the engine and is shared with
+         * other live sessions; growing it here would free their memory.
+         * Same-shape sessions can never need more than the published cap,
+         * so reaching this means a shape mismatch slipped through. */
+        fprintf(stderr,
+                "ds4: GLM shared prefill workspace cap %u < requested %u\n",
+                g->glm53_prefill_cap,
+                rows);
+        return false;
+    }
 
     uint32_t cap = 1;
     while (cap < rows) cap <<= 1;
@@ -68996,6 +69206,7 @@ static bool ds4_engine_glm_streaming_memory_guard(
                 load_output,
                 guard_ctx,
                 transient_extra_bytes,
+                0,
                 phase);
     }
     return glm_graph_memory_guard_with_transient(
@@ -72733,6 +72944,15 @@ void ds4_engine_close(ds4_engine *e) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
         e->shared_prefill_workspace_ready = false;
     }
+    if (e->glm_shared_ws) {
+        /* Engine-owned shared GLM prefill workspace; borrowing sessions
+         * never free it. */
+        for (int i = 0; i < GLM_WS_SLOT_COUNT; i++) {
+            ds4_gpu_tensor_free(e->glm_shared_ws->slot[i]);
+        }
+        free(e->glm_shared_ws);
+        e->glm_shared_ws = NULL;
+    }
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
@@ -73065,13 +73285,49 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                                                e->ssd_streaming);
         const uint32_t compact_cap = glm_graph_compact_cache_initial_cap(
             guard_ctx, work_ctx);
+        /* GLM-5.3 resident engines share the chunk-shaped prefill
+         * workspace across sessions: eligible engines publish it on the
+         * first session and every later same-shape session aliases it,
+         * paying only its caches. Streaming, multi-tier and TP engines
+         * keep private workspaces. */
+        struct ds4_glm_shared_ws *glm_shared_ws = NULL;
+        uint64_t glm_ws_discount_bytes = 0;
+        bool ws_was_ready = false;
+        if (ds4_model_is_glm53() && !e->ssd_streaming &&
+            !e->multi_tier && !e->tp.active) {
+            if (!e->glm_shared_ws) {
+                e->glm_shared_ws = xcalloc(1, sizeof(*e->glm_shared_ws));
+                if (!e->glm_shared_ws) {
+                    free(s);
+                    return 1;
+                }
+            }
+            glm_shared_ws = e->glm_shared_ws;
+            ws_was_ready = glm_shared_ws->ready;
+            if (glm_shared_ws_matches(glm_shared_ws,
+                                       guard_ctx,
+                                       work_ctx,
+                                       compact_cap,
+                                       layer_start,
+                                       layer_end)) {
+                glm_ws_discount_bytes =
+                    glm_graph_workspace_bytes_for_cap(work_ctx,
+                                                      compact_cap,
+                                                      e->ssd_streaming);
+            }
+        }
         const ds4_context_memory session_mem =
             glm_graph_context_memory_estimate_for_compact_cap_slice(
                 guard_ctx, work_ctx, compact_cap, e->ssd_streaming,
                 layer_start, layer_end);
+        if (glm_ws_discount_bytes > session_mem.total_bytes) {
+            glm_ws_discount_bytes = 0;
+        }
+        const uint64_t session_graph_bytes =
+            session_mem.total_bytes - glm_ws_discount_bytes;
         const uint64_t all_graph_bytes =
-            ds4_engine_glm_graph_budget(e, session_mem.total_bytes);
-        const uint64_t other_graph_bytes = all_graph_bytes - session_mem.total_bytes;
+            ds4_engine_glm_graph_budget(e, session_graph_bytes);
+        const uint64_t other_graph_bytes = all_graph_bytes - session_graph_bytes;
         if (e->ssd_streaming && !e->ssd_streaming_budget_finalized) {
             ds4_engine_fit_glm_streaming_budget(e,
                                                 true,
@@ -73096,12 +73352,30 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                    layer_start,
                                    layer_end,
                                    require_token_embd,
-                                   require_output)) {
+                                   require_output,
+                                   glm_shared_ws)) {
             free(s);
             return 1;
         }
         s->prefill_cap = s->glm_graph.ctx_cap;
         ds4_gpu_enable_q8_dequant_gemm();
+        if (glm_shared_ws && !ws_was_ready && glm_shared_ws->ready) {
+            fprintf(stderr,
+                    "ds4: shared GLM-5.3 prefill workspace: batch_cap=%u, "
+                    "%.2f GiB once; each further session costs its caches "
+                    "only (this session %s)\n",
+                    glm_shared_ws->batch_cap,
+                    (double)glm_ws_discount_bytes / (1024.0 * 1024.0 * 1024.0),
+                    "published");
+        } else if (s->glm_graph.ws_borrowed) {
+            fprintf(stderr,
+                    "ds4: shared GLM-5.3 prefill workspace: batch_cap=%u, "
+                    "%.2f GiB once; each further session costs its caches "
+                    "only (this session aliased, %.2f GiB saved)\n",
+                    glm_shared_ws->batch_cap,
+                    (double)glm_ws_discount_bytes / (1024.0 * 1024.0 * 1024.0),
+                    (double)glm_ws_discount_bytes / (1024.0 * 1024.0 * 1024.0));
+        }
         s->glm_graph_ready = true;
         s->glm_graph.quality = e->quality;
         s->glm_graph.ssd_streaming = e->ssd_streaming;
@@ -73166,7 +73440,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 return 1;
             }
         }
-        s->glm_reserved_graph_bytes = session_mem.total_bytes;
+        s->glm_reserved_graph_bytes = session_graph_bytes;
         e->glm_session_graph_bytes = glm_graph_saturating_add_u64(
             e->glm_session_graph_bytes, s->glm_reserved_graph_bytes);
         e->glm_session_count++;
