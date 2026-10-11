@@ -13981,6 +13981,7 @@ decode_again:
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
+    double last_client_keepalive = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
@@ -13994,6 +13995,27 @@ decode_again:
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
+        /* Decode-phase SSE keepalive.  The OpenAI live streamer deliberately
+         * withholds a tool call until its DSML block is complete (and the GLM
+         * tool-in-thinking path can stay silent for the entire block), so a
+         * long tool call produces no bytes for minutes.  Client transports run
+         * a per-chunk idle timer (OpenCode: 300 s) that only a received byte
+         * can reset, so mirror the prefill keepalive here: an SSE comment line
+         * every 5 s.  SSE parsers ignore comments, but they are bytes on the
+         * wire, and a failed write tells us the client left mid-silence. */
+        if (j->req.stream && j->fd >= 0 && progress.headers_sent) {
+            const double ka_now = now_sec();
+            if (ka_now - last_client_keepalive >= 5.0) {
+                static const char ka[] = ": decode\n\n";
+                if (!send_all(j->fd, ka, sizeof(ka) - 1)) {
+                    job_mark_cancelled(j);
+                    finish = "error";
+                    snprintf(err, sizeof(err), "client stream write failed");
+                    break;
+                }
+                last_client_keepalive = ka_now;
+            }
+        }
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);

@@ -7,6 +7,18 @@ fails the request at the 120 s deadline, the worker re-dials on resume, and a
 fresh request succeeds — previously the same freeze hung indefinitely).
 Measured evidence: `ds4-glm53-ws0-headmove-results.md` §2. §5's items 1–2 are
 done; the rest of that section stands as written for the future.
+
+**Update 2026-10-12 (second cause — now the dominant one):** a production
+session on the *single-session master* config (ctx 524288) hit the same client
+error repeatedly, and the logs show it was **not** the silent-stall class above.
+The pipeline stayed healthy throughout (prefill ~456 t/s, decode a steady
+10.23 t/s, no stall/timeout lines, the 120 s bounded wait never fired) while the
+server sent the client **zero bytes for the whole duration of a long open DSML
+tool call**. Each attempt ended exactly ~300 s after its last client-visible
+byte — OpenCode's per-chunk timer. This is the dominant real-world cause; see
+§7 for the evidence, the code mechanism and the fix (decode-phase SSE
+keepalive).
+
 **Symptom:** occasionally, the code agent (OpenCode) against the Mac+Spark
 GLM 5.3 Flash pair aborts a request with `Timed out waiting for response data`.
 
@@ -59,8 +71,15 @@ distributed layer has one by construction.
 * **KV snapshot save/load** runs on separate data connections and takes tens
   of seconds at depth — never minutes on the response path.
 
-A healthy pair cannot trip this error. The observation "occasionally" is the
-signature of an *event*, not a cadence.
+**Correction (2026-10-12):** the claim above that tool-call arguments stream
+live is **false for the GLM DSML tool-in-thinking path** — while a tool-call
+block is open the server can send *nothing at all* for the whole block (§7).
+The prefill keepalive is real; there was no decode-side equivalent.
+
+A healthy pair cannot trip this error — except that the decode path itself can
+go silent for an entire tool block (§7), which is not a stall and is invisible
+to the checks above. The observation "occasionally" is the signature of an
+*event*, not a cadence.
 
 ## 3. The mechanism: the coordinator's result read has no deadline
 
@@ -165,9 +184,80 @@ freeze therefore tends to be followed by a slow or failed retry.
   complete against the same 300 s timer).
 * **KV snapshot save/load** — tens of seconds at depth, on separate data
   connections, off the response path.
-* **Tool-call suppression** — the OpenAI chat path streams tool-call argument
+* ~~**Tool-call suppression** — the OpenAI chat path streams tool-call argument
   deltas live; only the Responses/Codex protocol withholds them
-  (`ds4_server.c:8751-8754`), and OpenCode does not use that protocol here.
+  (`ds4_server.c:8751-8754`), and OpenCode does not use that protocol here.~~
+  **WRONG (corrected 2026-10-12):** on the OpenAI chat path the live streamer
+  *withholds* a tool call whose DSML block is still open when the model is in
+  think mode (the thinking-before-`</think>` branch of
+  `openai_sse_stream_update`), which is exactly what GLM 5.3 Flash emits. This
+  was the dominant cause of the client timeout — see §7.
 * **Queueing behind another request** — that stalls *before* headers and
   produces the sibling "waiting for response **headers**" timeout, a different
   message.
+
+---
+
+## 7. Update 2026-10-12: decode-phase silence in an open tool call
+
+The 2026-10-12 production session (single-session **master** config, ctx
+524288, pair up 01:35–04:19 +1100, session `ses_ed859666…` in
+`~/dev/llm_server_manager`) hit `Timed out waiting for response data`
+repeatedly. The WS0 fix was deployed and healthy: both binaries contain the
+marker, both trees are at `006b52e`, the coordinator log has **no**
+stall/timeout/route-teardown lines and the 120 s bounded result wait never
+fired. Timings were perfect all night — 23-chunk prefills at ~456 t/s average
+(200.0–200.8 s), decode a steady 10.23 t/s, progress lines every ~4.9 s with no
+gaps.
+
+What happened instead: every big-prompt request decoded a **long DSML tool
+call**, and the client received **zero bytes for the entire open block**.
+
+| req | start | prompt | decode entry | last decode line | silence → abort |
+| --- | --- | --- | --- | --- | --- |
+| REQ3 | 01:54:10 | 90 443 | `gen=50 DSML_START` | 02:02:30 `gen=3050` | ~300 s (from prefill end) |
+| REQ4 | 02:02:34 | 90 443 | text to `gen=1000`, then `DSML_START` | 02:12:24 `gen=4000` | ~293 s (from last text byte) |
+| REQ5 | 02:12:29 | 91 413 | `gen=50 DSML_START` | 02:20:47 `gen=3050` | ~297 s |
+| REQ6 | 02:20:58 | 91 413 | `gen=50 DSML_START` | 02:29:22 `gen=3100` | ~302 s → **logged drain #1** |
+| REQ7–REQ9 | 03:45–04:10 | 91 452 | `gen=50 DSML_START` | ~298 s each | ~298 s |
+| REQ10 | 04:10:28 | 91 452 | `gen=50 DSML_START` | 04:18:47 `gen=3050` | ~298 s → **logged drain #2** |
+
+The two opencode errors (02:29:22 and 04:18:49 local) match REQ6 and REQ10 exactly.
+REQ4 had streamed ~1000 tokens of pre-tool text, which pushed its deadline out
+by ~90 s; the prompt growth after it (90443 → 91413) implies that attempt's call
+did complete and run. So the outcome depends on where the block boundary falls
+relative to the 300 s window — hence the intermittency.
+
+**Mechanism (code).** Think mode defaults on (`r->think_mode = DS4_THINK_HIGH`,
+`ds4_server.c:995`), so `openai_stream_start` sets
+`mode = OPENAI_STREAM_THINKING` (`:7220`). In that branch, when a tool start
+appears before any `</think>` and its block is not yet complete, the function
+emits the preceding reasoning and then **returns early, without ever entering
+the tool streamer** (`~:8088-8095`). GLM 5.3 Flash emits the DSML block with no
+`</think>` (the progress lines carry no `THINKING` flag), so the whole call is
+silent; the complete call is emitted only at finish by
+`openai_sse_finish_live` (fallback when `!st->tool.emitted_any`). The model's
+call here is ~3000–3100 tokens; at 10.23 t/s that is ~293–303 s, straddling
+OpenCode's 300 s no-byte timer. Secondarily, because the server never writes
+during the silence it never sees the client's FIN, so it keeps decoding the
+abandoned call.
+
+**Fix (in tree, pending live gate).** Mirror the prefill keepalive on the
+decode path: an SSE comment line (`: decode`) every ≥ 5 s at the top of the
+decode loop in `generate_job_inner` (`:14000`). SSE parsers ignore comments, but
+they are bytes on the wire — OpenCode's chunk timer only needs *a* byte — and a
+failed write now detects a client that left mid-silence. Compiles clean
+(`clang -std=c99 -Wall -Wextra -c ds4_server.c`, 0 errors/warnings).
+
+Optional follow-ups: (a) stream tool-argument deltas live in the
+thinking-before-`</think>` case (better UX; the complete-block gate exists to
+avoid mistaking quoted protocol text for a real call, so the keepalive is the
+low-risk fix); (b) client-side `http.chunkTimeout` bump as a belt-and-braces
+(§5 item 4).
+
+**Corrections to the earlier analysis.** §2's "tool-argument deltas flow live"
+and §6's "Ruled out tool-call suppression" are wrong for this path (§6 updated
+above). The §3/§4 silent-stall class is real and WS0 addresses it, but it was
+not what tripped the agent on 2026-10-12; on the same evidence it is also the
+probable cause of the earlier 2026-10-11 11:44 occurrence (same session id,
+same error), rather than an r8127 flap.
