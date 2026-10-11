@@ -11,7 +11,11 @@ both machines under load — as the acceptance target.
 follows from; its §7 has the saturation arithmetic this design relies on, and
 its §4.1 (output head on the coordinator) is assumed landed first, because it
 both balances the decode stages (81 % vs 61 % Mac duty at saturation) and frees
-the 1.18 GiB of Spark memory that admits the second session.
+the 1.18 GiB of Spark memory that admits the second session. Workstream 0 comes
+from `ds4-glm53-response-data-timeout.md`: the code agent's
+`Timed out waiting for response data` failures are unbounded result waits on
+stalled worker connections, and the fix is standalone-landable before any of
+the concurrency work.
 
 ---
 
@@ -25,6 +29,7 @@ the 1.18 GiB of Spark memory that admits the second session.
 | 4 | **Single-client regression-free.** One client alone behaves exactly as today | E1-harness A/B: prefill t/s and decode median gap within noise; continuation sha256 identical at ~11 K/~285 K/~473 K |
 | 5 | **Correctness gates on the live pair** | criterion-1 oracle, boundary gates (2048→2056, 4096→4100), `--dist-replay-check`, per-session snapshot round-trip (criterion-6 machinery, session ids already in the frames) |
 | 6 | **Admission.** Memory over-subscription is refused loudly, not OOM'd | guard session accounting (`glm_session_graph_bytes`, `ds4.c:73169-73172`) refuses an Nth session; server queues or errors cleanly |
+| 7 | **Bounded stalls** (workstream 0, independent of 1–6). A worker-side stall that does not close the TCP connection produces a visible failure within the result deadline, not a silent hang | stall the worker mid-request on the pair (or drop the link without RST); the request errors/rebuilds within ~2 min instead of freezing until the agent's 300 s chunk timeout (`ds4-glm53-response-data-timeout.md` §3) |
 
 Expected per-client latency, stated now to set expectations: at saturation each
 client's inter-token gap is ≈ N × T_spark (114 ms at N=2 post-head-move, 171 ms
@@ -213,8 +218,9 @@ behind flags applies, so the gate is measurement, not configuration:
   coordinator core touches `ds4.c` session creation.
 
 If any phase fails its gate, it does not land — the phases are ordered so
-1–2 are pure structure with zero behavioural delta, and only 3 changes runtime
-behaviour at all.
+1–2 are pure structure with zero behavioural delta, while 0 and 3 are the two
+phases that change runtime behaviour, each carrying its own gate (criterion 7
+for 0, criterion 4 for 3).
 
 ---
 
@@ -222,6 +228,7 @@ behaviour at all.
 
 | # | Workstream | Files | Est. | Notes |
 | --- | --- | --- | ---: | --- |
+| 0 | Bounded result wait + dist socket keepalive tuning | `ds4_distributed.c` | 0.5–1 d | request-scoped poll deadline in `dist_recv_result_alloc` and the prefill result reader (~120 s default; the blanket `DS4_DIST_SOCKET_RECV_TIMEOUT_SEC` is the wrong knob — the worker read loop legitimately idles between requests); `TCP_KEEPALIVE` ≈ 30 s / 10 s / 3 on dist sockets; kills the 5-min agent freeze, no protocol change; motivation and analysis in `ds4-glm53-response-data-timeout.md` §5 |
 | 1 | Shared coordinator core | `ds4_distributed.c`, `ds4.h` | 1–2 d | registry/listener/generation hoist; single-session byte-identical |
 | 2 | Per-session work connections | `ds4_distributed.c` | 1–2 d | lazy dial + keep-alive; snapshot-style; no protocol change |
 | 3 | Shrunken local-eval mutex + server concurrency | `ds4_distributed.c`, `ds4_server.c` | 2–3 d | drop `inference_mu` for distributed; queue on refused admission; `--dist-prefill-chunk` guidance |
@@ -229,7 +236,8 @@ behaviour at all.
 | 5 | Dynamic prefill chunk policy | `ds4_distributed.c` | 1 d | later; behind the existing knob |
 | 6 | Disk-KV eviction for pipeline sessions | `ds4_server.c` | 2 d | later; reuses criterion-6 transport |
 
-Order 1 → 2 → 3 is the minimum for criteria 1–3. Each step keeps the previous
+Order 0 is independent of the concurrency work and can land alone; 1 → 2 → 3
+is the minimum for criteria 1–3. Each step keeps the previous
 behaviour observable behind it, per the repo's rule that the Metal default,
 SSD streaming, CUDA and distributed paths must not be affected by fixes to
 other parts — verified here by the criterion-4 single-client A/B after each
@@ -252,7 +260,9 @@ step.
 
 ## 6. Non-goals
 
-* No wire protocol change; no version bump; no worker-side code change.
+* No wire protocol change; no version bump; no worker-side behavioural change
+  (workstream 0 tunes shared socket options compiled into both binaries — the
+  worker's eval and queue logic is untouched).
 * No true batched decode (analysis §4.3) — it multiplies per-pass throughput but
   does not by itself raise duties, since the stages still alternate within a
   pass; revisit after saturation is measured.
