@@ -91,6 +91,63 @@ anything above 65536 per session.
 
 ## 4. Operating the concurrent configuration
 
+**Superseded later the same day by workstream 4 (§5): the 2-slot context is
+now 262144.** Kept for the record of what was gated at 65536:
+
+```sh
+# Worker: same as production, smaller ctx
+DS4_GLM_LAYER_SLICE_TOKEN_DECODE=1 DS4_GLM_MEMORY_GUARD_RESERVE_GB=14 \
+  ~/bin/ds4 --cuda -m ~/mlmodels/glm/GLM-5.3-Flash-Q4_K.gguf \
+  --role worker --layers 21:44 --coordinator 192.168.2.1 9911 \
+  --listen 192.168.2.2 55911 --ctx 65536
+
+# Mac: batched slots enable concurrent clients
+DS4_GLM_LAYER_SLICE_TOKEN_DECODE=1 ~/bin/ds4-server ... \
+  --role coordinator --layers 0:20 --listen 192.168.2.1 9911 \
+  --ctx 65536 --batched-session 2 --dist-prefill-chunk 2048 \
+  --host 0.0.0.0 --port 8081
+```
+
+Notes: `--dist-prefill-chunk 2048` halves the per-session prefill workspace
+(measured no prefill-rate cost on this pair); a long prefill on one slot
+monopolises the Mac's prefill for its duration (one-shot syncs serialize
+prefills; decode steps of other slots still interleave between chunks);
+watch the worker's `free -g` when adding sessions. The production
+configuration (single session, ctx 524288) is unchanged and remains the
+default in `~/bin/llm_config.json`.
+
+## 5. Workstream 4 — shared GLM prefill workspace (2026-10-11, same day)
+
+Implemented in `ds4.c` after the 262144 incident made it necessary: the
+chunk-shaped batch and GLM-5.3 layer-major prefill buffers (50 tensors, one
+offset table) are allocated by the **first** eligible session, ownership
+moves to the engine, and every later same-shape session **aliases** them.
+Safety rests on the invariant that every use of the set happens inside a
+serialized eval (WS3's `gpu_mu` around local slice evals on the coordinator,
+the worker's eval lock) — verified by mapping all 731 `batch_*` references
+to their enclosing functions; the only token-path touch is the single-row
+embedding staging write into `prefill_tokens[0]`, inside the eval lock.
+`glm_graph_free` skips borrowed slots; `glm53_graph_prefill_workspace_ensure`
+refuses to grow a borrowed workspace rather than free aliased memory; the
+memory guard and `glm_reserved_graph_bytes` charge a borrowing session only
+its caches (discount = `glm_graph_workspace_bytes_for_cap`). The publish and
+alias events are logged (`shared GLM-5.3 prefill workspace: …`).
+
+**Measured effect** (ctx 262144, batched 2, live `free -g` sampling):
+
+| | before WS4 | with WS4 |
+| --- | ---: | ---: |
+| second worker session adds | ~4.2 GiB | **~2 GiB** (KV + small scratch) |
+| worker available under 2 sessions | wedged (power cycle) | **≥ 10 GiB** |
+| concurrent A+B decode | — | **112.8 ms each, byte-identical, +62 % aggregate** |
+
+Single-session regression at production ctx 524288 on the deployed binaries:
+11K decode median **90.78 ms**, sha `a3898c57…` — unchanged. The 2-slot
+configuration in `~/bin/llm_config.json` (both hosts) is raised
+**65536 → 262144** accordingly. **2 × 524288 remains out of bounds**: the
+arithmetic leaves ~7 GiB available, below the ≥ 10 GiB bar the incident set —
+not probed.
+
 ```sh
 # Worker: same as production, smaller ctx
 DS4_GLM_LAYER_SLICE_TOKEN_DECODE=1 DS4_GLM_MEMORY_GUARD_RESERVE_GB=14 \

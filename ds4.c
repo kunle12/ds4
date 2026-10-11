@@ -73292,6 +73292,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          * keep private workspaces. */
         struct ds4_glm_shared_ws *glm_shared_ws = NULL;
         uint64_t glm_ws_discount_bytes = 0;
+        uint64_t glm_ws_size_bytes = 0;
         bool ws_was_ready = false;
         if (ds4_model_is_glm53() && !e->ssd_streaming &&
             !e->multi_tier && !e->tp.active) {
@@ -73304,16 +73305,18 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             }
             glm_shared_ws = e->glm_shared_ws;
             ws_was_ready = glm_shared_ws->ready;
+            /* Chunk-shaped workspace size for this shape. It is the alias
+             * discount for a matched session, and the charge for the live
+             * engine-owned workspace below. */
+            glm_ws_size_bytes = glm_graph_workspace_bytes_for_cap(
+                    work_ctx, compact_cap, e->ssd_streaming);
             if (glm_shared_ws_matches(glm_shared_ws,
                                        guard_ctx,
                                        work_ctx,
                                        compact_cap,
                                        layer_start,
                                        layer_end)) {
-                glm_ws_discount_bytes =
-                    glm_graph_workspace_bytes_for_cap(work_ctx,
-                                                      compact_cap,
-                                                      e->ssd_streaming);
+                glm_ws_discount_bytes = glm_ws_size_bytes;
             }
         }
         const ds4_context_memory session_mem =
@@ -73340,6 +73343,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             e->ssd_streaming_budget_finalized = true;
         }
         s->glm_graph.placement = e->multi_tier ? e->placement : NULL;
+        /* Charge the live engine-owned workspace when it exists: the
+         * discount below removes only what this session no longer
+         * allocates, and the workspace itself is in GPU memory regardless
+         * of which sessions are alive. */
+        const uint64_t glm_ws_live_bytes =
+            glm_shared_ws && glm_shared_ws->ready ? glm_ws_size_bytes : 0;
         if (!glm_graph_alloc_slice(&s->glm_graph,
                                    &e->model,
                                    &e->weights,
@@ -73347,8 +73356,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                    e->ssd_streaming,
                                    e->ssd_streaming_cold,
                                    glm_graph_saturating_add_u64(
-                                       ds4_engine_streaming_transient_guard_bytes(e),
-                                       other_graph_bytes),
+                                       glm_graph_saturating_add_u64(
+                                           ds4_engine_streaming_transient_guard_bytes(e),
+                                           other_graph_bytes),
+                                       glm_ws_live_bytes),
                                    layer_start,
                                    layer_end,
                                    require_token_embd,
@@ -73363,17 +73374,16 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr,
                     "ds4: shared GLM-5.3 prefill workspace: batch_cap=%u, "
                     "%.2f GiB once; each further session costs its caches "
-                    "only (this session %s)\n",
+                    "only (this session published)\n",
                     glm_shared_ws->batch_cap,
-                    (double)glm_ws_discount_bytes / (1024.0 * 1024.0 * 1024.0),
-                    "published");
+                    (double)glm_ws_size_bytes / (1024.0 * 1024.0 * 1024.0));
         } else if (s->glm_graph.ws_borrowed) {
             fprintf(stderr,
                     "ds4: shared GLM-5.3 prefill workspace: batch_cap=%u, "
                     "%.2f GiB once; each further session costs its caches "
                     "only (this session aliased, %.2f GiB saved)\n",
                     glm_shared_ws->batch_cap,
-                    (double)glm_ws_discount_bytes / (1024.0 * 1024.0 * 1024.0),
+                    (double)glm_ws_size_bytes / (1024.0 * 1024.0 * 1024.0),
                     (double)glm_ws_discount_bytes / (1024.0 * 1024.0 * 1024.0));
         }
         s->glm_graph_ready = true;

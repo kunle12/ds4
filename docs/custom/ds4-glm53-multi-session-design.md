@@ -250,7 +250,7 @@ for 0, criterion 4 for 3).
 | 1 | Shared coordinator core | `ds4_distributed.c`, `ds4.h` | 1–2 d | **done 2026-10-11** — registry/listener/accept hoisted to a refcounted per-engine core; single-session byte-identical |
 | 2 | Per-session work connections | `ds4_distributed.c` | 1–2 d | **done 2026-10-11** — sessions dial the worker's data listener; plans own dups; failure drops and re-dials; strict matching is per-session |
 | 3 | Shrunken local-eval mutex + server concurrency | `ds4_distributed.c`, `ds4_server.c` | 2–3 d | **done 2026-10-11** — shared `gpu_mu` around the GPU sections; dist slots self-serve decode; image encoder joins the exclusion; one-shot sync in batched mode (the 269→430 t/s quantum fix); +62 % aggregate at 2 clients, outputs byte-identical |
-| 4 | Shared GLM prefill workspace | `ds4.c` | 1–2 d | **now necessary** for per-session ctx above 65536 (the 262144 incident); unlocks more/larger sessions |
+| 4 | Shared GLM prefill workspace | `ds4.c` | 1–2 d | **done 2026-10-11** — 50-tensor shared set, engine-owned, offset-table aliasing; a second session adds KV only (~2 GiB at 262144 vs ~4.2 before); 2×262144 gated byte-identical with ≥ 10 GiB available; the memory table above is superseded by the results doc §5 |
 | 5 | Dynamic prefill chunk policy | `ds4_distributed.c` | 1 d | later; behind the existing knob |
 | 6 | Disk-KV eviction for pipeline sessions | `ds4_server.c` | 2 d | later; reuses criterion-6 transport |
 
