@@ -172,3 +172,80 @@ measurement before they could mislead further, and the one gap that mattered
 bounded, listed, and none of them guards a path the production configuration
 actually exercises. The production pair is serving, on the hardened build,
 verified end to end this evening.
+
+---
+
+## 7. Workstream 4 self-review (2026-10-12, post-deploy)
+
+**Scope:** the shared GLM prefill workspace (`ds4.c`, `eca36db`…`e1df92c`),
+reviewed with the same discipline as §1–§6.
+
+### Defects found by this review — fixed (`e1df92c`) and re-gated
+
+1. **The publish log printed the wrong number — and I read past it twice.**
+   The "shared GLM-5.3 prefill workspace: … %.2f GiB once" line printed the
+   *alias discount* (zero for the publishing session): production logs said
+   **"0.00 GiB once"** during the WS4 test *and* in my own final
+   verification grep. A size of 0.00 GiB is impossible and should have
+   stopped me both times. Fixed to print the shape's actual workspace bytes;
+   verified in production ("**3.02 GiB once**").
+2. **The memory guard under-charged at an aliasing session's admission.**
+   The discount removed what the session no longer allocates, but the live
+   engine-owned workspace itself was not charged anywhere in `required` —
+   an under-charge of the workspace size (~3 GiB) at every post-publish
+   admission. The same fallacy class as the 262144 incident: I derived the
+   discount algebra once during design, then applied it without re-deriving
+   the full *required* identity after the edit. Fixed: the transient passed
+   to the slice guard now includes the live workspace when one is
+   published. Arithmetic for the 2×262144 admission: required ≈ 103.6 of
+   107.61 — still admitted, now honestly.
+
+Because that fix changed the admission formula *after* the 2×262144 gate had
+passed, the gate was **re-run on the fixed binaries** (the repo's own rule: a
+physical run is the gate): A alone 90.1 ms / B alone 91.3 ms (the critical
+admission) / concurrent 112.6 ms each — all byte-identical, +62 % aggregate,
+no refusal. The 285K production-depth run was also added on the final
+binaries (the earlier WS4 verification was 11K-only): **406.7 t/s prefill,
+104.5 ms decode median, sha `a3898c57…`** — criterion 4 fully closed.
+
+### Reviewed and found sound
+
+* **The sharing invariant, re-derived end to end.** All 731 `batch_*`
+  references were bucketed by enclosing function: every use sits inside an
+  eval call (the 29-slot `ws_mirror` set that `glm_graph_ws_free` touches
+  first in `glm_graph_free` is the *decode* scratch, none of it shared).
+  The only token-graph touch is the single-row embedding staging write into
+  `prefill_tokens[0]`, inside the eval lock. MTP verify, native session
+  batch, imatrix and seed paths are all eval-internal or shape-ineligible.
+* **Alias-before-validate ordering.** The alias block's `batch_cap` /
+  `generic_routed_moe` writes are redundant (validate and the batch-rows
+  computation overwrite them with identical values); `glm53_prefill_cap`
+  survives because `glm53_graph_prefill_workspace_ensure` no-ops at
+  matching caps and now *refuses* to grow a borrowed workspace.
+* **Ownership lifecycle.** Publish marks the *owner* graph borrowed, so its
+  free skips the shared tensors; engine close owns them; the guarded
+  indexed block and the generic-routed allocations align with the owner's
+  because the shape key includes the compact caps that size them.
+* **Accepted approximations, now on record:** the discount over-counts by
+  ≤ ~10 MB (the estimate bundles single-token scratch and the seed buffer
+  into `glm_graph_workspace_bytes_for_cap`); the owner-freed window leaves
+  the workspace bytes out of `glm_session_graph_bytes` while the tensors
+  live (the new live-charge covers the *admission* side; slots live for
+  process lifetime, so the counter window is theoretical); and the
+  workspace never migrates shapes — if an engine's first shape dies out,
+  its ~3 GiB stays until engine close (the Qwen4 arena's refcount-free
+  rebuild is the template, worth copying only if shape-churning engines
+  ever exist).
+
+### Process notes
+
+* The **deploy-vs-git friction recurred** on spike (rsync stomp → dirty
+  tree → pull refused; resolved by checkout+pull). Second occurrence; the
+  standing fix is to make `ds4-deploy.sh` git-pull on the peer instead of
+  rsyncing over its checkout — a host-script change, offered, not made.
+* The two defects above were both **visible in output I produced during the
+  work** (the 0.00 log line) or **derivable from the design algebra** (the
+  un-charged workspace). Neither required new machinery to find — only
+  reading my own output skeptically and re-deriving my own formulas. That
+  is the same lesson as §3, and it is now written down twice because it
+  was committed twice in one day.
