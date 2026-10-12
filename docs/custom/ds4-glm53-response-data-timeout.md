@@ -242,12 +242,23 @@ OpenCode's 300 s no-byte timer. Secondarily, because the server never writes
 during the silence it never sees the client's FIN, so it keeps decoding the
 abandoned call.
 
-**Fix (in tree, pending live gate).** Mirror the prefill keepalive on the
-decode path: an SSE comment line (`: decode`) every ≥ 5 s at the top of the
-decode loop in `generate_job_inner` (`:14000`). SSE parsers ignore comments, but
-they are bytes on the wire — OpenCode's chunk timer only needs *a* byte — and a
-failed write now detects a client that left mid-silence. Compiles clean
-(`clang -std=c99 -Wall -Wextra -c ds4_server.c`, 0 errors/warnings).
+**Fix (implemented at `0af96c0`, gated on the pair 2026-10-12 19:14).** Mirror
+the prefill keepalive on the decode path: an SSE comment line (`: decode`) every
+≥ 5 s at the top of the decode loop in `generate_job_inner` (`:14000`). SSE
+parsers ignore comments, but they are bytes on the wire — OpenCode's chunk timer
+only needs *a* byte — and a failed write now detects a client that left
+mid-silence. Compiles clean (`clang -std=c99 -Wall -Wextra -c ds4_server.c`,
+0 errors/warnings).
+
+**Gate (physical pair, master config ctx 524288, synthetic ~89 K-token prompt
+with a `write_file` tool).** The model produced an ~8750-token DSML tool call
+that stayed open from `gen=50` to `gen=8752` — ~854 s of silent decode
+(`TOOLS DSML_START`, no `THINKING`), i.e. ~3× the 300 s window. The client
+received **168** `: decode` comments and saw a **maximum gap of 5.1 s** during
+decode (mean 0.02 s over 45 893 byte-reads; prefill max 8.9 s, normal). The
+request completed with `finish=tool_calls` and a **valid-JSON** tool call (1038
+lines in the `content` argument). The same request pre-fix would have gone
+silent for the whole block and aborted at 300 s.
 
 Optional follow-ups: (a) stream tool-argument deltas live in the
 thinking-before-`</think>` case (better UX; the complete-block gate exists to
