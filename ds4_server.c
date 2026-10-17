@@ -12629,15 +12629,6 @@ static int server_generation_rewind(server *s, server_slot *slot,
                                      bool resample, int last_token,
                                      char *err, size_t errlen) {
     pthread_mutex_lock(&s->inference_mu);
-    /* Fast path: a DeepSeek V4 DSpark boundary rewind can restore the verifier's
-     * block-start frontier and replay a few tokens in place, avoiding the
-     * full-context rebuild whose Metal prefill can hang. */
-    if (ds4_session_rewind_speculative_boundary(slot->session, pos) == 0) {
-        server_log(DS4_LOG_GENERATION,
-                   "ds4-server: in-place DSpark boundary rewind to %d", pos);
-        pthread_mutex_unlock(&s->inference_mu);
-        return 0;
-    }
     /* A mode change only needs logits at the retained boundary. Replaying the
      * previous token can cross before the verifier snapshot in exact mode. */
     if (resample && ds4_session_rewind_speculative(slot->session, pos)) {

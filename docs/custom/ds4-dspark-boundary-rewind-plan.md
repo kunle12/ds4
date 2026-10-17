@@ -1,7 +1,8 @@
 # Plan: in-place DeepSeek V4 rewind for the DSpark speculative boundary
 
-Status: IMPLEMENTED + HARDENED (revision 4) — built and installed; awaiting end-to-end test.
-Date: 2026-09-30
+Status: RETIRED 2026-10-18 — removed in favour of upstream `dspark_rewind_*`
+(`fc80bd6`). Kept as a historical design record; see §10.
+Date: 2026-09-30 (retired 2026-10-18)
 
 Implementation: `ds4.c` (session fields + logits buffer,
 `ds4_session_dspark_note_rewind_frontier`, recorded in both DSpark verify paths,
@@ -9,6 +10,14 @@ Implementation: `ds4.c` (session fields + logits buffer,
 `ds4_server.c` (`server_generation_rewind` fast path under `inference_mu` + generation
 log), `ds4.h` (declaration). Built clean (`-Wall -Wextra`); `ds4-server` installed to
 `/Users/xun/bin/ds4-server` (sha `e9e6226f…`). See §8 for the hardening pass.
+
+> **Retired 2026-10-18.** The custom `ds_rewind_*` state,
+> `ds4_session_dspark_note_rewind_frontier` and
+> `ds4_session_rewind_speculative_boundary` were removed from `ds4.c`, `ds4.h` and
+> `ds4_server.c`; the server now relies on upstream
+> `ds4_session_rewind_speculative`/`ds4_session_rewind`. The test-harness
+> adaptations were reverted to their upstream versions. See §10 for the A/B that
+> motivated the retirement.
 
 ## 1. Problem
 
@@ -280,3 +289,27 @@ the captured boundary logits are restored, so the `resample` case no longer fall
 `tests/test_dspark_eos_contract.py` stubs `ds4_session_dspark_note_rewind_frontier`.
 All four `tests/test_dspark_{window,confidence_input,eos_contract,rewind}.py` pass on
 the merged tree.
+
+*Superseded by §10: the custom code and these harness adaptations were removed.*
+
+## 10. Retirement of the custom path (2026-10-18)
+
+The custom `ds_rewind_*` frontier, `ds4_session_dspark_note_rewind_frontier` and
+`ds4_session_rewind_speculative_boundary` were removed. The server now calls only
+upstream `ds4_session_rewind_speculative` and `ds4_session_rewind`, and the two
+extracted-source tests are back to their upstream contents.
+
+A/B on titan (M4 Max, Metal), V4 Flash Vision-Exp + DSpark, ctx 32768, temperature 0,
+seed 1234, three runs per prompt, same prompt family:
+
+| Retained tokens | Custom mean `rewind_ms` | Upstream mean `rewind_ms` |
+| ---: | ---: | ---: |
+| 1 | 0.29 | 0.31 |
+| 3 | 57.9 | 30.2 |
+| 4 | 86.8 | 29.3 |
+
+The custom path replays every retained token with
+`metal_graph_eval_token_raw_swa`; upstream commits the verifier prefix and replays
+only the last token. Outputs were identical in all cases. Upstream is therefore
+equal when no replay is needed and 2-3x faster when retained tokens must be
+replayed, and it is the only mechanism that supports tensor parallelism.

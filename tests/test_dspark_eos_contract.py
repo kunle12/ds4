@@ -130,13 +130,6 @@ static void dspark_rewind_begin(ds4_session *s,const ds4_spec_frontier *f,int st
 static void dspark_rewind_keep(ds4_session *s) {
     if(s!=active_session || !s->checkpoint_valid || s->checkpoint.len!=s->graph.frontier) mock_errors++;
 }
-/* The customisation branch records an independent boundary frontier here. This
- * contract test exercises the verifier only; the custom boundary-rewind path is
- * outside this harness, so the capture is a no-op here. */
-static void ds4_session_dspark_note_rewind_frontier(ds4_session *s,
-        const ds4_spec_frontier *f,int start,int draft_n) {
-    (void)s; (void)f; (void)start; (void)draft_n;
-}
 #endif
 static bool ds4_session_tp_leader(ds4_session *s) { (void)s; return tp_leader; }
 #if HAVE_TP_FLAGS
