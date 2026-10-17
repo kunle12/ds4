@@ -68,6 +68,8 @@ typedef struct {
     float *dspark_rewind_logits, logits[DS4_N_VOCAB];
     int dspark_rewind_start, dspark_rewind_end;
     uint32_t dspark_rewind_prefixes;
+    /* Customisation-only frontier flag, cleared by the extracted restore helper. */
+    bool ds_rewind_valid;
     uint64_t tp_session_id;
     int rank, storage[CAPACITY];
     bool leader, capture_valid;

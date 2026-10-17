@@ -147,6 +147,11 @@ ds4_session_rewind(slot->session, pos);   /* fallback: rebuild */
 block_start+1`. `kept >= 1` is guaranteed (the seed token is proved non-stop before the
 speculative eval, `ds4_server.c:13957-13974`), so `pos >= base`.
 
+> **Superseded after merging upstream main (2026-10-18):** upstream changed the caller to
+> `pos = block_start + kept` and the hook now also runs the upstream
+> `ds4_session_rewind_speculative` resample path before the rebuild fallback. The
+> checkpoint semantics make this equivalent; see §9.
+
 ### 3.5 Lifecycle
 
 - `ds_rewind_valid = false` in `ds4_session_invalidate`, in `ds4_session_rewind` (so a
@@ -235,8 +240,43 @@ Known, intentional limitations:
 - `ds4-agent` callers and DS4.1 remain on the rebuild path (follow-up).
 - Under `--mtp-exact-sampling`, the `resample` rewind to `base-1` (kept==1) is rejected
   by the `pos >= base` bound and falls back — correct, just not accelerated.
+  *Superseded by §9: the merged caller passes the post-kept boundary, so `kept==1` uses
+  the captured boundary logits instead of falling back.*
 - The unrelated `openai_finish_reason` mapping (fix 1 from earlier) deliberately turns
   internal generation errors into a valid terminal reason; noted as a separate tradeoff.
 
 Final diff: `+161` lines, zero deletions; `make all` clean under `-Wall -Wextra`;
 `ds4-server` installed at `/Users/xun/bin/ds4-server` (sha `e9e6226f…`).
+
+## 9. Merge integration with upstream main (2026-10-18)
+
+Upstream main added an independent recent-rewind mechanism
+(`dspark_rewind_frontier`/`dspark_rewind_logits`, `dspark_rewind_begin`,
+`dspark_rewind_keep`, `dspark_rewind_recent`, `ds4_session_rewind_speculative`) and
+changed `server_generation_rewind` to take `(pos, resample, last_token)` with
+`pos = block_start + kept`. The merge keeps both mechanisms rather than choosing one:
+
+- `ds4.c` retains the customisation `ds_rewind_*` state and
+  `ds4_session_dspark_note_rewind_frontier` alongside the upstream `dspark_rewind_*`
+  state and helpers. Both frontier captures run back-to-back in the argmax and
+  stochastic verifiers; both logits buffers are freed.
+- `ds4_server.c` tries the custom in-place boundary rewind first, then the upstream
+  `ds4_session_rewind_speculative` resample fast path, then the
+  `ds4_session_rewind` + `common_prefix` rebuild fallback.
+- `ds4_session_restore_speculative_prefix` clears `ds_rewind_valid` at entry. The
+  upstream restore path can return early, so this prevents a stale custom frontier from
+  being restorable after an upstream rewind.
+
+**Position semantics.** The custom API sets `checkpoint.len = pos` after restoring the
+block-start frontier and replaying `[base, pos)`. Passing `pos = block_start + kept`
+therefore means “keep `kept` tokens and leave the logits at that boundary”, which is
+equivalent to the old pair “rewind to `block_start + kept - (resample ? 1 : 0)`, then
+`server_eval_token(last_token)`”: the last retained token is replayed inside the fast
+path instead of by the caller. When `pos == base` (`kept == 1`) the replay is empty and
+the captured boundary logits are restored, so the `resample` case no longer falls back.
+
+**Tests.** The upstream extracted-source tests now model the custom additions:
+`tests/test_dspark_rewind.py` mocks `ds_rewind_valid`, and
+`tests/test_dspark_eos_contract.py` stubs `ds4_session_dspark_note_rewind_frontier`.
+All four `tests/test_dspark_{window,confidence_input,eos_contract,rewind}.py` pass on
+the merged tree.
