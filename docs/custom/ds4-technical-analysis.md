@@ -363,7 +363,7 @@ Three operations define its lifecycle:
 | --- | --- |
 | `ds4_session_sync(s, prompt)` | Make the live KV equal to `prompt`. If the current checkpoint is a prefix, only the suffix is evaluated; otherwise the state is rebuilt from scratch. Returns `DS4_SESSION_SYNC_INTERRUPTED` if cancelled mid-way. |
 | `ds4_session_eval(s, token)` | Append one token, produce logits. |
-| `ds4_session_invalidate(s)` / `ds4_session_rewind(s, pos)` | Drop or truncate state. Rewind keeps the token prefix and restores recurrent state where possible; DeepSeek's compressors cannot truncate, so the checkpoint is invalidated and the caller must re-sync. |
+| `ds4_session_invalidate(s)` / `ds4_session_rewind(s, pos)` | Drop or truncate state. Rewind keeps the token prefix and restores recurrent state where possible; DeepSeek's compressors cannot be truncated directly, so the recent verifier-prefix restore (`dspark_rewind_recent`) is tried first; if that is unavailable or stale the checkpoint is invalidated and the caller must re-sync. |
 
 Prefix math lives in `ds4_session_common_prefix` + `ds4_session_rewrite_from_common` + `ds4_session_rewrite_requires_rebuild`, with the rule that a GPU session needs an exact token-prefix match (the CPU path is more forgiving). Frontends then implement their own *cache ladders* on top (see §8) — the engine only offers "is this a prefix?" and "sync".
 
@@ -1037,7 +1037,7 @@ Sampling semantics matter and are easy to get wrong:
 - default (non-zero) → **opportunistic**: greedy drafts are accepted when they match the target's greedy choice, but the target's own distribution is used for the final sample.
 - `--mtp-exact-sampling` → **exact p/q acceptance with residual replacement** for DSpark / internal MTP blocks, i.e. provably distributed-identical output.
 
-Rewind differs by model because the architectures differ: Qwen restores from verify snapshots; GLM rewinds its MTP state; **DeepSeek's compressors cannot truncate**, so a speculative rewind invalidates the checkpoint and the caller must rebuild (this is stated in `ds4.h` next to `ds4_session_rewind`).
+Rewind differs by model: Qwen restores from verify snapshots; GLM rewinds its MTP state; **DeepSeek's compressors cannot be truncated directly**, so a DSpark rewind restores a recent verifier prefix and replays at most one block (`dspark_rewind_recent`). An arbitrary or stale rewind still invalidates the checkpoint and forces a rebuild (as stated in `ds4.h` next to `ds4_session_rewind`).
 
 Budget/limits: prefill is never accelerated; the scheduler backs off when acceptance is low; the server disables MTP/DSpark while session batching is active except for Qwen-on-Metal.
 
@@ -1214,7 +1214,7 @@ The codebase uses env vars for diagnostics and tuning. Those most relevant to th
 7. **`--dist-activation-bits 8` is E4M3 with no Inf/NaN and a ±240 clamp** — an accuracy hazard for large activations, not just a bandwidth knob.
 8. **A worker disconnect drops all of its per-session KV**, so reconnecting always implies a transcript replay.
 9. **TP is exactly two ranks** and refuses SSD streaming, pipeline mode, CPU backend and (on CUDA) anything but V4.1 Q2 with one GPU per rank.
-10. **DeepSeek's compressors cannot truncate**, so a speculative rewind invalidates the checkpoint and forces a rebuild — unlike GLM/Qwen which restore snapshots.
+10. **DeepSeek's compressors cannot be truncated directly.** DSpark restores a recent verifier prefix and replays at most one block; arbitrary or stale rewinds still invalidate the checkpoint and force a rebuild. GLM/Qwen restore their own snapshots.
 11. **`-ffast-math` is selectively removed** (engram, several numeric tests); re-adding it changes results.
 12. **The CPU backend can crash macOS** with very large mappings (`AGENT.md` safety note) — it is for tests and oracles, not for production runs.
 13. **Warnings are release blockers** per `QA_BEFORE_RELEASES.md`, and `tests/test-vectors/` fixtures are checkpoint-scoped: 0731 vs pre-0731 vs Vision-Experimental are not interchangeable.

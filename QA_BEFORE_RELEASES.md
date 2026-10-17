@@ -1292,8 +1292,12 @@ The agent is the most stateful component.  Test it manually, not only by build.
   status bar fill to terminal width, syntax highlighting in Markdown/code blocks,
   and SSH/remote terminal flicker.
 
-Check speculative stop-boundary rewinds separately from compaction. Record
-any required prefix rebuild and its latency; a successful compaction test
+Check speculative stop-boundary rewinds separately from compaction. For DSpark,
+verify with `DS4_DSPARK_SPEC_LOG=1` that the recent-verifier-prefix path logs
+`ds4: DSpark boundary restore pos=... base=... replay=...` and does not force a
+rebuild; the retired custom `in-place DSpark boundary rewind` line must no
+longer appear. Record `rewind_ms` for `kept=1` and for `kept>1` (the latter
+exercises replay), and note any rebuild latency. A successful compaction test
 does not establish that speculative cache reuse is efficient.
 
 ## 14. Download Script And Model Files

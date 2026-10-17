@@ -1,5 +1,10 @@
 # Plan: in-place DeepSeek V4 rewind for the DSpark speculative boundary
 
+> **Historical design record — do not implement from this document.**
+> The custom implementation described below was removed on 2026-10-18. The
+> shipped path is upstream `dspark_rewind_recent` /
+> `ds4_session_rewind_speculative`; §10 records the A/B that motivated removal.
+
 Status: RETIRED 2026-10-18 — removed in favour of upstream `dspark_rewind_*`
 (`fc80bd6`). Kept as a historical design record; see §10.
 Date: 2026-09-30 (retired 2026-10-18)
