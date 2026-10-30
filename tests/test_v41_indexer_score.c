@@ -21,6 +21,7 @@
 #define N_HEAD 32u
 #define HEAD_DIM 128u
 #define ROW_BYTES (HEAD_DIM * sizeof(float))
+#define GUARD_ROWS 16u
 
 static uint64_t rng_state = 0x243f6a8885a308d3ull;
 
@@ -56,8 +57,10 @@ static int run_case(const char *name, uint32_t n_rows, int fp4_data, int f16_cac
     const uint32_t n_head = N_HEAD, head_dim = HEAD_DIM;
     float *q = malloc(sizeof(float) * n_head * head_dim);
     float *weights = malloc(sizeof(float) * n_head);
-    float *scores_a = malloc(sizeof(float) * n_rows);
-    float *scores_b = malloc(sizeof(float) * n_rows);
+    const uint32_t output_rows = n_rows + GUARD_ROWS;
+    const float sentinel = -1234.5f;
+    float *scores_a = malloc(sizeof(float) * output_rows);
+    float *scores_b = malloc(sizeof(float) * output_rows);
     if (!q || !weights || !scores_a || !scores_b) return 1;
     for (uint32_t i = 0; i < n_head * head_dim; i++)
         q[i] = fp4_data ? rng_fp4() : rng_float();
@@ -76,10 +79,12 @@ static int run_case(const char *name, uint32_t n_rows, int fp4_data, int f16_cac
     ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc(sizeof(float) * n_head * head_dim);
     ds4_gpu_tensor *tw = ds4_gpu_tensor_alloc(sizeof(float) * n_head);
     ds4_gpu_tensor *tcache = ds4_gpu_tensor_alloc(cache_bytes);
-    ds4_gpu_tensor *ta = ds4_gpu_tensor_alloc(sizeof(float) * n_rows);
-    ds4_gpu_tensor *tb = ds4_gpu_tensor_alloc(sizeof(float) * n_rows);
+    ds4_gpu_tensor *ta = ds4_gpu_tensor_alloc(sizeof(float) * output_rows);
+    ds4_gpu_tensor *tb = ds4_gpu_tensor_alloc(sizeof(float) * output_rows);
     int rc = 1;
     if (!tq || !tw || !tcache || !ta || !tb) goto done;
+    if (!ds4_gpu_tensor_fill_f32(ta, sentinel, output_rows) ||
+        !ds4_gpu_tensor_fill_f32(tb, sentinel, output_rows)) goto done;
     if (!ds4_gpu_tensor_write(tq, 0, q, sizeof(float) * n_head * head_dim) ||
         !ds4_gpu_tensor_write(tw, 0, weights, sizeof(float) * n_head) ||
         !ds4_gpu_tensor_write(tcache, 0, cache, cache_bytes)) goto done;
@@ -91,8 +96,14 @@ static int run_case(const char *name, uint32_t n_rows, int fp4_data, int f16_cac
     if (!ds4_gpu_glm_indexer_score_one_tensor(tb, tq, tw, tcache, n_rows,
                                               n_head, head_dim, 1.0f / 64.0f, f16_cache)) goto done;
 
-    if (!ds4_gpu_tensor_read(ta, 0, scores_a, sizeof(float) * n_rows) ||
-        !ds4_gpu_tensor_read(tb, 0, scores_b, sizeof(float) * n_rows)) goto done;
+    if (!ds4_gpu_tensor_read(ta, 0, scores_a, sizeof(float) * output_rows) ||
+        !ds4_gpu_tensor_read(tb, 0, scores_b, sizeof(float) * output_rows)) goto done;
+    for (uint32_t i = n_rows; i < output_rows; i++) {
+        if (scores_a[i] != sentinel || scores_b[i] != sentinel) {
+            fprintf(stderr, "%s: output guard overwritten at row %u\n", name, i);
+            goto done;
+        }
+    }
     int diff = 0;
     double max_abs = 0.0;
     uint32_t first = 0;
@@ -146,6 +157,11 @@ int main(void) {
         return 1;
     }
     int fail = 0;
+    const uint32_t tails[] = {1, 2, 3, 4, 15, 16, 17, 31, 33, 1023, 1025};
+    for (size_t i = 0; i < sizeof(tails) / sizeof(*tails); i++) {
+        fail |= run_case("tail-f32", tails[i], 0, 0, 0);
+        fail |= run_case("tail-f16", tails[i], 0, 1, 0);
+    }
     fail |= run_case("random-f32", 1048576u, 0, 0, 10);
     fail |= run_case("fp4-keys-f32", 262144u, 1, 0, 0);
     fail |= run_case("fp4-keys-f16", 262144u, 1, 1, 0);
