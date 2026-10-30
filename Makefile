@@ -223,6 +223,7 @@ tests/test_metal_command_memory: tests/test_metal_command_memory.c ds4_gpu.h $(C
 
 .PHONY: test-metal-command-memory
 test-metal-command-memory: tests/test_metal_command_memory
+	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory buffers
 	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory
 	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory row
 	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory session
