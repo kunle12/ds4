@@ -59915,6 +59915,14 @@ static void *qwen4_ple_prefetch_run(void *context) {
 /* host side: embedding rows tiled into R and the PLE n-gram gather */
 static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                      const int *tokens, uint32_t T, const float *prefetched_ple) {
+    /* The prefetch path stages inputs before forward_tokens_impl, so validate
+     * the whole chunk before reading any embedding or changing PLE history. */
+    for (uint32_t t = 0; t < T; t++) {
+        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
+            fprintf(stderr, "ds4: Qwen3.8 token id %d is outside the vocabulary\n", tokens[t]);
+            return false;
+        }
+    }
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc;
     float *row = g->host_row;
     const ds4_vision_span *spans = g->vis_spans;
@@ -59968,12 +59976,6 @@ static bool qwen4_graph_forward_tokens_impl(ds4_qwen4_gpu_graph *g, const ds4_mo
                                             bool inputs_staged, double stage_start) {
     if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
     if (all_rows && T > g->n_logit_rows) return false;
-    for (uint32_t t = 0; t < T; t++) {
-        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
-            fprintf(stderr, "ds4: Qwen3.8 token id %d is outside the vocabulary\n", tokens[t]);
-            return false;
-        }
-    }
     const uint32_t pos0 = g->pos;
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     const uint32_t hc_dim = DS4_N_EMBD * DS4_N_HC;
