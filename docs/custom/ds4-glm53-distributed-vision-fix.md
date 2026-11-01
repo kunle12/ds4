@@ -77,3 +77,16 @@ The worker did not need a rebuild: it never owns the encoder or the splice.
 The GLM entries in titan's `~/bin/llm_config.json` launch
 `/Users/xun/dev/ds4/ds4-server`, which is the rebuilt binary. The copies under
 `~/bin` were not replaced; they are used by the other model entries.
+
+## Regression checks
+
+The change only enters the GLM distributed layer-slice path; DeepSeek does not
+call it and the solo GLM path uses `ds4_session_sync_internal()` instead. Both
+were still exercised end to end:
+
+- **DeepSeek V4.1 Flash** (original Q2 + vision, `--metal --ssd-streaming`):
+  text returned `4`; `earth.jpg` returned Earth / Africa.
+- **Solo GLM 5.3 Flash Q2** (`--ctx 32768 --vision`, no `--role`): text returned
+  `4`; `earth.jpg` returned Earth / Africa. The temporary manager entry used for
+  this run was removed and `llm_config.json` restored byte-for-byte.
+- **Restored 2-slot pair**: the Earth / Africa image smoke test passed.
