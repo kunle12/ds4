@@ -76216,6 +76216,12 @@ static DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, c
     ds4_session_dspark_capture_note_checkpoint(s);
 }
 
+/* Defined below; the GPU layer-slice path needs it before the definition. */
+static bool ds4_session_vision_range_overlaps(
+        const ds4_session *s,
+        uint32_t           token_start,
+        uint32_t           token_count);
+
 int ds4_session_eval_layer_slice(ds4_session *s,
                                  const int *tokens,
                                  uint32_t n_tokens,
@@ -76329,6 +76335,13 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             layer_slice_token_env ? glm_graph_env_truthy(layer_slice_token_env)
                                   : ds4_model_is_glm53();
 #endif
+        /* The coordinator owns the vision encoder and embeds the prompt for
+         * its first slice. Splice the encoder rows here too: dropping them
+         * leaves the language model with bare image-placeholder tokens, which
+         * it reads as a blank attachment. A worker receives hidden states and
+         * must not repeat the splice. */
+        const ds4_vision_span *vision_images = input_hc ? NULL : s->sync_images;
+        const size_t vision_image_count = vision_images ? s->sync_image_count : 0;
         uint32_t done = 0;
         while (done < n_tokens) {
             const uint32_t pos = pos0 + done;
@@ -76337,6 +76350,8 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             float *chunk_output = output_hc ? output_hc + (uint64_t)done * hidden_dim : NULL;
             uint32_t chunk = 1;
             bool ok = false;
+            const bool vision_here = vision_image_count != 0 &&
+                ds4_session_vision_range_overlaps(s, pos, remaining);
 
             /*
              * A single-token step uses the dedicated decode graph, which accepts
@@ -76344,9 +76359,11 @@ int ds4_session_eval_layer_slice(ds4_session *s,
              * KV-only step always takes it; a step carrying hidden state in or
              * out (the distributed decode shape) takes it when
              * layer_slice_token_decode is set, which is the default for GLM 5.3
-             * on Metal/CUDA (see the switch above).
+             * on Metal/CUDA (see the switch above). An image row needs the
+             * batch graph's embedding splice, so never take the decode graph
+             * at a position inside an image span.
              */
-            if (remaining == 1 && pos > 0 &&
+            if (!vision_here && remaining == 1 && pos > 0 &&
                 ((!input_hc && !output_hc) ||
                  layer_slice_token_decode)) {
                 float *chunk_logits = output_logits ? logits : NULL;
@@ -76372,8 +76389,8 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                               &e->weights,
                                               tokens + done,
                                               chunk_input,
-                                              NULL,
-                                              0,
+                                              vision_images,
+                                              vision_image_count,
                                               pos,
                                               chunk,
                                               chunk_output,
@@ -76397,8 +76414,8 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                       &e->weights,
                                                       tokens + done,
                                                       chunk_input,
-                                                      NULL,
-                                                      0,
+                                                      vision_images,
+                                                      vision_image_count,
                                                       pos,
                                                       chunk,
                                                       chunk_output,
@@ -76408,6 +76425,11 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                       pos0,
                                                       done,
                                                       n_tokens);
+            } else if (vision_here) {
+                if (errlen) snprintf(err, errlen,
+                                     "%s GLM image span requires the batch prefill path at pos %u",
+                                     ds4_backend_name(e->backend), pos);
+                ok = false;
             } else {
                 float *chunk_logits = (output_logits && done + 1u == n_tokens) ? logits : NULL;
                 ok = glm_graph_forward_token(g,
